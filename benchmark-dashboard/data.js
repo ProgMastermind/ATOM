@@ -1,262 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1775842156416,
+  "lastUpdate": 1775850432225,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "haoyangli0109",
-            "username": "haoyangli0109",
-            "email": "lihaoyang0109@gmail.com"
-          },
-          "committer": {
-            "name": "GitHub",
-            "username": "web-flow",
-            "email": "noreply@github.com"
-          },
-          "id": "464ce6751e52b8f278b39cd03434005dc81dda28",
-          "message": "WIP (#411)\n\nSigned-off-by: Haoyang Li <lihaoyang0109@gmail.com>",
-          "timestamp": "2026-04-02T12:09:37Z",
-          "url": "https://github.com/ROCm/ATOM/commit/464ce6751e52b8f278b39cd03434005dc81dda28"
-        },
-        "date": 1775137437746,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "GLM-5-FP8 1024/1024 c=128 throughput (tok/s)",
-            "value": 2930,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=128 Total Tput (tok/s)",
-            "value": 5866.45,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=128 TTFT (ms)",
-            "value": 411.35,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=128 TPOT (ms)",
-            "value": 42.06,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=128 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=16 throughput (tok/s)",
-            "value": 700.85,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=16 Total Tput (tok/s)",
-            "value": 1409.16,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=16 TTFT (ms)",
-            "value": 163.06,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=16 TPOT (ms)",
-            "value": 22.14,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=16 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=2 throughput (tok/s)",
-            "value": 109.22,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=2 Total Tput (tok/s)",
-            "value": 216.44,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=2 TTFT (ms)",
-            "value": 117.23,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=2 TPOT (ms)",
-            "value": 18.15,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=2 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=256 throughput (tok/s)",
-            "value": 4217.86,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=256 Total Tput (tok/s)",
-            "value": 8431.64,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=256 TTFT (ms)",
-            "value": 633.57,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=256 TPOT (ms)",
-            "value": 58.57,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=256 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=32 throughput (tok/s)",
-            "value": 1129.17,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=32 Total Tput (tok/s)",
-            "value": 2254.78,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=32 TTFT (ms)",
-            "value": 590.02,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=32 TPOT (ms)",
-            "value": 26.99,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=32 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=4 throughput (tok/s)",
-            "value": 206.67,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=4 Total Tput (tok/s)",
-            "value": 415.36,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=4 TTFT (ms)",
-            "value": 125.66,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=4 TPOT (ms)",
-            "value": 18.62,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=4 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=64 throughput (tok/s)",
-            "value": 1868.43,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=64 Total Tput (tok/s)",
-            "value": 3737.7,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=64 TTFT (ms)",
-            "value": 270.44,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=64 TPOT (ms)",
-            "value": 32.93,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=64 _gpu_count",
-            "value": 8,
-            "unit": ""
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=8 throughput (tok/s)",
-            "value": 376.96,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=8 Total Tput (tok/s)",
-            "value": 751.14,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=8 TTFT (ms)",
-            "value": 135.3,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=8 TPOT (ms)",
-            "value": 20.63,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23902037281 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1"
-          },
-          {
-            "name": "GLM-5-FP8 1024/1024 c=8 _gpu_count",
-            "value": 8,
-            "unit": ""
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -47448,6 +47194,70 @@ window.BENCHMARK_DATA = {
             "value": 0.4344,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24250703467 | Threshold: 0.38 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | strict-match: 0.2244 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "carlushuang",
+            "username": "carlushuang",
+            "email": "carlus.huang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "108a70ed4e3c4f4ce3d8afcd5bc7e99c7cbc07ed",
+          "message": "[server] Refactor OpenAI server with tool calling, reasoning, and debug logging (#489)\n\n* [server] Improve OpenAI API compatibility for OpenClaw integration\n\n- Accept multimodal content format: ChatMessage.content now handles both\n  plain string and OpenAI array format ([{\"type\":\"text\",\"text\":\"...\"}])\n- Add model_config extra=\"ignore\" to ChatCompletionRequest and\n  CompletionRequest to silently drop unsupported fields (stream_options,\n  tools, tool_choice, etc.) instead of returning 422\n- Increase DEFAULT_MAX_TOKENS from 256 to 8192 for thinking models\n  (Kimi-K2) where 256 truncates inside <think> blocks\n- Strip <think>...</think> reasoning blocks from both streaming and\n  non-streaming responses so clients see only the final answer\n- Add thinking-block state machine in stream_chat_response() to filter\n  thinking content token-by-token during SSE streaming\n\n* style: fix Black formatting in openai_server.py\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* [server] Refactor OpenAI server into modular architecture with reasoning support\n\nSplit the monolithic openai_server.py (1076 lines) into focused modules\nfollowing the mini-sglang/vLLM pattern:\n\n  atom/entrypoints/openai/\n  ├── __init__.py           - Package re-export\n  ├── protocol.py           - Pydantic request/response models\n  ├── reasoning.py          - Thinking content separation (reasoning_content)\n  ├── serving_chat.py       - Chat completion handler\n  ├── serving_completion.py - Text completion handler\n  └── api_server.py         - FastAPI app, routes, engine interface, main()\n\nKey improvements:\n- Reasoning content separation: <think>...</think> blocks are now returned\n  in a `reasoning_content` field alongside `content`, following the\n  SGLang/vLLM pattern (instead of stripping entirely)\n- Streaming reasoning: thinking tokens stream as reasoning_content deltas,\n  answer tokens as content deltas\n- Tool call token stripping: <|tool_calls_section_*|> tokens filtered\n- OpenAI-format error responses via exception handlers\n- Proper ModelCard/ModelList Pydantic models for /v1/models\n- Compatibility fields: presence_penalty, frequency_penalty, n accepted\n- Backward compatible: python -m atom.entrypoints.openai_server still works\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* style: fix Ruff lint errors (unused imports and variables)\n\n- api_server.py: remove unused ErrorResponse import\n- reasoning.py: remove unused `field` import from dataclasses\n- serving_chat.py: remove unused uuid, List, ChatCompletionRequest\n  imports; remove unused first_chunk and finish variables\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* [test] Add unit tests for OpenAI server entrypoints\n\nAdd tests/entrypoints/ with 46 unit tests covering:\n\n- test_protocol.py (18 tests): ChatMessage multimodal content parsing,\n  ChatCompletionRequest extra field handling, CompletionRequest defaults,\n  response models, ModelCard/ModelList, ErrorResponse\n- test_reasoning.py (17 tests): separate_reasoning() for thinking block\n  extraction, unclosed blocks, tool call stripping; ReasoningFilter\n  streaming state machine with various token sequences\n- test_serving_chat.py (11 tests): SSE chunk creation format,\n  build_chat_response() with reasoning_content separation\n\nAll tests run without GPU (pure unit tests, no engine required).\nFix __init__.py to use lazy import avoiding uvicorn at import time.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* [server] Add tool call parsing support\n\nParse model tool call special tokens into OpenAI-compatible tool_calls\nformat instead of stripping them.\n\nNew file: atom/entrypoints/openai/tool_parser.py\n- parse_tool_calls(text) -> (content, List[ToolCall]) for non-streaming\n- ToolCallStreamParser: stateful streaming parser for SSE chunks\n- Parses <|tool_call_begin|>functions.NAME:INDEX<|tool_call_argument_begin|>\n  ARGS<|tool_call_end|> format (Kimi-K2, etc.)\n\nChanges:\n- protocol.py: add tools/tool_choice fields to ChatCompletionRequest\n- serving_chat.py: integrate tool parser in both streaming and\n  non-streaming paths; set finish_reason=\"tool_calls\" when present\n- reasoning.py: remove tool call stripping (handled by tool_parser now)\n\nTests: 56 unit tests (11 new tool parser tests) + 16 integration tests\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* Fix tool call round-trip for chat templates (Kimi-K2)\n\nMake ChatMessage.content optional (tool messages send content=None) and\nadd to_template_dict() to preserve tool_calls, tool_call_id, name, and\nreasoning_content when rendering the chat template.  Pass request.tools\nthrough to apply_chat_template so the template can inject tool\ndeclarations.\n\nAdds curl tool call tests for both parse_tool_calls and streaming parser.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* Add --request-log flag for debugging API requests and responses\n\nAdds optional JSONL request logging behind --request-log <filepath>.\nWhen enabled, logs all incoming requests, non-streaming responses, and\nstreaming SSE chunks with timestamps and request IDs. Uses a dedicated\nlogger with FileHandler so it doesn't interfere with normal server\noutput. Zero overhead when the flag is not provided.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* style: fix Black formatting in test_tool_parser\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* Update copyright year to 2024-2026 in all new files\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 4.6 <noreply@anthropic.com>",
+          "timestamp": "2026-04-10T15:31:14Z",
+          "url": "https://github.com/ROCm/ATOM/commit/108a70ed4e3c4f4ce3d8afcd5bc7e99c7cbc07ed"
+        },
+        "date": 1775850429466,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.9424,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.93 | Baseline: 0.93 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | strict-match: 0.9356 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4 TP8 accuracy (GSM8K)",
+            "value": 0.9363,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.9 | Baseline: 0.9 | BaselineModel: amd/Kimi-K2-Thinking-MXFP4 | strict-match: 0.9348 | fewshot: 3 | Model: /models/amd/Kimi-K2-Thinking-MXFP4"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.5-MXFP4 TP8 accuracy (GSM8K)",
+            "value": 0.9287,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.93 | Baseline: 0.93 | BaselineModel: amd/Kimi-K2.5-MXFP4 | BaselineNote: Reference value from recipes/atom_vllm/Kimi-K2.5.md | strict-match: 0.928 | fewshot: 3 | Model: /models/amd/Kimi-K2.5-MXFP4"
+          },
+          {
+            "name": "ATOM-vLLM::Llama-3.1-8B-Instruct TP1 accuracy (GSM8K)",
+            "value": 0.7703,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.73 | BaselineModel: meta-llama/Llama-3.1-8B-Instruct | BaselineNote: Threshold aligned with existing 8B Llama baseline used in CI (3-shot GSM8K). | strict-match: 0.674 | fewshot: 3 | Model: /models/meta-llama/Llama-3.1-8B-Instruct"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8 accuracy (GSM8K)",
+            "value": 0.8939,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.87 | Baseline: 0.87 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | strict-match: 0.8779 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B TP8 accuracy (GSM8K)",
+            "value": 0.8575,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.83 | Baseline: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B | strict-match: 0.8385 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b TP2 accuracy (GSM8K)",
+            "value": 0.3988,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24257396742 | Threshold: 0.38 | Baseline: 0.38 | BaselineModel: openai/gpt-oss-120b | strict-match: 0.2146 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
