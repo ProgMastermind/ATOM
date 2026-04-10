@@ -43,11 +43,11 @@ curl -X POST "http://localhost:8000/v1/completions" \
 ```
 
 ### Curl with text + image
-Use your own local image file as input (for example: `/path/to/your-image.png`).
+Let's use the image of a dog located at `ATOM/recipes/vllm_atom/dog.png` as an example.
+<img src="./dog.png" width="400">
 ```bash
 # Convert image to base64
-IMAGE_PATH=/path/to/your-image.png
-IMAGE_BASE64=$(base64 -w 0 "${IMAGE_PATH}")
+IMAGE_BASE64=$(base64 -w 0 ATOM/recipes/vllm_atom/dog.png)
 curl -X POST "http://localhost:8000/v1/chat/completions" \
   -H "Content-Type: application/json" \
   -d '{
