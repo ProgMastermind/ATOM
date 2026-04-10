@@ -1323,7 +1323,7 @@ jobs:
             /tmp/accuracy-results \
             --output accuracy-benchmark-input.json \
             --models .github/benchmark/vllm_atom_models_accuracy.json \
-            --backend "ATOM-vLLM" \
+            --backend "vLLM-ATOM" \
             --run-url "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
           echo "=== Generated entries ==="
           cat accuracy-benchmark-input.json

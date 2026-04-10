@@ -9,7 +9,7 @@ import re
 from pathlib import Path
 
 VARIANT_RE = re.compile(r"-(mtp\d*)-")
-DEFAULT_BACKEND = "ATOM-vLLM"
+DEFAULT_BACKEND = "vLLM-ATOM"
 
 
 def derive_model_name(result_path: Path, payload: dict) -> str:

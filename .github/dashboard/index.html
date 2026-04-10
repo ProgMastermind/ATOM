@@ -341,7 +341,7 @@
    1. CONSTANTS & COLOR PALETTE
    ================================================================ */
 // HSL-based palette: each model gets a distinct base hue; backend offsets keep
-// ATOM and ATOM-vLLM visually related but not identical.
+// ATOM and vLLM-ATOM visually related but not identical.
 const MODEL_HUES = {
   'DeepSeek-R1-0528':      210,   // blue
   'DeepSeek-R1-0528-mtp3': 175,   // cyan/teal — distinct from base DeepSeek
@@ -354,12 +354,12 @@ const MODEL_HUES = {
 };
 const BACKEND_HUE_OFFSETS = {
   'ATOM': 0,
-  'ATOM-vLLM': 28,
+  'vLLM-ATOM': 28,
 };
 const FALLBACK_HUES = [45, 330, 190, 30]; // yellow, pink, teal, amber
 let fallbackHueIdx = 0;
 function getModelHue(backend, model) {
-  const normalizedBackend = backend === 'vLLM-ATOM' ? 'ATOM-vLLM' : backend;
+  const normalizedBackend = backend === 'vLLM-ATOM' ? 'vLLM-ATOM' : backend;
   const backendModelKey = normalizedBackend ? `${normalizedBackend}::${model}` : model;
   if (MODEL_HUES[backendModelKey] != null) return MODEL_HUES[backendModelKey];
   let baseHue = MODEL_HUES[model];
@@ -499,7 +499,7 @@ function parseBenchName(name) {
     backend = backendMatch[1];
     rawName = backendMatch[2];
   }
-  if (backend === 'vLLM-ATOM') backend = 'ATOM-vLLM';
+  if (backend === 'vLLM-ATOM') backend = 'vLLM-ATOM';
   // Accuracy entries: "ModelName accuracy (GSM8K)" — (.+?) for multi-word model names
   let m = rawName.match(/^(.+?)\s+accuracy\s+\((\w+)\)$/);
   if (m) return { backend, model: m[1], metric: 'accuracy', unit: m[2], isAccuracy: true };
@@ -1801,7 +1801,7 @@ function renderTrendsTab() {
   const container = document.getElementById('tab-trends');
   destroyChartsIn(container);
 
-  // Mode+model selector — keeps native and ATOM-vLLM trend lines distinct
+  // Mode+model selector — keeps native and vLLM-ATOM trend lines distinct
   const trendOptions = [...new Set(Object.values(latestConfigs)
     .filter(cfg => state.filters.backends.includes(cfg.backend) && state.filters.models.includes(cfg.model))
     .map(cfg => `${cfg.backend}|${cfg.model}`))]
