@@ -16,6 +16,8 @@ logger = logging.getLogger("atom")
 support_eagle_model_arch_dict = {
     "DeepSeekMTPModel": "atom.models.deepseek_mtp.DeepSeekMTP",
     "Qwen3NextMTPModel": "atom.models.qwen3_next_mtp.Qwen3NextMTP",
+    # GLM-5 uses the DeepSeek-v3.2-style MTP head implementation.
+    "GlmMoeDsaForCausalLM": "atom.models.deepseek_mtp.DeepSeekMTP",
 }
 
 

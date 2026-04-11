@@ -13,6 +13,8 @@ from atom.plugin.attention import (
 )
 from atom.plugin.prepare import is_plugin_mode
 
+_RUNTIME_VLLM_INDEXER_BUILDER_CLS = None
+
 
 @AiterBackendDecoratorForPluginMode
 class AiterMLASparseBackend(AttentionBackend):
@@ -23,7 +25,7 @@ class AiterMLASparseBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "ROCM_AITER_MLA_SPARSE" if not is_plugin_mode() else "CUSTOM"
+        return "ROCM_AITER_MLA_SPARSE" if not is_plugin_mode() else "CUSTOM_MLA_SPARSE"
 
     @staticmethod
     def get_builder_cls() -> Type["AiterMLASparseMetadataBuilder"]:
@@ -59,11 +61,34 @@ class AiterMLASparseIndexerBackend(AttentionBackend):
 
     @staticmethod
     def get_name() -> str:
-        return "ROCM_AITER_MLA_SPARSE_INDEXER" if not is_plugin_mode() else "CUSTOM"
+        return (
+            "ROCM_AITER_MLA_SPARSE_INDEXER"
+            if not is_plugin_mode()
+            else "CUSTOM_MLA_SPARSE_INDEXER"
+        )
 
     @staticmethod
     def get_builder_cls() -> Type["AiterMLASparseIndexerMetadataBuilder"]:
-        return AiterMLASparseIndexerMetadataBuilder
+        global _RUNTIME_VLLM_INDEXER_BUILDER_CLS
+        if not is_plugin_mode():
+            return AiterMLASparseIndexerMetadataBuilder
+
+        # Build the vLLM/plugin-decorated indexer metadata builder lazily at
+        # runtime. This avoids import-order issues where module-level
+        # decorators may execute before framework mode switches to vLLM.
+        if _RUNTIME_VLLM_INDEXER_BUILDER_CLS is None:
+
+            @AiterMLASparseIndexerAttentionMetadataBuilderDecoratorForPluginMode(
+                default_base_class=AiterMLAMetadataBuilder
+            )
+            class RuntimeAiterMLASparseIndexerMetadataBuilder(AiterMLAMetadataBuilder):
+                pass
+
+            _RUNTIME_VLLM_INDEXER_BUILDER_CLS = (
+                RuntimeAiterMLASparseIndexerMetadataBuilder
+            )
+
+        return _RUNTIME_VLLM_INDEXER_BUILDER_CLS
 
     @staticmethod
     def get_impl_cls() -> Type["MLAAttention"]:

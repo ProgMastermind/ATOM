@@ -215,6 +215,7 @@ class PagedAttention(BaseAttention):
                 layer_name=self.layer_name,
                 use_mla=self.use_mla,
                 qkv=qkv,
+                attn_module=self,
             )
             return output
 

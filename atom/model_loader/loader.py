@@ -181,6 +181,7 @@ def load_model_in_plugin_mode(
     prefix: str = "",
     weights_mapper: WeightsMapper | None = None,
     load_fused_expert_weights_fn=None,
+    spec_decode: bool = False,
 ) -> set[str]:
 
     # during loading model, the outplace operation may consume more
@@ -201,17 +202,29 @@ def load_model_in_plugin_mode(
         model_name_or_path = config.plugin_config.model_config.model_path
 
     _empty_cache()
+    # In vLLM plugin mode, always prefer the active vLLM model_config.hf_config.
+    # This preserves draft-model overrides (e.g. DeepSeekMTPModel) that may not
+    # exist in the raw checkpoint config loaded by ATOM.
+    vllm_hf_config = None
+    if config.plugin_config.is_vllm and config.plugin_config.vllm_config is not None:
+        vllm_hf_config = getattr(
+            config.plugin_config.vllm_config.model_config, "hf_config", None
+        )
     config_for_loading = (
-        config.hf_config.text_config
-        if hasattr(config.hf_config, "text_config")
-        else config.hf_config
+        vllm_hf_config
+        if vllm_hf_config is not None
+        else (
+            config.hf_config.text_config
+            if hasattr(config.hf_config, "text_config")
+            else config.hf_config
+        )
     )
     loaded_weights_record = load_model(
         model=model,
         model_name_or_path=model_name_or_path,
         hf_config=config_for_loading,
         load_dummy=config.load_dummy,
-        spec_decode=False,
+        spec_decode=spec_decode,
         prefix=prefix,
         is_plugin_mode=True,
         weights_mapper=weights_mapper,
@@ -314,7 +327,8 @@ def load_model(
             ):
                 continue
             if spec_decode:
-                if hf_config.model_type == "deepseek_mtp":
+                is_deepseek_mtp_model = model.__class__.__name__ == "DeepSeekMTP"
+                if hf_config.model_type == "deepseek_mtp" or is_deepseek_mtp_model:
                     spec_layer = get_spec_layer_idx_from_weight_name(hf_config, name)
                     if spec_layer is None:
                         continue

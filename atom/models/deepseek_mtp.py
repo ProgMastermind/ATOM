@@ -4,7 +4,6 @@ from typing import Optional, Union
 
 import torch
 import torch.nn as nn
-from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from atom.config import Config, QuantizationConfig
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import RMSNorm
@@ -50,6 +49,20 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         self.hnorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.eh_proj = nn.Linear(config.hidden_size * 2, config.hidden_size, bias=False)
 
+        if hasattr(config, "index_topk"):
+            max_num_batched_tokens = getattr(
+                atom_config, "max_num_batched_tokens", atom_config.max_num_seqs
+            )
+            buffer_device = getattr(atom_config, "device", "cuda")
+            topk_indices_buffer = torch.empty(
+                max_num_batched_tokens,
+                config.index_topk,
+                dtype=torch.int32,
+                device=buffer_device,
+            )
+        else:
+            topk_indices_buffer = None
+
         self.shared_head = SharedHead(
             config=config, prefix=prefix, quant_config=atom_config.quant_config
         )
@@ -63,6 +76,7 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
             quant_config=quant_config,
             layer_num=layer_idx,
             is_mtp_block=True,
+            topk_indices_buffer=topk_indices_buffer,
         )
 
     def forward(
@@ -74,10 +88,9 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         spec_step_index: int = 0,
     ) -> torch.Tensor:
         assert inputs_embeds is not None
-        # masked_inputs_embeds = torch.where(
-        #     positions.unsqueeze(-1) == 0, 0, inputs_embeds
-        # )
-        masked_inputs_embeds = inputs_embeds
+        masked_inputs_embeds = torch.where(
+            positions.unsqueeze(-1) == 0, 0, inputs_embeds
+        )
         inputs_embeds = self.enorm(masked_inputs_embeds)
         previous_hidden_states = self.hnorm(previous_hidden_states)
 
@@ -88,8 +101,6 @@ class DeepSeekMultiTokenPredictorLayer(nn.Module):
         hidden_states, residual = self.mtp_block(
             positions=positions, hidden_states=hidden_states, residual=None
         )
-        # mtp always has input_layernorm fused_allreduce off
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
         hidden_states = residual + hidden_states
         return hidden_states
 
@@ -190,7 +201,15 @@ class DeepSeekMTP(nn.Module):
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor | None:
-        return self.model.compute_logits(hidden_states, spec_step_idx)
+        current_step_idx = spec_step_idx % self.model.num_mtp_layers
+        mtp_layer = self.model.layers[
+            str(self.model.mtp_start_layer_idx + current_step_idx)
+        ]
+        hidden_states = mtp_layer.shared_head(hidden_states)
+        lm_head = getattr(self, "lm_head", None)
+        if lm_head is None:
+            lm_head = mtp_layer.shared_head.head
+        return lm_head(hidden_states)
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales

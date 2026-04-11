@@ -84,8 +84,10 @@ from atom.plugin.attention_mla_sparse import (
     IndexerDecoratorForPluginMode,
     DeepseekV32IndexerCacheDecoratorForPluginMode,
 )
+from atom.plugin.prepare import is_vllm
 from torch import nn
 from transformers import PretrainedConfig
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 
 # from vllm.model_executor.layers.quantization.utils.fp8_utils import per_token_group_quant_fp8
 
@@ -962,7 +964,7 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
 
 
 @DeepseekV32IndexerCacheDecoratorForPluginMode
-class DeepseekV32IndexerCache(nn.Module):
+class DeepseekV32IndexerCache(nn.Module, AttentionLayerBase):
 
     def __init__(
         self, head_dim: int, dtype: torch.dtype, prefix: str, cache_config: str
@@ -973,6 +975,32 @@ class DeepseekV32IndexerCache(nn.Module):
         self.prefix = prefix
         self.cache_config = cache_config
         self.dtype = dtype
+        if is_vllm():
+            from vllm.config import get_current_vllm_config
+
+            compilation_config = get_current_vllm_config().compilation_config
+            if prefix in compilation_config.static_forward_context:
+                raise ValueError(f"Duplicate layer name: {prefix}")
+            compilation_config.static_forward_context[prefix] = self
+
+    def get_kv_cache_spec(self, vllm_config):
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+        return MLAAttentionSpec(
+            block_size=1,
+            num_kv_heads=1,
+            head_size=self.head_dim,
+            dtype=self.dtype,
+        )
+
+    def get_attn_backend(self):
+        from atom.plugin.vllm.attention_backend.mla_sparse import (
+            AiterMLASparseIndexerBackend,
+        )
+
+        if is_vllm():
+            return AiterMLASparseIndexerBackend
+        return AiterMLASparseIndexerBackend
 
 
 def sparse_attn_indexer(
@@ -1203,6 +1231,10 @@ class Indexer(nn.Module):
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
 
         self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
+        if is_vllm():
+            self.sparse_attn_indexer_impl = (
+                torch.ops.aiter.sparse_attn_indexer_plugin_mode
+            )
 
     def forward(
         self,
@@ -1212,13 +1244,22 @@ class Indexer(nn.Module):
         positions,
         rotary_emb,
     ) -> torch.Tensor:
+        # Some speculative + FP8 paths can feed FP8 activations into indexer.
+        # The dynamic_per_group_scaled_quant kernel used in wk/weights_proj does
+        # not support Float8_e4m3fn input, so upcast to BF16 here.
+        hs_for_indexer = (
+            hidden_states.to(torch.bfloat16)
+            if hidden_states.dtype == torch.float8_e4m3fn
+            else hidden_states
+        )
+
         q = self.wq_b(qr, qr_scale)
         q = q.view(-1, self.n_head, self.head_dim)
         q_pe, q_nope = torch.split(
             q, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
         )
 
-        k = self.wk(hidden_states)
+        k = self.wk(hs_for_indexer)
         k = self.k_norm(k)
         k_pe, k_nope = torch.split(
             k, [self.rope_dim, self.head_dim - self.rope_dim], dim=-1
@@ -1233,11 +1274,22 @@ class Indexer(nn.Module):
         q_fp8 = q_fp8.view(-1, self.n_head, self.head_dim)
         q_scale = q_scale.view(-1, self.n_head, 1)
 
-        weights = self.weights_proj(hidden_states)
+        weights = self.weights_proj(hs_for_indexer)
         weights = (
             weights.unsqueeze(-1) * q_scale * self.softmax_scale * self.n_head**-0.5
         )
         weights = weights.squeeze(-1)
+
+        topk_indices_buffer = self.topk_indices_buffer
+        assert topk_indices_buffer is not None, (
+            "topk_indices_buffer must be pre-allocated by upper layers "
+            "(DeepseekV2Model/DeepSeekMultiTokenPredictorLayer) and passed down "
+            "to Indexer."
+        )
+        assert topk_indices_buffer.shape[0] >= hidden_states.shape[0], (
+            "topk_indices_buffer is smaller than current token batch; "
+            "ensure upper-layer allocation uses max_num_batched_tokens."
+        )
 
         return self.sparse_attn_indexer_impl(
             hidden_states,
@@ -1252,7 +1304,7 @@ class Indexer(nn.Module):
             self.head_dim,
             self.max_model_len,
             self.max_total_seq_len,
-            self.topk_indices_buffer,
+            topk_indices_buffer,
         )
 
 

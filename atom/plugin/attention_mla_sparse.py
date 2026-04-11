@@ -119,18 +119,46 @@ class MLASparseAttentionImplPluginModeMethods:
             device=q.device,
         )
 
-        # Build ragged layout only once per forward as it shared across MLA layers
-        if not getattr(sparse_meta, "ragged_layout_built", False):
-            seq_len = (topk_indices_global != -1).sum(dim=-1)
-            torch.cumsum(seq_len, dim=0, out=sparse_meta.paged_kv_indptr[1:])
-            sparse_meta.paged_kv_indptr_rest.fill_(sparse_meta.paged_kv_indptr[-1])
-            fetch_id_to_ragged_triton(
-                topk_indices_global,
-                sparse_meta.paged_kv_indptr,
-                sparse_meta.paged_kv_indices,
-                sparse_meta.topk_tokens,
+        # Build ragged layout only once per forward as it shared across MLA layers.
+        # Some paths (e.g. vllmDeepseekV32IndexerMetadata) do not provide paged_kv_*,
+        # so build a lightweight fallback layout on-the-fly.
+        has_paged_layout = (
+            hasattr(sparse_meta, "paged_kv_indptr")
+            and hasattr(sparse_meta, "paged_kv_indices")
+            and hasattr(sparse_meta, "paged_kv_last_page_len")
+        )
+        if has_paged_layout:
+            if not getattr(sparse_meta, "ragged_layout_built", False):
+                seq_len = (topk_indices_global != -1).sum(dim=-1)
+                torch.cumsum(seq_len, dim=0, out=sparse_meta.paged_kv_indptr[1:])
+                sparse_meta.paged_kv_indptr_rest.fill_(sparse_meta.paged_kv_indptr[-1])
+                fetch_id_to_ragged_triton(
+                    topk_indices_global,
+                    sparse_meta.paged_kv_indptr,
+                    sparse_meta.paged_kv_indices,
+                    sparse_meta.topk_tokens,
+                )
+                sparse_meta.ragged_layout_built = True
+            paged_kv_indptr = sparse_meta.paged_kv_indptr
+            paged_kv_indices = sparse_meta.paged_kv_indices
+            paged_kv_last_page_len = sparse_meta.paged_kv_last_page_len
+            qo_indptr = getattr(sparse_meta, "qo_indptr", None)
+            if qo_indptr is None:
+                qo_indptr = torch.arange(
+                    num_tokens + 1, device=q.device, dtype=torch.int32
+                )
+        else:
+            seq_len = (topk_indices_global != -1).sum(dim=-1).to(torch.int32)
+            paged_kv_indptr = torch.empty(
+                num_tokens + 1, device=q.device, dtype=torch.int32
             )
-            sparse_meta.ragged_layout_built = True
+            paged_kv_indptr[0] = 0
+            torch.cumsum(seq_len, dim=0, out=paged_kv_indptr[1:])
+            paged_kv_indices = topk_indices_global[topk_indices_global != -1].to(
+                torch.int32
+            )
+            paged_kv_last_page_len = (seq_len > 0).to(torch.int32)
+            qo_indptr = torch.arange(num_tokens + 1, device=q.device, dtype=torch.int32)
 
         kv_buffer = kv_cache.unsqueeze(2)
 
@@ -141,10 +169,10 @@ class MLASparseAttentionImplPluginModeMethods:
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             output,
-            sparse_meta.qo_indptr,
-            sparse_meta.paged_kv_indptr,
-            sparse_meta.paged_kv_indices,
-            sparse_meta.paged_kv_last_page_len,
+            qo_indptr,
+            paged_kv_indptr,
+            paged_kv_indices,
+            paged_kv_last_page_len,
             1,
             sm_scale=self.scale,
             q_scale=layer._q_scale,
@@ -300,15 +328,33 @@ class MLASparseAttentionImplPluginModeMethods:
                 triton_convert_req_index_to_global_index,
             )
 
-        req_id_i32 = sparse_meta.req_id_per_token.to(dtype=torch.int32)
-        block_table_i32 = sparse_meta.block_table.to(dtype=torch.int32)
+        req_id_per_token = getattr(sparse_meta, "req_id_per_token", None)
+        if req_id_per_token is None:
+            # Compatibility path: some plugin metadata variants only expose
+            # query_start_loc. Reconstruct req_id_per_token on-the-fly.
+            starts = sparse_meta.query_start_loc.to(dtype=torch.int32)
+            seg_lengths = torch.diff(starts)
+            req_id_per_token = torch.repeat_interleave(
+                torch.arange(
+                    seg_lengths.shape[0], device=starts.device, dtype=torch.int32
+                ),
+                seg_lengths,
+            )
+        req_id_i32 = req_id_per_token[:num_actual_toks].to(dtype=torch.int32)
+
+        block_table = getattr(sparse_meta, "block_table", None)
+        if block_table is None:
+            block_table = attn_metadata.block_tables
+        block_table_i32 = block_table.to(dtype=torch.int32)
         topk_indices_i32 = topk_indices.to(dtype=torch.int32)
+        block_size = getattr(sparse_meta, "block_size", 1)
+        topk_tokens = getattr(sparse_meta, "topk_tokens", topk_indices_i32.shape[1])
         topk_indices_global = triton_convert_req_index_to_global_index(
             req_id_i32,  # sparse_meta.req_id_per_token,
             block_table_i32,  # sparse_meta.block_table,
             topk_indices_i32,  # topk_indices,
-            BLOCK_SIZE=sparse_meta.block_size,
-            NUM_TOPK_TOKENS=sparse_meta.topk_tokens,
+            BLOCK_SIZE=block_size,
+            NUM_TOPK_TOKENS=topk_tokens,
         )
         if fp8_attention:
             from vllm import _custom_ops as ops
@@ -407,6 +453,11 @@ def sparse_attn_indexer_plugin_mode(
     total_seq_lens: int,
     topk_indices_buffer: torch.Tensor,
 ) -> torch.Tensor:
+    from vllm.v1.attention.ops.rocm_aiter_mla_sparse import (
+        rocm_fp8_mqa_logits,
+        rocm_fp8_paged_mqa_logits,
+    )
+
     try:
         from vllm.forward_context import (
             get_forward_context as get_vllm_forward_context,
@@ -429,14 +480,27 @@ def sparse_attn_indexer_plugin_mode(
     if layer_meta is None:
         return weights
 
-    # In plugin mode, plugin_metadata is vllmDeepseekV32IndexerMetadata from
-    # AiterMLASparseIndexerMetadataBuilder.
     plugin_meta = layer_meta.plugin_metadata
     indexer_meta = plugin_meta
     slot_mapping = indexer_meta.slot_mapping
-    has_decode = indexer_meta.num_decodes > 0
+    decode_metadata = getattr(indexer_meta, "indexer_decode", None)
+    if decode_metadata is None:
+        decode_metadata = getattr(indexer_meta, "decode", None)
+    if indexer_meta.num_decodes > 0 and decode_metadata is None:
+        raise RuntimeError(
+            "Indexer decode metadata is missing in plugin mode. "
+            f"k_cache_prefix={k_cache_prefix}, "
+            f"plugin_metadata_type={type(plugin_meta).__name__}, "
+            f"num_decodes={indexer_meta.num_decodes}"
+        )
+
+    has_decode = indexer_meta.num_decodes > 0 and decode_metadata is not None
     has_prefill = indexer_meta.num_prefills > 0
     num_decode_tokens = indexer_meta.num_decode_tokens
+
+    # During speculative decoding, k may be padded to the capture batch size
+    # while slot_mapping only contains actual tokens.
+    k = k[: slot_mapping.shape[0]]
 
     indexer_k_quant_and_cache(
         k,
@@ -449,7 +513,13 @@ def sparse_attn_indexer_plugin_mode(
     topk_indices_buffer[: hidden_states.shape[0]] = -1
     # topk_indices_buffer[: num_actual_tokens] = -1
     if has_prefill:
-        prefill_metadata = indexer_meta.prefill
+        prefill_metadata = getattr(indexer_meta, "indexer_prefill", None)
+        if prefill_metadata is None:
+            prefill_metadata = getattr(indexer_meta, "prefill", None)
+        assert prefill_metadata is not None and hasattr(prefill_metadata, "chunks"), (
+            "sparse_attn_indexer_plugin_mode expects indexer prefill metadata "
+            "with chunked layout (vllmDeepseekV32IndexerPrefillMetadata)."
+        )
         for chunk in prefill_metadata.chunks:
             k_fp8 = torch.empty(
                 [chunk.total_seq_lens, head_dim],
@@ -457,9 +527,9 @@ def sparse_attn_indexer_plugin_mode(
                 dtype=dtypes.fp8,
             )
             k_scale = torch.empty(
-                [chunk.total_seq_lens, 1],
+                [chunk.total_seq_lens, 4],
                 device=k.device,
-                dtype=torch.float32,
+                dtype=torch.uint8,
             )
 
             cp_gather_indexer_k_quant_cache(
@@ -470,13 +540,12 @@ def sparse_attn_indexer_plugin_mode(
                 chunk.cu_seq_lens,
             )
 
-            logits = fp8_mqa_logits(
-                Q=q_fp8[chunk.token_start : chunk.token_end],
-                KV=k_fp8,
-                kv_scales=k_scale,
-                weights=weights[chunk.token_start : chunk.token_end],
-                cu_starts=chunk.cu_seqlen_ks,
-                cu_ends=chunk.cu_seqlen_ke,
+            logits = rocm_fp8_mqa_logits(
+                q_fp8[chunk.token_start : chunk.token_end],
+                (k_fp8, k_scale.view(torch.float32).flatten()),
+                weights[chunk.token_start : chunk.token_end],
+                chunk.cu_seqlen_ks,
+                chunk.cu_seqlen_ke,
             )
             num_rows = logits.shape[0]
             assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
@@ -493,13 +562,8 @@ def sparse_attn_indexer_plugin_mode(
                 stride0=logits.stride(0),
                 stride1=logits.stride(1),
             )
-            # Convert global concatenated KV buffer indices to request-local
-            valid_mask = topk_indices != -1
-            topk_indices.sub_(chunk.cu_seqlen_ks.unsqueeze(1))
-            topk_indices.masked_fill_(~valid_mask, -1)
 
     if has_decode:
-        decode_metadata = indexer_meta.decode
         # kv_cache size requirement [num_block, block_size, n_head, head_dim],
         # we only have [num_block, block_size, head_dim],
         kv_cache = kv_cache.unsqueeze(-2)
@@ -523,31 +587,40 @@ def sparse_attn_indexer_plugin_mode(
         next_n = padded_q_fp8_decode_tokens.shape[1]
         assert batch_size == decode_metadata.seq_lens.shape[0]
         num_padded_tokens = batch_size * next_n
-        logits = torch.empty(
-            [batch_size * next_n, max_model_len], dtype=torch.float32, device="cuda"
-        )
-        deepgemm_fp8_paged_mqa_logits(
+        logits = rocm_fp8_paged_mqa_logits(
             padded_q_fp8_decode_tokens,
             kv_cache,
             weights[:num_padded_tokens],
-            logits,
             decode_metadata.seq_lens,
             decode_metadata.block_table,
+            decode_metadata.schedule_metadata,
             max_model_len,
         )
 
         num_rows = logits.shape[0]
         assert topk_tokens == 2048, "top_k_per_row assumes size 2048"
-        topk_indices = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
-        top_k_per_row_decode(
-            logits,
-            next_n,
-            decode_metadata.seq_lens,
-            topk_indices,
-            num_rows,
-            logits.stride(0),
-            logits.stride(1),
-        )
+        topk_indices = topk_indices_buffer[:num_padded_tokens, :topk_tokens]
+        if getattr(decode_metadata, "use_large_context_topk", False):
+            if next_n == 1:
+                lengths = decode_metadata.seq_lens
+            else:
+                lengths = (
+                    decode_metadata.seq_lens.unsqueeze(1)
+                    - next_n
+                    + 1
+                    + decode_metadata.offsets
+                ).flatten()
+            torch.ops._C.large_context_topk(logits, topk_indices, lengths, None)
+        else:
+            top_k_per_row_decode(
+                logits,
+                next_n,
+                decode_metadata.seq_lens,
+                topk_indices,
+                num_rows,
+                logits.stride(0),
+                logits.stride(1),
+            )
 
         if decode_metadata.requires_padding:
             # if padded, we need to unpack
@@ -633,6 +706,8 @@ def _deepseek_v32_indexer_get_attn_backend(self):
         AiterMLASparseIndexerBackend,
     )
 
+    # DeepseekV32IndexerCache is dedicated to sparse indexer.
+    # Always route to indexer backend to guarantee decode metadata layout.
     return AiterMLASparseIndexerBackend
 
 
