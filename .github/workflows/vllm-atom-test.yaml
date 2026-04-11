@@ -89,10 +89,10 @@ concurrency:
 
 env:
   ATOM_BASE_NIGHTLY_IMAGE: rocm/atom-dev:latest
-  OOT_IMAGE_CACHE_KEEP: "3"
+  vLLM_ATOM_IMAGE_CACHE_KEEP: "3"
   GITHUB_REPO_URL: ${{ github.event.pull_request.head.repo.clone_url || 'https://github.com/ROCm/ATOM.git' }}
   GITHUB_COMMIT_SHA: ${{ github.event.pull_request.head.sha || github.event.head_commit.id || github.sha }}
-  NIGHTLY_OOT_IMAGE_TAG: rocm/atom-dev:vllm-latest
+  NIGHTLY_vLLM_ATOM_IMAGE_TAG: rocm/atom-dev:vllm-latest
   VALIDATION_IMAGE_REPO: rocm/atom-dev
   GPU_ARCH: "gfx942;gfx950"
   AITER_REPO: "https://github.com/ROCm/aiter.git"
@@ -186,7 +186,7 @@ jobs:
           path: aiter-whl/amd_aiter*.whl
           retention-days: 1
 
-  build_oot_image:
+  build_vllm_atom_image:
     if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
     needs: [check-signal, download_aiter_wheel]
     name: Reuse vLLM-ATOM CI image
@@ -197,7 +197,7 @@ jobs:
     steps:
       - name: Initialize vLLM-ATOM image tag
         run: |
-          echo "OOT_IMAGE_TAG=rocm/atom-dev:vLLM-ATOM-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
+          echo "vLLM_ATOM_IMAGE_TAG=rocm/atom-dev:vLLM-ATOM-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
 
       - name: Checkout ATOM repo
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
@@ -209,28 +209,28 @@ jobs:
           echo "${{ secrets.DOCKER_PASSWORD }}" | docker login -u ${{ secrets.DOCKER_USERNAME }} --password-stdin
 
       - name: Check existing prebuilt vLLM-ATOM image
-        id: existing_oot_image
+        id: existing_vllm_atom_image
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         run: |
           set -euo pipefail
           echo "image_exists=false" >> "$GITHUB_OUTPUT"
 
-          if ! docker manifest inspect "${OOT_IMAGE_TAG}" >/dev/null 2>&1; then
-            echo "No existing vLLM-ATOM image found for ${OOT_IMAGE_TAG}; building a new one."
+          if ! docker manifest inspect "${vLLM_ATOM_IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "No existing vLLM-ATOM image found for ${vLLM_ATOM_IMAGE_TAG}; building a new one."
             exit 0
           fi
 
-          echo "Found existing vLLM-ATOM image for ${OOT_IMAGE_TAG}; validating vLLM commit label."
-          if ! docker pull "${OOT_IMAGE_TAG}"; then
-            echo "Failed to pull existing image ${OOT_IMAGE_TAG}; rebuilding it."
+          echo "Found existing vLLM-ATOM image for ${vLLM_ATOM_IMAGE_TAG}; validating vLLM commit label."
+          if ! docker pull "${vLLM_ATOM_IMAGE_TAG}"; then
+            echo "Failed to pull existing image ${vLLM_ATOM_IMAGE_TAG}; rebuilding it."
             exit 0
           fi
 
-          EXISTING_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${OOT_IMAGE_TAG}" 2>/dev/null || true)"
-          EXISTING_AITER_ARTIFACT_ID="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.aiter_artifact_id" }}' "${OOT_IMAGE_TAG}" 2>/dev/null || true)"
+          EXISTING_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${vLLM_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
+          EXISTING_AITER_ARTIFACT_ID="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.aiter_artifact_id" }}' "${vLLM_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
           if [ -n "${EXISTING_VLLM_COMMIT}" ] && [ "${EXISTING_VLLM_COMMIT}" = "${VLLM_COMMIT}" ] && [ -n "${EXISTING_AITER_ARTIFACT_ID}" ] && [ "${EXISTING_AITER_ARTIFACT_ID}" = "${AITER_ARTIFACT_ID}" ]; then
             echo "image_exists=true" >> "$GITHUB_OUTPUT"
-            echo "Reusing existing vLLM-ATOM image for ${OOT_IMAGE_TAG} (vLLM commit ${EXISTING_VLLM_COMMIT}, aiter artifact ${EXISTING_AITER_ARTIFACT_ID})."
+            echo "Reusing existing vLLM-ATOM image for ${vLLM_ATOM_IMAGE_TAG} (vLLM commit ${EXISTING_VLLM_COMMIT}, aiter artifact ${EXISTING_AITER_ARTIFACT_ID})."
           else
             echo "Existing image label mismatch or missing."
             echo "Expected vLLM commit ${VLLM_COMMIT}, got ${EXISTING_VLLM_COMMIT:-<missing>}."
@@ -238,18 +238,18 @@ jobs:
           fi
 
       - name: Download aiter wheel
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' }}
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_vllm_atom_image.outputs.image_exists != 'true' }}
         uses: actions/download-artifact@v4
         with:
           name: aiter-whl
           path: aiter-whl
 
       - name: Generate vLLM-ATOM overlay Dockerfile
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' }}
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_vllm_atom_image.outputs.image_exists != 'true' }}
         run: |
           cat <<'EOF' > Dockerfile.mod
-          ARG OOT_BASE_IMAGE
-          FROM ${OOT_BASE_IMAGE}
+          ARG vLLM_ATOM_BASE_IMAGE
+          FROM ${vLLM_ATOM_BASE_IMAGE}
           ARG GITHUB_REPO_URL
           ARG GITHUB_COMMIT_SHA
           ARG VLLM_COMMIT
@@ -285,35 +285,35 @@ jobs:
 
       - name: Resolve vLLM-ATOM CI build mode
         id: build_mode
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' }}
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_vllm_atom_image.outputs.image_exists != 'true' }}
         run: |
           set -euo pipefail
           echo "build_mode=full" >> "$GITHUB_OUTPUT"
 
-          if ! docker pull "${NIGHTLY_OOT_IMAGE_TAG}"; then
-            echo "Unable to pull ${NIGHTLY_OOT_IMAGE_TAG}; falling back to a full vLLM rebuild."
+          if ! docker pull "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}"; then
+            echo "Unable to pull ${NIGHTLY_vLLM_ATOM_IMAGE_TAG}; falling back to a full vLLM rebuild."
             exit 0
           fi
 
-          echo "Inspecting ${NIGHTLY_OOT_IMAGE_TAG} labels before deciding whether to reuse it."
-          docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_OOT_IMAGE_TAG}" || true
-          docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_OOT_IMAGE_TAG}" || true
-          LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_OOT_IMAGE_TAG}" 2>/dev/null || true)"
+          echo "Inspecting ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} labels before deciding whether to reuse it."
+          docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" || true
+          docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" || true
+          LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
           echo "Expected vLLM commit label: ${VLLM_COMMIT}"
-          echo "Resolved ${NIGHTLY_OOT_IMAGE_TAG} label com.rocm.atom.vllm_commit: ${LATEST_VLLM_COMMIT:-<missing>}"
+          echo "Resolved ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} label com.rocm.atom.vllm_commit: ${LATEST_VLLM_COMMIT:-<missing>}"
           if [ -n "${LATEST_VLLM_COMMIT}" ] && [ "${LATEST_VLLM_COMMIT}" = "${VLLM_COMMIT}" ]; then
             echo "build_mode=fast" >> "$GITHUB_OUTPUT"
-            echo "Reusing ${NIGHTLY_OOT_IMAGE_TAG} as the vLLM-ATOM CI base (vLLM commit ${LATEST_VLLM_COMMIT})."
+            echo "Reusing ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} as the vLLM-ATOM CI base (vLLM commit ${LATEST_VLLM_COMMIT})."
           else
             echo "vLLM-ATOM CI latest image label mismatch or missing. Expected ${VLLM_COMMIT}, got ${LATEST_VLLM_COMMIT:-<missing>}; rebuilding vLLM."
           fi
 
       - name: Build vLLM-ATOM overlay image from reusable latest
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode == 'fast' }}
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_vllm_atom_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode == 'fast' }}
         run: |
           DOCKER_BUILDKIT=1 docker build --network=host \
-            -t atom_oot:ci \
-            --build-arg OOT_BASE_IMAGE="${NIGHTLY_OOT_IMAGE_TAG}" \
+            -t vllm_atom:ci \
+            --build-arg vLLM_ATOM_BASE_IMAGE="${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
@@ -322,12 +322,12 @@ jobs:
             -f Dockerfile.mod .
 
       - name: Build vLLM-ATOM overlay base image
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode != 'fast' }}
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_vllm_atom_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode != 'fast' }}
         run: |
           DOCKER_BUILDKIT=1 docker build --pull --network=host \
             --no-cache \
-            -t atom_oot_base:ci \
-            --build-arg OOT_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
+            -t vllm_atom_base:ci \
+            --build-arg vLLM_ATOM_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
@@ -336,13 +336,13 @@ jobs:
             -f Dockerfile.mod .
 
       - name: Build vLLM-ATOM vLLM image
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode != 'fast' }}
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_vllm_atom_image.outputs.image_exists != 'true' && steps.build_mode.outputs.build_mode != 'fast' }}
         run: |
           DOCKER_BUILDKIT=1 docker build --network=host \
             --no-cache \
-            -t atom_oot:ci \
-            --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
+            -t vllm_atom:ci \
+            --target vllm_atom \
+            --build-arg vLLM_ATOM_BASE_IMAGE="vllm_atom_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
@@ -350,10 +350,10 @@ jobs:
             -f docker/Dockerfile .
 
       - name: Push Docker image
-        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_oot_image.outputs.image_exists != 'true' }}
+        if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_vllm_atom_image.outputs.image_exists != 'true' }}
         run: |
-          docker tag atom_oot:ci "${OOT_IMAGE_TAG}"
-          docker push "${OOT_IMAGE_TAG}"
+          docker tag vllm_atom:ci "${vLLM_ATOM_IMAGE_TAG}"
+          docker push "${vLLM_ATOM_IMAGE_TAG}"
 
       - name: Skip remote build for fork PR
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
@@ -364,12 +364,12 @@ jobs:
         if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && always() }}
         run: |
           rm -f Dockerfile.mod || true
-          docker rmi "atom_oot_base:ci" || true
-          docker rmi "atom_oot:ci" || true
-          docker rmi "${OOT_IMAGE_TAG}" || true
+          docker rmi "vllm_atom_base:ci" || true
+          docker rmi "vllm_atom:ci" || true
+          docker rmi "${vLLM_ATOM_IMAGE_TAG}" || true
 
   atom-vllm-vLLM-ATOM:
-    needs: [check-signal, download_aiter_wheel, build_oot_image]
+    needs: [check-signal, download_aiter_wheel, build_vllm_atom_image]
     if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
     name: ${{ matrix.display_name }}
     strategy:
@@ -411,7 +411,7 @@ jobs:
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     env:
-      CONTAINER_NAME: atom_vllm_oot_${{ strategy.job-index }}
+      CONTAINER_NAME: vllm_atom_${{ strategy.job-index }}
       VLLM_COMMIT: 2a69949bdadf0e8942b7a1619b229cb475beef20
       VLLM_VERSION: "0.19.0"
       AITER_ARTIFACT_ID: ${{ needs.download_aiter_wheel.outputs.aiter_artifact_id }}
@@ -450,8 +450,8 @@ jobs:
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           cat <<'EOF' > Dockerfile.mod
-          ARG OOT_BASE_IMAGE
-          FROM ${OOT_BASE_IMAGE}
+          ARG vLLM_ATOM_BASE_IMAGE
+          FROM ${vLLM_ATOM_BASE_IMAGE}
           ARG GITHUB_REPO_URL
           ARG GITHUB_COMMIT_SHA
           ARG VLLM_COMMIT
@@ -489,22 +489,22 @@ jobs:
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           set -euo pipefail
-          docker rmi "atom_oot_base:ci" || true
-          docker rmi "atom_oot:ci" || true
+          docker rmi "vllm_atom_base:ci" || true
+          docker rmi "vllm_atom:ci" || true
 
           BUILD_MODE="full"
-          if ! docker pull "${NIGHTLY_OOT_IMAGE_TAG}"; then
-            echo "Unable to pull ${NIGHTLY_OOT_IMAGE_TAG}; rebuilding vLLM locally."
+          if ! docker pull "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}"; then
+            echo "Unable to pull ${NIGHTLY_vLLM_ATOM_IMAGE_TAG}; rebuilding vLLM locally."
           else
-            echo "Inspecting ${NIGHTLY_OOT_IMAGE_TAG} labels before deciding whether to reuse it locally."
-            docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_OOT_IMAGE_TAG}" || true
-            docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_OOT_IMAGE_TAG}" || true
-            LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_OOT_IMAGE_TAG}" 2>/dev/null || true)"
+            echo "Inspecting ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} labels before deciding whether to reuse it locally."
+            docker inspect --format 'Image ID: {{.Id}}' "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" || true
+            docker inspect --format 'Image labels: {{json .Config.Labels}}' "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" || true
+            LATEST_VLLM_COMMIT="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.vllm_commit" }}' "${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
             echo "Expected vLLM commit label: ${VLLM_COMMIT}"
-            echo "Resolved ${NIGHTLY_OOT_IMAGE_TAG} label com.rocm.atom.vllm_commit: ${LATEST_VLLM_COMMIT:-<missing>}"
+            echo "Resolved ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} label com.rocm.atom.vllm_commit: ${LATEST_VLLM_COMMIT:-<missing>}"
             if [ -n "${LATEST_VLLM_COMMIT}" ] && [ "${LATEST_VLLM_COMMIT}" = "${VLLM_COMMIT}" ]; then
               BUILD_MODE="fast"
-              echo "Reusing ${NIGHTLY_OOT_IMAGE_TAG} locally for fork PR vLLM-ATOM CI."
+              echo "Reusing ${NIGHTLY_vLLM_ATOM_IMAGE_TAG} locally for fork PR vLLM-ATOM CI."
             else
               echo "vLLM-ATOM CI latest image label mismatch or missing. Expected ${VLLM_COMMIT}, got ${LATEST_VLLM_COMMIT:-<missing>}; rebuilding vLLM locally."
             fi
@@ -512,8 +512,8 @@ jobs:
 
           if [ "${BUILD_MODE}" = "fast" ]; then
             DOCKER_BUILDKIT=1 docker build --network=host \
-              -t atom_oot:ci \
-              --build-arg OOT_BASE_IMAGE="${NIGHTLY_OOT_IMAGE_TAG}" \
+              -t vllm_atom:ci \
+              --build-arg vLLM_ATOM_BASE_IMAGE="${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" \
               --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
               --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
               --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
@@ -525,8 +525,8 @@ jobs:
 
           DOCKER_BUILDKIT=1 docker build --pull --network=host \
             --no-cache \
-            -t atom_oot_base:ci \
-            --build-arg OOT_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
+            -t vllm_atom_base:ci \
+            --build-arg vLLM_ATOM_BASE_IMAGE="${ATOM_BASE_NIGHTLY_IMAGE}" \
             --build-arg GITHUB_REPO_URL="${GITHUB_REPO_URL}" \
             --build-arg GITHUB_COMMIT_SHA="${GITHUB_COMMIT_SHA}" \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
@@ -536,9 +536,9 @@ jobs:
 
           DOCKER_BUILDKIT=1 docker build --network=host \
             --no-cache \
-            -t atom_oot:ci \
-            --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
+            -t vllm_atom:ci \
+            --target vllm_atom \
+            --build-arg vLLM_ATOM_BASE_IMAGE="vllm_atom_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
@@ -550,15 +550,15 @@ jobs:
           IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           if [ "${IS_FORK_PR}" = "true" ]; then
-            echo "OOT_IMAGE_TAG=atom_oot:ci" >> "$GITHUB_ENV"
+            echo "vLLM_ATOM_IMAGE_TAG=vllm_atom:ci" >> "$GITHUB_ENV"
           else
-            echo "OOT_IMAGE_TAG=rocm/atom-dev:vLLM-ATOM-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
+            echo "vLLM_ATOM_IMAGE_TAG=rocm/atom-dev:vLLM-ATOM-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
           fi
 
       - name: Pull vLLM-ATOM image
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         run: |
-          docker pull "${OOT_IMAGE_TAG}"
+          docker pull "${vLLM_ATOM_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         run: |
@@ -600,7 +600,7 @@ jobs:
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
             --name "$CONTAINER_NAME" \
-            "$OOT_IMAGE_TAG"
+            "$vLLM_ATOM_IMAGE_TAG"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -673,10 +673,10 @@ jobs:
         if: success()
         run: |
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "OOT_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "vLLM_ATOM_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: /models/${{ matrix.model_path }}"
           else
-            echo "OOT_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "vLLM_ATOM_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"
           fi
 
@@ -684,18 +684,18 @@ jobs:
         if: success()
         timeout-minutes: 120
         env:
-          OOT_MODEL_NAME: ${{ matrix.model_name }}
-          OOT_MODEL_PATH: ${{ matrix.model_path }}
-          OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
-          OOT_ENV_VARS: ${{ matrix.env_vars }}
+          vLLM_ATOM_MODEL_NAME: ${{ matrix.model_name }}
+          vLLM_ATOM_MODEL_PATH: ${{ matrix.model_path }}
+          vLLM_ATOM_EXTRA_ARGS: ${{ matrix.extra_args }}
+          vLLM_ATOM_ENV_VARS: ${{ matrix.env_vars }}
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
         run: |
           docker exec \
-            -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
-            -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
-            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
-            -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
+            -e vLLM_ATOM_MODEL_NAME="${vLLM_ATOM_MODEL_NAME}" \
+            -e vLLM_ATOM_MODEL_PATH="${vLLM_ATOM_RESOLVED_MODEL_PATH:-$vLLM_ATOM_MODEL_PATH}" \
+            -e vLLM_ATOM_EXTRA_ARGS="${vLLM_ATOM_EXTRA_ARGS}" \
+            -e vLLM_ATOM_ENV_VARS="${vLLM_ATOM_ENV_VARS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
@@ -706,10 +706,10 @@ jobs:
       - name: Check vLLM-ATOM accuracy test results
         if: success()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
-          result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
+          docker cp "$CONTAINER_NAME":/tmp/vllm_atom_accuracy_results ./vllm_atom_accuracy_results || true
+          result_file=$(ls -1t vllm_atom_accuracy_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
-            echo "ERROR: No results JSON file found in oot_accuracy_results/"
+            echo "ERROR: No results JSON file found in vllm_atom_accuracy_results/"
             exit 2
           fi
 
@@ -731,14 +731,14 @@ jobs:
         if: success()
         run: |
           echo "vLLM-ATOM Accuracy Test Summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
-          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/oot_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/vllm_atom_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Collect vLLM-ATOM logs and results
         if: always()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          docker cp "$CONTAINER_NAME":/tmp/vllm_atom.log ./vllm_atom.log || true
+          docker cp "$CONTAINER_NAME":/tmp/vllm_atom_accuracy_output.txt ./vllm_atom_accuracy_output.txt || true
+          docker cp "$CONTAINER_NAME":/tmp/vllm_atom_accuracy_results ./vllm_atom_accuracy_results || true
 
       - name: Upload vLLM-ATOM artifacts
         if: always()
@@ -746,23 +746,23 @@ jobs:
         with:
           name: vLLM-ATOM-${{ matrix.model_name }}-artifacts
           path: |
-            vllm_oot.log
-            oot_accuracy_output.txt
-            oot_accuracy_results
+            vllm_atom.log
+            vllm_atom_accuracy_output.txt
+            vllm_atom_accuracy_results
 
       - name: Clean up vLLM-ATOM test
         if: always()
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_atom.pid ]; then kill \$(cat /tmp/vllm_atom.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
           rm -f Dockerfile.mod || true
-          docker rmi "atom_oot_base:ci" || true
-          docker rmi "atom_oot:ci" || true
-          KEEP_COUNT="${OOT_IMAGE_CACHE_KEEP:-3}"
-          if [[ "${OOT_IMAGE_TAG}" == rocm/atom-dev:vLLM-ATOM-pre-build-* ]]; then
+          docker rmi "vllm_atom_base:ci" || true
+          docker rmi "vllm_atom:ci" || true
+          KEEP_COUNT="${vLLM_ATOM_IMAGE_CACHE_KEEP:-3}"
+          if [[ "${vLLM_ATOM_IMAGE_TAG}" == rocm/atom-dev:vLLM-ATOM-pre-build-* ]]; then
             echo "Keeping current vLLM-ATOM image tag and the ${KEEP_COUNT} most recent vLLM-ATOM-pre-build tags."
-            mapfile -t OLD_OOT_TAGS < <(
+            mapfile -t OLD_vLLM_ATOM_TAGS < <(
               docker image ls --filter=reference='rocm/atom-dev:vLLM-ATOM-pre-build-*' --format '{{.Repository}}:{{.Tag}}' \
                 | while read -r tag; do
                     [ -n "${tag}" ] || continue
@@ -772,8 +772,8 @@ jobs:
                 | sort -r \
                 | awk -v keep="${KEEP_COUNT}" 'NR > keep { print $2 }'
             )
-            for tag in "${OLD_OOT_TAGS[@]}"; do
-              if [ "${tag}" = "${OOT_IMAGE_TAG}" ]; then
+            for tag in "${OLD_vLLM_ATOM_TAGS[@]}"; do
+              if [ "${tag}" = "${vLLM_ATOM_IMAGE_TAG}" ]; then
                 continue
               fi
               echo "Removing old vLLM-ATOM image tag: ${tag}"
@@ -787,7 +787,7 @@ jobs:
     name: Prepare validation image
     runs-on: build-only-atom
     outputs:
-      oot_image_tag: ${{ steps.meta.outputs.oot_image_tag }}
+      vllm_atom_image_tag: ${{ steps.meta.outputs.vllm_atom_image_tag }}
       cleanup_temp_image: ${{ steps.meta.outputs.cleanup_temp_image }}
       model_matrix: ${{ steps.meta.outputs.model_matrix }}
     steps:
@@ -950,16 +950,16 @@ jobs:
           PY
 
           if [ "${GITHUB_EVENT_NAME}" = "schedule" ]; then
-            echo "Scheduled run uses published vLLM-ATOM image: ${NIGHTLY_OOT_IMAGE_TAG}"
-            echo "oot_image_tag=${NIGHTLY_OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+            echo "Scheduled run uses published vLLM-ATOM image: ${NIGHTLY_vLLM_ATOM_IMAGE_TAG}"
+            echo "vllm_atom_image_tag=${NIGHTLY_vLLM_ATOM_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
           fi
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
-          MANUAL_BASE_IMAGE_TAG="atom_oot_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
-          OOT_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:vLLM-ATOM-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
+          MANUAL_BASE_IMAGE_TAG="vllm_atom_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
+          vLLM_ATOM_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:vLLM-ATOM-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
           BUILD_CONTEXT="$(mktemp -d)"
           trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
 
@@ -1006,9 +1006,9 @@ jobs:
             "${BUILD_CONTEXT}"
 
           docker build --network=host --no-cache \
-            -t "${OOT_IMAGE_TAG}" \
-            --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
+            -t "${vLLM_ATOM_IMAGE_TAG}" \
+            --target vllm_atom \
+            --build-arg vLLM_ATOM_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
@@ -1016,16 +1016,16 @@ jobs:
             -f "${BUILD_CONTEXT}/docker/Dockerfile" \
             "${BUILD_CONTEXT}"
 
-          docker push "${OOT_IMAGE_TAG}"
+          docker push "${vLLM_ATOM_IMAGE_TAG}"
 
-          echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "vllm_atom_image_tag=${vLLM_ATOM_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
           echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Clean up builder images
         if: ${{ always() && steps.meta.outputs.cleanup_temp_image == 'true' }}
         run: |
-          docker rmi "${{ steps.meta.outputs.oot_image_tag }}" || true
+          docker rmi "${{ steps.meta.outputs.vllm_atom_image_tag }}" || true
           docker rmi "${{ steps.meta.outputs.manual_base_image_tag }}" || true
 
   vLLM-ATOM-model-accuracy:
@@ -1041,8 +1041,8 @@ jobs:
       actions: read
       contents: write
     env:
-      CONTAINER_NAME: atom_vllm_oot_validation_${{ strategy.job-index }}
-      OOT_IMAGE_TAG: ${{ needs.prepare-vLLM-ATOM-image.outputs.oot_image_tag }}
+      CONTAINER_NAME: vllm_atom_validation_${{ strategy.job-index }}
+      vLLM_ATOM_IMAGE_TAG: ${{ needs.prepare-vLLM-ATOM-image.outputs.vllm_atom_image_tag }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -1056,7 +1056,7 @@ jobs:
 
       - name: Pull vLLM-ATOM image
         run: |
-          docker pull "${OOT_IMAGE_TAG}"
+          docker pull "${vLLM_ATOM_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         run: |
@@ -1093,7 +1093,7 @@ jobs:
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
-          cat > /tmp/oot_env_file.txt << 'EOF'
+          cat > /tmp/vllm_atom_env_file.txt << 'EOF'
           ${{ matrix.env_vars }}
           EOF
 
@@ -1108,10 +1108,10 @@ jobs:
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
-            --env-file /tmp/oot_env_file.txt \
+            --env-file /tmp/vllm_atom_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
-            "${OOT_IMAGE_TAG}"
+            "${vLLM_ATOM_IMAGE_TAG}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -1183,28 +1183,28 @@ jobs:
         if: success()
         run: |
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "OOT_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "vLLM_ATOM_RESOLVED_MODEL_PATH=/models/${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using mounted model path: /models/${{ matrix.model_path }}"
           else
-            echo "OOT_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
+            echo "vLLM_ATOM_RESOLVED_MODEL_PATH=${{ matrix.model_path }}" >> "$GITHUB_ENV"
             echo "Using model id: ${{ matrix.model_path }}"
           fi
 
       - name: Run vLLM-ATOM launch and gsm8k accuracy via script (full mode)
         timeout-minutes: 120
         env:
-          OOT_MODEL_NAME: ${{ matrix.model_name }}
-          OOT_MODEL_PATH: ${{ matrix.model_path }}
-          OOT_EXTRA_ARGS: ${{ matrix.extra_args }}
-          OOT_ENV_VARS: ${{ matrix.env_vars }}
+          vLLM_ATOM_MODEL_NAME: ${{ matrix.model_name }}
+          vLLM_ATOM_MODEL_PATH: ${{ matrix.model_path }}
+          vLLM_ATOM_EXTRA_ARGS: ${{ matrix.extra_args }}
+          vLLM_ATOM_ENV_VARS: ${{ matrix.env_vars }}
           MAX_WAIT_RETRIES: "120"
           STREAM_VLLM_LOGS: "1"
         run: |
           docker exec \
-            -e OOT_MODEL_NAME="${OOT_MODEL_NAME}" \
-            -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$OOT_MODEL_PATH}" \
-            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
-            -e OOT_ENV_VARS="${OOT_ENV_VARS}" \
+            -e vLLM_ATOM_MODEL_NAME="${vLLM_ATOM_MODEL_NAME}" \
+            -e vLLM_ATOM_MODEL_PATH="${vLLM_ATOM_RESOLVED_MODEL_PATH:-$vLLM_ATOM_MODEL_PATH}" \
+            -e vLLM_ATOM_EXTRA_ARGS="${vLLM_ATOM_EXTRA_ARGS}" \
+            -e vLLM_ATOM_ENV_VARS="${vLLM_ATOM_ENV_VARS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             "$CONTAINER_NAME" bash -lc "
@@ -1215,10 +1215,10 @@ jobs:
       - name: Check vLLM-ATOM accuracy test results
         if: success()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
-          result_file=$(ls -1t oot_accuracy_results/*.json 2>/dev/null | head -n 1)
+          docker cp "$CONTAINER_NAME":/tmp/vllm_atom_accuracy_results ./vllm_atom_accuracy_results || true
+          result_file=$(ls -1t vllm_atom_accuracy_results/*.json 2>/dev/null | head -n 1)
           if [ -z "$result_file" ] || [ ! -f "$result_file" ]; then
-            echo "ERROR: No results JSON file found in oot_accuracy_results/"
+            echo "ERROR: No results JSON file found in vllm_atom_accuracy_results/"
             exit 2
           fi
 
@@ -1240,14 +1240,14 @@ jobs:
         if: success()
         run: |
           echo "vLLM-ATOM gsm8k summary for ${{ matrix.model_name }}:" >> $GITHUB_STEP_SUMMARY
-          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/oot_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
+          docker exec "$CONTAINER_NAME" bash -lc "awk '/\|Tasks\|Version\|/,/^$/ { if (NF > 0) print }' /tmp/vllm_atom_accuracy_output.txt" >> $GITHUB_STEP_SUMMARY || true
 
       - name: Collect artifacts
         if: always()
         run: |
-          docker cp "$CONTAINER_NAME":/tmp/vllm_oot.log ./vllm_oot.log || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_output.txt ./oot_accuracy_output.txt || true
-          docker cp "$CONTAINER_NAME":/tmp/oot_accuracy_results ./oot_accuracy_results || true
+          docker cp "$CONTAINER_NAME":/tmp/vllm_atom.log ./vllm_atom.log || true
+          docker cp "$CONTAINER_NAME":/tmp/vllm_atom_accuracy_output.txt ./vllm_atom_accuracy_output.txt || true
+          docker cp "$CONTAINER_NAME":/tmp/vllm_atom_accuracy_results ./vllm_atom_accuracy_results || true
 
       - name: Upload model artifacts
         if: always()
@@ -1255,25 +1255,25 @@ jobs:
         with:
           name: vLLM-ATOM-validation-${{ matrix.model_name }}-${{ github.run_id }}
           path: |
-            vllm_oot.log
-            oot_accuracy_output.txt
-            oot_accuracy_results
+            vllm_atom.log
+            vllm_atom_accuracy_output.txt
+            vllm_atom_accuracy_results
 
       - name: Upload accuracy results for dashboard
         if: ${{ always() && (github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.upload_accuracy_to_dashboard)) }}
         uses: actions/upload-artifact@v7
         with:
           name: accuracy-${{ matrix.model_name }}
-          path: oot_accuracy_results/*.json
+          path: vllm_atom_accuracy_results/*.json
           if-no-files-found: ignore
 
       - name: Cleanup
         if: always()
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_atom.pid ]; then kill \$(cat /tmp/vllm_atom.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
-          docker rmi "${OOT_IMAGE_TAG}" || true
+          docker rmi "${vLLM_ATOM_IMAGE_TAG}" || true
 
   # Build the dashboard payload from all uploaded accuracy artifacts after the
   # full matrix completes. This keeps dashboard writes off the GPU runners and

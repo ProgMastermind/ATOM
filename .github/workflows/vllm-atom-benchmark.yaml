@@ -1,4 +1,4 @@
-name: ATOM vLLM vLLM-ATOM Benchmark
+name: vLLM-ATOM Benchmark
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.repository }}-${{ github.ref_name }}
@@ -67,7 +67,7 @@ on:
         description: "Qwen3-Next-80B-A3B-Instruct-FP8 TP4"
         type: boolean
         default: false
-      oot_image:
+      vllm_atom_image:
         description: "Optional vLLM-ATOM benchmark image override. Leave empty to use vllm-latest on main or rebuild from the selected non-main branch."
         type: string
         default: ""
@@ -93,12 +93,12 @@ jobs:
       atom_repository: ${{ steps.resolve.outputs.atom_repository }}
       atom_ref: ${{ steps.resolve.outputs.atom_ref }}
       normalized_ref: ${{ steps.resolve.outputs.normalized_ref }}
-      rebuild_oot_image: ${{ steps.resolve.outputs.rebuild_oot_image }}
-      prebuilt_oot_image: ${{ steps.resolve.outputs.prebuilt_oot_image }}
+      rebuild_vllm_atom_image: ${{ steps.resolve.outputs.rebuild_vllm_atom_image }}
+      prebuilt_vllm_atom_image: ${{ steps.resolve.outputs.prebuilt_vllm_atom_image }}
       selected_vllm_commit: ${{ steps.resolve.outputs.selected_vllm_commit }}
       selected_vllm_version: ${{ steps.resolve.outputs.selected_vllm_version }}
-      oot_base_image: ${{ steps.resolve.outputs.oot_base_image }}
-      oot_image_source: ${{ steps.resolve.outputs.oot_image_source }}
+      vllm_atom_base_image: ${{ steps.resolve.outputs.vllm_atom_base_image }}
+      vllm_atom_image_source: ${{ steps.resolve.outputs.vllm_atom_image_source }}
       publish_to_dashboard: ${{ steps.resolve.outputs.publish_to_dashboard }}
     steps:
       - name: Checkout selected branch
@@ -107,32 +107,32 @@ jobs:
       - name: Resolve benchmark source
         id: resolve
         env:
-          INPUT_OOT_IMAGE: ${{ inputs.oot_image || '' }}
+          INPUT_vLLM_ATOM_IMAGE: ${{ inputs.vllm_atom_image || '' }}
           INPUT_PUBLISH_TO_DASHBOARD: ${{ inputs.publish_to_dashboard }}
         run: |
           set -euo pipefail
 
           ATOM_REPOSITORY="${GITHUB_REPOSITORY}"
           ATOM_REF="${GITHUB_REF_NAME}"
-          OOT_BASE_IMAGE="rocm/atom-dev:latest"
+          vLLM_ATOM_BASE_IMAGE="rocm/atom-dev:latest"
 
           NORMALIZED_REF="${ATOM_REF#refs/heads/}"
           NORMALIZED_REF="${NORMALIZED_REF#refs/tags/}"
 
-          PREBUILT_OOT_IMAGE=""
-          REBUILD_OOT_IMAGE=false
-          OOT_IMAGE_SOURCE="prebuilt"
-          USER_PROVIDED_OOT_IMAGE=false
-          if [[ -n "${INPUT_OOT_IMAGE}" ]]; then
-            PREBUILT_OOT_IMAGE="${INPUT_OOT_IMAGE}"
-            OOT_IMAGE_SOURCE="user-provided"
-            USER_PROVIDED_OOT_IMAGE=true
+          PREBUILT_vLLM_ATOM_IMAGE=""
+          REBUILD_vLLM_ATOM_IMAGE=false
+          vLLM_ATOM_IMAGE_SOURCE="prebuilt"
+          USER_PROVIDED_vLLM_ATOM_IMAGE=false
+          if [[ -n "${INPUT_vLLM_ATOM_IMAGE}" ]]; then
+            PREBUILT_vLLM_ATOM_IMAGE="${INPUT_vLLM_ATOM_IMAGE}"
+            vLLM_ATOM_IMAGE_SOURCE="user-provided"
+            USER_PROVIDED_vLLM_ATOM_IMAGE=true
           elif [[ "${NORMALIZED_REF}" == "main" ]]; then
-            PREBUILT_OOT_IMAGE="rocm/atom-dev:vllm-latest"
-            OOT_IMAGE_SOURCE="prebuilt"
+            PREBUILT_vLLM_ATOM_IMAGE="rocm/atom-dev:vllm-latest"
+            vLLM_ATOM_IMAGE_SOURCE="prebuilt"
           else
-            REBUILD_OOT_IMAGE=true
-            OOT_IMAGE_SOURCE="rebuild"
+            REBUILD_vLLM_ATOM_IMAGE=true
+            vLLM_ATOM_IMAGE_SOURCE="rebuild"
           fi
 
           PUBLISH_TO_DASHBOARD="${INPUT_PUBLISH_TO_DASHBOARD:-true}"
@@ -160,37 +160,37 @@ jobs:
             echo "atom_repository=${ATOM_REPOSITORY}"
             echo "atom_ref=${ATOM_REF}"
             echo "normalized_ref=${NORMALIZED_REF}"
-            echo "rebuild_oot_image=${REBUILD_OOT_IMAGE}"
-            echo "prebuilt_oot_image=${PREBUILT_OOT_IMAGE}"
+            echo "rebuild_vllm_atom_image=${REBUILD_vLLM_ATOM_IMAGE}"
+            echo "prebuilt_vllm_atom_image=${PREBUILT_vLLM_ATOM_IMAGE}"
             echo "selected_vllm_commit=${SELECTED_VLLM_COMMIT}"
             echo "selected_vllm_version=${SELECTED_VLLM_VERSION}"
-            echo "oot_base_image=${OOT_BASE_IMAGE}"
-            echo "oot_image_source=${OOT_IMAGE_SOURCE}"
+            echo "vllm_atom_base_image=${vLLM_ATOM_BASE_IMAGE}"
+            echo "vllm_atom_image_source=${vLLM_ATOM_IMAGE_SOURCE}"
             echo "publish_to_dashboard=${PUBLISH_TO_DASHBOARD}"
           } >> "$GITHUB_OUTPUT"
 
           printf '### vLLM-ATOM benchmark source\n- Repository: `%s`\n- Ref: `%s`\n- Image mode: `%s`\n' \
             "${ATOM_REPOSITORY}" \
             "${ATOM_REF}" \
-            "${OOT_IMAGE_SOURCE}" >> "$GITHUB_STEP_SUMMARY"
+            "${vLLM_ATOM_IMAGE_SOURCE}" >> "$GITHUB_STEP_SUMMARY"
 
-          if [[ "${USER_PROVIDED_OOT_IMAGE}" == "true" ]]; then
+          if [[ "${USER_PROVIDED_vLLM_ATOM_IMAGE}" == "true" ]]; then
             printf -- '- User-provided image: `%s`\n- Expected vLLM version: `%s`\n- Expected vLLM commit: `%s`\n' \
-              "${PREBUILT_OOT_IMAGE}" \
+              "${PREBUILT_vLLM_ATOM_IMAGE}" \
               "${SELECTED_VLLM_VERSION}" \
               "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
-            printf -- '\nBecause an explicit `oot_image` input was provided, this run uses that image directly and skips branch-based rebuild logic.\n' \
+            printf -- '\nBecause an explicit `vllm_atom_image` input was provided, this run uses that image directly and skips branch-based rebuild logic.\n' \
               >> "$GITHUB_STEP_SUMMARY"
-          elif [[ "${REBUILD_OOT_IMAGE}" == "true" ]]; then
+          elif [[ "${REBUILD_vLLM_ATOM_IMAGE}" == "true" ]]; then
             printf -- '- Base image: `%s`\n- vLLM version: `%s`\n- vLLM commit: `%s`\n- vLLM source: `.github/workflows/docker-release.yaml`\n' \
-              "${OOT_BASE_IMAGE}" \
+              "${vLLM_ATOM_BASE_IMAGE}" \
               "${SELECTED_VLLM_VERSION}" \
               "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
-            printf -- '\nBecause branch `%s` is not `main` and no `oot_image` override was provided, a custom vLLM-ATOM docker is rebuilt from the selected branch.\n' \
+            printf -- '\nBecause branch `%s` is not `main` and no `vllm_atom_image` override was provided, a custom vLLM-ATOM docker is rebuilt from the selected branch.\n' \
               "${ATOM_REF}" >> "$GITHUB_STEP_SUMMARY"
           else
             printf -- '- Prebuilt image: `%s`\n- Expected vLLM version: `%s`\n- Expected vLLM commit: `%s`\n' \
-              "${PREBUILT_OOT_IMAGE}" \
+              "${PREBUILT_vLLM_ATOM_IMAGE}" \
               "${SELECTED_VLLM_VERSION}" \
               "${SELECTED_VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
           fi
@@ -368,24 +368,24 @@ jobs:
             echo "Benchmark matrix: ${BENCHMARK_MATRIX}"
           fi
 
-  build-vLLM-ATOM-image:
+  build-vllm-atom-image:
     name: Build custom vLLM-ATOM benchmark image
     needs: [resolve-atom-source, build-benchmark-matrix]
     if: >-
-      needs.resolve-atom-source.outputs.rebuild_oot_image == 'true'
+      needs.resolve-atom-source.outputs.rebuild_vllm_atom_image == 'true'
       && needs.build-benchmark-matrix.result == 'success'
       && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     runs-on: build-only-atom
     outputs:
-      oot_image_tag: ${{ steps.image-meta.outputs.oot_image_tag }}
+      vllm_atom_image_tag: ${{ steps.image-meta.outputs.vllm_atom_image_tag }}
       atom_source_sha: ${{ steps.source-meta.outputs.atom_source_sha }}
     env:
       ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
       ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
-      OOT_BASE_IMAGE: ${{ needs.resolve-atom-source.outputs.oot_base_image }}
+      vLLM_ATOM_BASE_IMAGE: ${{ needs.resolve-atom-source.outputs.vllm_atom_base_image }}
       VLLM_COMMIT: ${{ needs.resolve-atom-source.outputs.selected_vllm_commit }}
       VLLM_VERSION: ${{ needs.resolve-atom-source.outputs.selected_vllm_version }}
-      OOT_IMAGE_REPO: rocm/atom-dev
+      vLLM_ATOM_IMAGE_REPO: rocm/atom-dev
     steps:
       - name: Checkout benchmark ATOM source
         uses: actions/checkout@v6
@@ -403,7 +403,7 @@ jobs:
             "${ATOM_SOURCE_REPOSITORY}" \
             "${ATOM_SOURCE_REF}" \
             "${ATOM_SOURCE_SHA}" \
-            "${OOT_BASE_IMAGE}" \
+            "${vLLM_ATOM_BASE_IMAGE}" \
             "${VLLM_VERSION}" \
             "${VLLM_COMMIT}" >> "$GITHUB_STEP_SUMMARY"
 
@@ -413,8 +413,8 @@ jobs:
 
       - name: Generate custom vLLM-ATOM base Dockerfile
         run: |
-          cat > Dockerfile.vLLM-ATOM-base <<EOF
-          FROM ${OOT_BASE_IMAGE}
+          cat > Dockerfile.vllm-atom-base <<EOF
+          FROM ${vLLM_ATOM_BASE_IMAGE}
           RUN pip install -U lm-eval[api]
           RUN pip show lm-eval || true
           RUN pip install hf_transfer
@@ -442,8 +442,8 @@ jobs:
         run: |
           docker build --pull --network=host \
             --no-cache \
-            -t atom_oot_base:ci \
-            -f Dockerfile.vLLM-ATOM-base .
+            -t vllm_atom_base:ci \
+            -f Dockerfile.vllm-atom-base .
 
       - name: Build custom vLLM-ATOM vLLM image
         id: image-meta
@@ -451,37 +451,37 @@ jobs:
           SHORT_SHA="$(git rev-parse --short HEAD)"
           SHORT_VLLM="$(printf '%s' "${VLLM_COMMIT}" | cut -c1-12)"
           SAFE_VLLM_VERSION="$(printf '%s' "${VLLM_VERSION}" | tr '/:' '--')"
-          OOT_IMAGE_TAG="${OOT_IMAGE_REPO}:vLLM-ATOM-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}-${SAFE_VLLM_VERSION}-${SHORT_VLLM}"
+          vLLM_ATOM_IMAGE_TAG="${vLLM_ATOM_IMAGE_REPO}:vLLM-ATOM-benchmark-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}-${SHORT_SHA}-${SAFE_VLLM_VERSION}-${SHORT_VLLM}"
           docker build --network=host \
             --no-cache \
-            -t "${OOT_IMAGE_TAG}" \
-            --target atom_oot \
-            --build-arg OOT_BASE_IMAGE="atom_oot_base:ci" \
+            -t "${vLLM_ATOM_IMAGE_TAG}" \
+            --target vllm_atom \
+            --build-arg vLLM_ATOM_BASE_IMAGE="vllm_atom_base:ci" \
             --build-arg MAX_JOBS=64 \
             --build-arg VLLM_COMMIT="${VLLM_COMMIT}" \
             --build-arg INSTALL_LM_EVAL=1 \
             --build-arg INSTALL_FASTSAFETENSORS=1 \
             -f docker/Dockerfile .
-          echo "oot_image_tag=${OOT_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "vllm_atom_image_tag=${vLLM_ATOM_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Push custom vLLM-ATOM image
         run: |
-          docker push "${{ steps.image-meta.outputs.oot_image_tag }}"
+          docker push "${{ steps.image-meta.outputs.vllm_atom_image_tag }}"
 
       - name: Clean up build images
         if: always()
         run: |
-          docker rmi "${{ steps.image-meta.outputs.oot_image_tag }}" || true
-          docker rmi atom_oot_base:ci || true
+          docker rmi "${{ steps.image-meta.outputs.vllm_atom_image_tag }}" || true
+          docker rmi vllm_atom_base:ci || true
 
   benchmark:
     name: vLLM-ATOM ${{ matrix.model.display }} ${{ matrix.params.input_length }}/${{ matrix.params.output_length }} c=${{ matrix.params.concurrency }}
-    needs: [resolve-atom-source, build-benchmark-matrix, build-vLLM-ATOM-image]
+    needs: [resolve-atom-source, build-benchmark-matrix, build-vllm-atom-image]
     if: >-
       always()
       && needs.resolve-atom-source.result == 'success'
       && needs.build-benchmark-matrix.result == 'success'
-      && (needs.build-vLLM-ATOM-image.result == 'success' || needs.build-vLLM-ATOM-image.result == 'skipped')
+      && (needs.build-vllm-atom-image.result == 'success' || needs.build-vllm-atom-image.result == 'skipped')
       && needs.build-benchmark-matrix.outputs.has_benchmark_cells == 'true'
     strategy:
       fail-fast: false
@@ -496,7 +496,7 @@ jobs:
       DASHBOARD_MODEL_NAME: ${{ matrix.model.dashboard_model || '' }}
       MODEL_SOURCE_PATH: ${{ matrix.model.source_path || matrix.model.path }}
       MODEL_PATH: ${{ matrix.model.path || matrix.model.source_path }}
-      OOT_EXTRA_ARGS: ${{ matrix.model.extra_args }}
+      vLLM_ATOM_EXTRA_ARGS: ${{ matrix.model.extra_args }}
       BENCH_EXTRA_ARGS: ${{ matrix.model.bench_args }}
       RESULT_PREFIX: ${{ matrix.model.prefix }}
       ISL: ${{ matrix.params.input_length }}
@@ -504,11 +504,11 @@ jobs:
       CONC: ${{ matrix.params.concurrency }}
       RANDOM_RANGE_RATIO: ${{ matrix.params.random_range_ratio }}
       RESULT_FILENAME: ${{ matrix.model.prefix }}-${{ matrix.params.input_length }}-${{ matrix.params.output_length }}-${{ matrix.params.concurrency }}-${{ matrix.params.random_range_ratio }}
-      CONTAINER_NAME: atom_vllm_oot_benchmark_${{ strategy.job-index }}
-      CONTAINER_RESULT_DIR: /tmp/vLLM-ATOM-benchmark-results
-      CONTAINER_BENCH_SERVING_DIR: /tmp/vLLM-ATOM-benchmark/bench_serving
-      OOT_IMAGE_TAG: ${{ needs.build-vLLM-ATOM-image.outputs.oot_image_tag || needs.resolve-atom-source.outputs.prebuilt_oot_image }}
-      OOT_IMAGE_SOURCE: ${{ needs.resolve-atom-source.outputs.oot_image_source }}
+      CONTAINER_NAME: vllm_atom_benchmark_${{ strategy.job-index }}
+      CONTAINER_RESULT_DIR: /tmp/vllm-atom-benchmark-results
+      CONTAINER_BENCH_SERVING_DIR: /tmp/vllm-atom-benchmark/bench_serving
+      vLLM_ATOM_IMAGE_TAG: ${{ needs.build-vllm-atom-image.outputs.vllm_atom_image_tag || needs.resolve-atom-source.outputs.prebuilt_vllm_atom_image }}
+      vLLM_ATOM_IMAGE_SOURCE: ${{ needs.resolve-atom-source.outputs.vllm_atom_image_source }}
       BENCH_SERVING_REPO_URL: https://github.com/kimbochen/bench_serving.git
       ATOM_SOURCE_REPOSITORY: ${{ needs.resolve-atom-source.outputs.atom_repository }}
       ATOM_SOURCE_REF: ${{ needs.resolve-atom-source.outputs.atom_ref }}
@@ -562,7 +562,7 @@ jobs:
         run: |
           SOURCE_SHA="$(git rev-parse HEAD)"
           echo "ATOM_SOURCE_SHA=${SOURCE_SHA}" >> "$GITHUB_ENV"
-          echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${OOT_IMAGE_SOURCE} image ${OOT_IMAGE_TAG}"
+          echo "Benchmarking ${ATOM_SOURCE_REPOSITORY}@${ATOM_SOURCE_REF} (${SOURCE_SHA}) with ${vLLM_ATOM_IMAGE_SOURCE} image ${vLLM_ATOM_IMAGE_TAG}"
 
       - name: Docker Login
         if: steps.check.outputs.enabled == 'true'
@@ -576,8 +576,8 @@ jobs:
       - name: Pull vLLM-ATOM benchmark image
         if: steps.check.outputs.enabled == 'true'
         run: |
-          echo "Pulling vLLM-ATOM benchmark image: ${OOT_IMAGE_TAG}"
-          docker pull "${OOT_IMAGE_TAG}"
+          echo "Pulling vLLM-ATOM benchmark image: ${vLLM_ATOM_IMAGE_TAG}"
+          docker pull "${vLLM_ATOM_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         if: steps.check.outputs.enabled == 'true'
@@ -613,7 +613,7 @@ jobs:
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
-          cat > /tmp/oot_env_file.txt << 'EOF'
+          cat > /tmp/vllm_atom_env_file.txt << 'EOF'
           ${{ matrix.model.env_vars }}
           EOF
 
@@ -628,10 +628,10 @@ jobs:
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
-            --env-file /tmp/oot_env_file.txt \
+            --env-file /tmp/vllm_atom_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
-            "${OOT_IMAGE_TAG}"
+            "${vLLM_ATOM_IMAGE_TAG}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -684,10 +684,10 @@ jobs:
             model_dir="/models/${model_dir}"
           fi
           if [ -n "${MODEL_CACHE_MOUNT}" ]; then
-            echo "OOT_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
+            echo "vLLM_ATOM_RESOLVED_MODEL_PATH=${model_dir}" >> "$GITHUB_ENV"
             echo "Using mounted model path: ${model_dir}"
           else
-            echo "OOT_RESOLVED_MODEL_PATH=${MODEL_SOURCE_PATH}" >> "$GITHUB_ENV"
+            echo "vLLM_ATOM_RESOLVED_MODEL_PATH=${MODEL_SOURCE_PATH}" >> "$GITHUB_ENV"
             echo "Using model id: ${MODEL_SOURCE_PATH}"
           fi
 
@@ -711,9 +711,9 @@ jobs:
         run: |
           set -euo pipefail
           docker exec \
-            -e OOT_MODEL_NAME="${MODEL_NAME}" \
-            -e OOT_MODEL_PATH="${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
-            -e OOT_EXTRA_ARGS="${OOT_EXTRA_ARGS}" \
+            -e vLLM_ATOM_MODEL_NAME="${MODEL_NAME}" \
+            -e vLLM_ATOM_MODEL_PATH="${vLLM_ATOM_RESOLVED_MODEL_PATH:-$MODEL_PATH}" \
+            -e vLLM_ATOM_EXTRA_ARGS="${vLLM_ATOM_EXTRA_ARGS}" \
             -e MAX_WAIT_RETRIES="${MAX_WAIT_RETRIES}" \
             -e STREAM_VLLM_LOGS="${STREAM_VLLM_LOGS}" \
             -e KEEP_SERVER_ALIVE_ON_EXIT=1 \
@@ -723,7 +723,7 @@ jobs:
             "
 
           TRUST_REMOTE_CODE_ARG=""
-          if [[ "${OOT_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
+          if [[ "${vLLM_ATOM_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
             TRUST_REMOTE_CODE_ARG="--trust-remote-code"
           fi
 
@@ -741,7 +741,7 @@ jobs:
               rm -rf \"${CONTAINER_RESULT_DIR}\"
               mkdir -p \"${CONTAINER_RESULT_DIR}\"
               PYTHONDONTWRITEBYTECODE=1 python \"${CONTAINER_BENCH_SERVING_DIR}/benchmark_serving.py\" \
-                --model=\"${OOT_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
+                --model=\"${vLLM_ATOM_RESOLVED_MODEL_PATH:-$MODEL_PATH}\" \
                 --backend=vllm \
                 --base-url=http://127.0.0.1:8000 \
                 --dataset-name=random \
@@ -765,15 +765,15 @@ jobs:
             -e RESULT_PATH="${CONTAINER_RESULT_DIR}/${RESULT_FILENAME}.json" \
             -e ISL="${ISL}" \
             -e OSL="${OSL}" \
-            -e EXTRA_ARGS_TEXT="${OOT_EXTRA_ARGS}" \
+            -e EXTRA_ARGS_TEXT="${vLLM_ATOM_EXTRA_ARGS}" \
             -e DASHBOARD_MODEL_NAME="${DASHBOARD_MODEL_NAME}" \
             -e ATOM_SOURCE_REPOSITORY="${ATOM_SOURCE_REPOSITORY}" \
             -e ATOM_SOURCE_REF="${ATOM_SOURCE_REF}" \
             -e ATOM_SOURCE_SHA="${ATOM_SOURCE_SHA}" \
             -e VLLM_COMMIT_USED="${VLLM_COMMIT_USED}" \
             -e VLLM_VERSION_USED="${VLLM_VERSION_USED}" \
-            -e OOT_IMAGE_SOURCE="${OOT_IMAGE_SOURCE}" \
-            -e OOT_IMAGE_TAG_USED="${OOT_IMAGE_TAG}" \
+            -e vLLM_ATOM_IMAGE_SOURCE="${vLLM_ATOM_IMAGE_SOURCE}" \
+            -e vLLM_ATOM_IMAGE_TAG_USED="${vLLM_ATOM_IMAGE_TAG}" \
             -e PUBLISH_TO_DASHBOARD="${PUBLISH_TO_DASHBOARD}" \
             "$CONTAINER_NAME" python3 - <<'PY'
           import json
@@ -804,8 +804,8 @@ jobs:
           data["atom_source_sha"] = os.environ.get("ATOM_SOURCE_SHA", "")
           data["vllm_commit"] = os.environ.get("VLLM_COMMIT_USED", "")
           data["vllm_version"] = os.environ.get("VLLM_VERSION_USED", "")
-          data["oot_image_source"] = os.environ.get("OOT_IMAGE_SOURCE", "")
-          data["oot_image_tag"] = os.environ.get("OOT_IMAGE_TAG_USED", "")
+          data["vllm_atom_image_source"] = os.environ.get("vLLM_ATOM_IMAGE_SOURCE", "")
+          data["vllm_atom_image_tag"] = os.environ.get("vLLM_ATOM_IMAGE_TAG_USED", "")
           data["dashboard_publish_allowed"] = (
               os.environ.get("PUBLISH_TO_DASHBOARD", "false").lower() == "true"
           )
@@ -856,13 +856,13 @@ jobs:
       - name: Clean up vLLM-ATOM benchmark container
         if: always() && steps.check.outputs.enabled == 'true'
         run: |
-          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_oot.pid ]; then kill \$(cat /tmp/vllm_oot.pid) || true; fi" || true
+          docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/vllm_atom.pid ]; then kill \$(cat /tmp/vllm_atom.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
-          if [[ "${OOT_IMAGE_SOURCE}" == "rebuild" ]]; then
-            docker rmi "$OOT_IMAGE_TAG" || true
+          if [[ "${vLLM_ATOM_IMAGE_SOURCE}" == "rebuild" ]]; then
+            docker rmi "$vLLM_ATOM_IMAGE_TAG" || true
           else
-            echo "Keeping prebuilt vLLM-ATOM image cached on runner: ${OOT_IMAGE_TAG}"
+            echo "Keeping prebuilt vLLM-ATOM image cached on runner: ${vLLM_ATOM_IMAGE_TAG}"
           fi
 
   summarize-benchmark-result:
@@ -900,12 +900,12 @@ jobs:
             printf '### Summary mode\nResults from `%s@%s` using `%s` vLLM-ATOM image mode are shown below as a workflow summary table. Because dashboard upload is enabled for this run, this final Ubuntu summary job collects benchmark artifacts from all completed GPU cases and publishes the available successful results in one pass, then reconciles the completed run for regression comparison.\n' \
               "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
               "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
-              "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
+              "${{ needs.resolve-atom-source.outputs.vllm_atom_image_source }}" >> "$GITHUB_STEP_SUMMARY"
           else
             printf '### Summary mode\nResults from `%s@%s` using `%s` vLLM-ATOM image mode are shown below as a workflow summary table only. Dashboard upload is disabled for this run.\n' \
               "${{ needs.resolve-atom-source.outputs.atom_repository }}" \
               "${{ needs.resolve-atom-source.outputs.atom_ref }}" \
-              "${{ needs.resolve-atom-source.outputs.oot_image_source }}" >> "$GITHUB_STEP_SUMMARY"
+              "${{ needs.resolve-atom-source.outputs.vllm_atom_image_source }}" >> "$GITHUB_STEP_SUMMARY"
           fi
 
       - name: Generate vLLM-ATOM benchmark summary table
@@ -917,14 +917,14 @@ jobs:
             --result-dir . \
             --matrix-json "${BENCHMARK_MATRIX}" \
             --run-url "${RUN_URL}" \
-            --output-json oot_benchmark_summary.json \
+            --output-json vllm_atom_benchmark_summary.json \
             >> "$GITHUB_STEP_SUMMARY"
 
       - name: Read summary stats
         id: summary-stats
         run: |
-          PASSED_CASES=$(python3 -c "import json; print(json.load(open('oot_benchmark_summary.json', encoding='utf-8'))['passed_cases'])")
-          FAILED_CASES=$(python3 -c "import json; print(json.load(open('oot_benchmark_summary.json', encoding='utf-8'))['failed_cases'])")
+          PASSED_CASES=$(python3 -c "import json; print(json.load(open('vllm_atom_benchmark_summary.json', encoding='utf-8'))['passed_cases'])")
+          FAILED_CASES=$(python3 -c "import json; print(json.load(open('vllm_atom_benchmark_summary.json', encoding='utf-8'))['failed_cases'])")
           echo "passed_cases=${PASSED_CASES}" >> "$GITHUB_OUTPUT"
           echo "failed_cases=${FAILED_CASES}" >> "$GITHUB_OUTPUT"
           echo "Summary stats: passed=${PASSED_CASES}, failed=${FAILED_CASES}"
@@ -933,7 +933,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: vLLM-ATOM-benchmark-summary
-          path: oot_benchmark_summary.json
+          path: vllm_atom_benchmark_summary.json
 
       - name: Download baseline from previous successful main run
         if: needs.resolve-atom-source.outputs.publish_to_dashboard == 'true' && steps.summary-stats.outputs.passed_cases != '0'

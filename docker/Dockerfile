@@ -1,11 +1,11 @@
 # Default base images
 ARG BASE_IMAGE="rocm/pytorch:latest"
-ARG OOT_BASE_IMAGE="rocm/atom-dev:latest"
+ARG vLLM_ATOM_BASE_IMAGE="rocm/atom-dev:latest"
 ARG SGLANG_BASE_IMAGE="rocm/atom-dev:latest"
 ARG GPU_ARCH="gfx942;gfx950"
 
 # vLLM-ATOM image extends an ATOM base image that already contains atom/aiter/mori.
-FROM ${OOT_BASE_IMAGE} AS atom_oot
+FROM ${vLLM_ATOM_BASE_IMAGE} AS atom_vllm_atom
 
 ARG MAX_JOBS
 ARG VENV_PYTHON="/opt/venv/bin/python"
