@@ -1,59 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1775944098849,
+  "lastUpdate": 1776010516515,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "zejunchen-zejun",
-            "username": "zejunchen-zejun",
-            "email": "zejun.chen@amd.com"
-          },
-          "committer": {
-            "name": "zejunchen-zejun",
-            "username": "zejunchen-zejun",
-            "email": "zejun.chen@amd.com"
-          },
-          "id": "74e43a045041cb006c1288f074d624649710874e",
-          "message": "align weight cache policy with atom native ci\n\nSigned-off-by: zejunchen-zejun <zejun.chen@amd.com>",
-          "timestamp": "2026-04-02T13:45:35Z",
-          "url": "https://github.com/ROCm/ATOM/commit/74e43a045041cb006c1288f074d624649710874e"
-        },
-        "date": 1775143285464,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=64 throughput (tok/s)",
-            "value": 3955.69,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23907512805 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1 | Docker: rocm/atom-dev:vllm-v0.17.0-nightly_20260401"
-          },
-          {
-            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=64 Total Tput (tok/s)",
-            "value": 35655.73,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23907512805 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1 | Docker: rocm/atom-dev:vllm-v0.17.0-nightly_20260401"
-          },
-          {
-            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=64 TTFT (ms)",
-            "value": 538.03,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23907512805 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1 | Docker: rocm/atom-dev:vllm-v0.17.0-nightly_20260401"
-          },
-          {
-            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=64 TPOT (ms)",
-            "value": 15.33,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/23907512805 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.1 | Docker: rocm/atom-dev:vllm-v0.17.0-nightly_20260401"
-          },
-          {
-            "name": "ATOM-vLLM::gpt-oss-120b 8192/1024 c=64 _gpu_count",
-            "value": 1,
-            "unit": ""
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -51720,6 +51669,40 @@ window.BENCHMARK_DATA = {
             "value": 0.4094,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24288448578 | Threshold: 0.38 | Baseline: 0.38 | BaselineModel: openai/gpt-oss-120b | strict-match: 0.2381 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "carlushuang",
+            "username": "carlushuang",
+            "email": "carlus.huang@amd.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "108a70ed4e3c4f4ce3d8afcd5bc7e99c7cbc07ed",
+          "message": "[server] Refactor OpenAI server with tool calling, reasoning, and debug logging (#489)\n\n* [server] Improve OpenAI API compatibility for OpenClaw integration\n\n- Accept multimodal content format: ChatMessage.content now handles both\n  plain string and OpenAI array format ([{\"type\":\"text\",\"text\":\"...\"}])\n- Add model_config extra=\"ignore\" to ChatCompletionRequest and\n  CompletionRequest to silently drop unsupported fields (stream_options,\n  tools, tool_choice, etc.) instead of returning 422\n- Increase DEFAULT_MAX_TOKENS from 256 to 8192 for thinking models\n  (Kimi-K2) where 256 truncates inside <think> blocks\n- Strip <think>...</think> reasoning blocks from both streaming and\n  non-streaming responses so clients see only the final answer\n- Add thinking-block state machine in stream_chat_response() to filter\n  thinking content token-by-token during SSE streaming\n\n* style: fix Black formatting in openai_server.py\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* [server] Refactor OpenAI server into modular architecture with reasoning support\n\nSplit the monolithic openai_server.py (1076 lines) into focused modules\nfollowing the mini-sglang/vLLM pattern:\n\n  atom/entrypoints/openai/\n  ├── __init__.py           - Package re-export\n  ├── protocol.py           - Pydantic request/response models\n  ├── reasoning.py          - Thinking content separation (reasoning_content)\n  ├── serving_chat.py       - Chat completion handler\n  ├── serving_completion.py - Text completion handler\n  └── api_server.py         - FastAPI app, routes, engine interface, main()\n\nKey improvements:\n- Reasoning content separation: <think>...</think> blocks are now returned\n  in a `reasoning_content` field alongside `content`, following the\n  SGLang/vLLM pattern (instead of stripping entirely)\n- Streaming reasoning: thinking tokens stream as reasoning_content deltas,\n  answer tokens as content deltas\n- Tool call token stripping: <|tool_calls_section_*|> tokens filtered\n- OpenAI-format error responses via exception handlers\n- Proper ModelCard/ModelList Pydantic models for /v1/models\n- Compatibility fields: presence_penalty, frequency_penalty, n accepted\n- Backward compatible: python -m atom.entrypoints.openai_server still works\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* style: fix Ruff lint errors (unused imports and variables)\n\n- api_server.py: remove unused ErrorResponse import\n- reasoning.py: remove unused `field` import from dataclasses\n- serving_chat.py: remove unused uuid, List, ChatCompletionRequest\n  imports; remove unused first_chunk and finish variables\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* [test] Add unit tests for OpenAI server entrypoints\n\nAdd tests/entrypoints/ with 46 unit tests covering:\n\n- test_protocol.py (18 tests): ChatMessage multimodal content parsing,\n  ChatCompletionRequest extra field handling, CompletionRequest defaults,\n  response models, ModelCard/ModelList, ErrorResponse\n- test_reasoning.py (17 tests): separate_reasoning() for thinking block\n  extraction, unclosed blocks, tool call stripping; ReasoningFilter\n  streaming state machine with various token sequences\n- test_serving_chat.py (11 tests): SSE chunk creation format,\n  build_chat_response() with reasoning_content separation\n\nAll tests run without GPU (pure unit tests, no engine required).\nFix __init__.py to use lazy import avoiding uvicorn at import time.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* [server] Add tool call parsing support\n\nParse model tool call special tokens into OpenAI-compatible tool_calls\nformat instead of stripping them.\n\nNew file: atom/entrypoints/openai/tool_parser.py\n- parse_tool_calls(text) -> (content, List[ToolCall]) for non-streaming\n- ToolCallStreamParser: stateful streaming parser for SSE chunks\n- Parses <|tool_call_begin|>functions.NAME:INDEX<|tool_call_argument_begin|>\n  ARGS<|tool_call_end|> format (Kimi-K2, etc.)\n\nChanges:\n- protocol.py: add tools/tool_choice fields to ChatCompletionRequest\n- serving_chat.py: integrate tool parser in both streaming and\n  non-streaming paths; set finish_reason=\"tool_calls\" when present\n- reasoning.py: remove tool call stripping (handled by tool_parser now)\n\nTests: 56 unit tests (11 new tool parser tests) + 16 integration tests\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* Fix tool call round-trip for chat templates (Kimi-K2)\n\nMake ChatMessage.content optional (tool messages send content=None) and\nadd to_template_dict() to preserve tool_calls, tool_call_id, name, and\nreasoning_content when rendering the chat template.  Pass request.tools\nthrough to apply_chat_template so the template can inject tool\ndeclarations.\n\nAdds curl tool call tests for both parse_tool_calls and streaming parser.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* Add --request-log flag for debugging API requests and responses\n\nAdds optional JSONL request logging behind --request-log <filepath>.\nWhen enabled, logs all incoming requests, non-streaming responses, and\nstreaming SSE chunks with timestamps and request IDs. Uses a dedicated\nlogger with FileHandler so it doesn't interfere with normal server\noutput. Zero overhead when the flag is not provided.\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* style: fix Black formatting in test_tool_parser\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n* Update copyright year to 2024-2026 in all new files\n\nCo-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 4.6 <noreply@anthropic.com>",
+          "timestamp": "2026-04-10T15:31:14Z",
+          "url": "https://github.com/ROCm/ATOM/commit/108a70ed4e3c4f4ce3d8afcd5bc7e99c7cbc07ed"
+        },
+        "date": 1776010514949,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7506,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24286394546 | Threshold: 0.73 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | strict-match: 0.7491 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b (2 GPUs) accuracy (GSM8K)",
+            "value": 0.4193,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24286394546 | Threshold: 0.38 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | strict-match: 0.235 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
