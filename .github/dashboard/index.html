@@ -533,7 +533,7 @@ function parseRunConfigs(run) {
       const rcm = b.extra.match(/ROCm:\s*([\d.]+)/);
       if (rcm) configs[key]._rocm_version = rcm[1];
       const dm = b.extra.match(/Docker:\s*([^|]+)/);
-      if (dm) configs[key]._oot_image_tag = dm[1].trim();
+      if (dm) configs[key]._vllm_atom_image_tag = dm[1].trim();
     }
   }
   return configs;
@@ -2237,7 +2237,7 @@ function buildDetailHTML(key, cfg) {
       <div class="detail-item"><span class="detail-key">GPU</span><span class="detail-val" style="font-family:inherit">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">VRAM</span><span class="detail-val">${cfg._gpu_vram_gb ? (cfg._gpu_count ? cfg._gpu_count + '× ' : '') + cfg._gpu_vram_gb + ' GB' : '—'}</span></div>
       <div class="detail-item"><span class="detail-key">ROCm</span><span class="detail-val">${escHTML(cfg._rocm_version || '—')}</span></div>
-      <div class="detail-item"><span class="detail-key">Docker</span><span class="detail-val" style="max-width:250px;overflow-wrap:anywhere">${escHTML(cfg._oot_image_tag || '—')}</span></div>
+      <div class="detail-item"><span class="detail-key">Docker</span><span class="detail-val" style="max-width:250px;overflow-wrap:anywhere">${escHTML(cfg._vllm_atom_image_tag || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">Commit</span><span class="detail-val">${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${cfg.commit.id?.slice(0, 7) || '—'}</a>` : (cfg.commit.id?.slice(0, 7) || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">Message</span><span class="detail-val" style="font-family:inherit;max-width:250px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${escHTML(cfg.commit.message || '')}">${escHTML(cfg.commit.message?.split('\n')[0] || '—')}</span></div>
       <div class="detail-item"><span class="detail-key">Author</span><span class="detail-val" style="font-family:inherit">${escHTML(cfg.commit.author?.name || '—')}</span></div>
@@ -2270,7 +2270,7 @@ function showPopover(key, cfg) {
       <div class="pop-row"><span class="pop-key">Backend</span><span class="pop-val" style="font-family:inherit">${escHTML(cfg.backend)}</span></div>
       <div class="pop-row"><span class="pop-key">GPU</span><span class="pop-val" style="font-family:inherit">${cfg._gpu_count ? cfg._gpu_count + '× ' : ''}${escHTML(cfg._gpu_name || '—')}${cfg._gpu_vram_gb ? ' · ' + cfg._gpu_vram_gb + 'GB' : ''}</span></div>
       <div class="pop-row"><span class="pop-key">ROCm</span><span class="pop-val">${escHTML(cfg._rocm_version || '—')}</span></div>
-      <div class="pop-row"><span class="pop-key">Docker</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(cfg._oot_image_tag || '—')}</span></div>
+      <div class="pop-row"><span class="pop-key">Docker</span><span class="pop-val" style="font-size:11px;max-width:260px;overflow-wrap:anywhere">${escHTML(cfg._vllm_atom_image_tag || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Commit</span><span class="pop-val">${safeHref(cfg.commit.url) ? `<a href="${escHTML(safeHref(cfg.commit.url))}" target="_blank" rel="noopener noreferrer">${cfg.commit.id?.slice(0, 7) || '—'}</a>` : (cfg.commit.id?.slice(0, 7) || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Message</span><span class="pop-val" style="font-family:inherit;font-size:12px">${escHTML(cfg.commit.message?.split('\n')[0] || '—')}</span></div>
       <div class="pop-row"><span class="pop-key">Author</span><span class="pop-val" style="font-family:inherit">${escHTML(cfg.commit.author?.name || '—')}</span></div>

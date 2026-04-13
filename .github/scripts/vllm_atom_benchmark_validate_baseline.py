@@ -7,7 +7,10 @@ import argparse
 import json
 from pathlib import Path
 
-SKIP_FILENAMES = {"regression_report.json", "oot_benchmark_summary.json"}
+SKIP_FILENAMES = {
+    "regression_report.json",
+    "vllm_atom_benchmark_summary.json",
+}
 
 
 def is_dashboard_publish_allowed(payload: dict) -> bool:
