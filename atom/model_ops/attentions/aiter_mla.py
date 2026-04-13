@@ -143,7 +143,54 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             mla_metadata["sparse_kv_last_page_lens"].np[:] = 1
             mla_metadata["sparse_kv_last_page_lens"].copy_to_gpu()
 
+        if self.is_sparse and max_seqlen_qo > 1:
+            # Allocate a second set of persistent work buffers for sparse MTP
+            # per-token layout: max_bs*max_seqlen_qo virtual seqs, each q_len=1.
+            smt_max_bs = self.max_bs * max_seqlen_qo
+            (
+                (smt_wmd_size, smt_wmd_type),
+                (smt_wi_size, smt_wi_type),
+                (smt_wis_size, smt_wis_type),
+                (smt_ri_size, smt_ri_type),
+                (smt_rfm_size, smt_rfm_type),
+                (smt_rpm_size, smt_rpm_type),
+            ) = get_mla_metadata_info_v1(
+                smt_max_bs,
+                1,  # max_seqlen_qo=1 for per-token
+                self.padded_num_attention_heads,
+                self.dtype_q,
+                self.dtype_kv,
+                is_sparse=True,
+                fast_mode=True,
+            )
+            mla_metadata["sparse_mtp_work_meta_data"] = torch.empty(
+                smt_wmd_size, dtype=smt_wmd_type, device=self.device
+            )
+            mla_metadata["sparse_mtp_work_indptr"] = torch.empty(
+                smt_wi_size, dtype=smt_wi_type, device=self.device
+            )
+            mla_metadata["sparse_mtp_work_info_set"] = torch.empty(
+                smt_wis_size, dtype=smt_wis_type, device=self.device
+            )
+            mla_metadata["sparse_mtp_reduce_indptr"] = torch.empty(
+                smt_ri_size, dtype=smt_ri_type, device=self.device
+            )
+            mla_metadata["sparse_mtp_reduce_final_map"] = torch.empty(
+                smt_rfm_size, dtype=smt_rfm_type, device=self.device
+            )
+            mla_metadata["sparse_mtp_reduce_partial_map"] = torch.empty(
+                smt_rpm_size, dtype=smt_rpm_type, device=self.device
+            )
+
         self.model_runner.forward_vars.update(mla_metadata)
+
+        if self.is_sparse:
+            self._token_to_seq_idxs_gpu = torch.zeros(
+                self.max_num_batched_tokens,
+                dtype=torch.int32,
+                device=self.device,
+            )
+
         # Per-ubatch buffers for CUDAGraph TBO
         if config.enable_tbo:
             self._allocate_ubatch_buffers(
@@ -213,7 +260,6 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                     **i32_kwargs,
                 )
             var[f"{p}cu_seqlens_q"] = CpuGpuBuffer(ub_max_bs + 1, **i32_kwargs)
-            # cu_seqlens_q for decode is constant [0, q, 2q, ..., bs*q]
             var[f"{p}cu_seqlens_q"].cpu.copy_(
                 torch.arange(
                     0,
@@ -266,6 +312,60 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
     def prep_stream(self):
         # return self.model_runner.tokenID_processor.async_copy_stream
         return self.model_runner.async_execute_stream
+
+    def _set_mla_persistent_worker_buffers_sparse_mtp(
+        self,
+        num_tokens: int,
+    ):
+        """Compute persistent metadata for sparse MTP per-token layout.
+
+        B = batch_size * max_seqlen_q tokens are treated as B independent
+        virtual sequences each with q_len=1.  cu_seqlens_q = [0,1,...,B],
+        kv_indptr = per-token sparse_kv_indptr, kv_last_page_lens = all 1s.
+
+        Uses separate sparse_mtp_* buffers so dense layers can keep
+        their own persistent metadata (max_seqlen_qo=2) intact.
+        """
+        var = self.model_runner.forward_vars
+        split_params = {
+            "kv_granularity": max(self.block_size, 16),
+            "max_seqlen_qo": 1,
+            "uni_seqlen_qo": 1,
+            "fast_mode": 1,
+            "max_split_per_batch": 16,
+        }
+        work_meta_data = var["sparse_mtp_work_meta_data"]
+        work_info_set = var["sparse_mtp_work_info_set"]
+        work_indptr = var["sparse_mtp_work_indptr"]
+        reduce_indptr = var["sparse_mtp_reduce_indptr"]
+        reduce_final_map = var["sparse_mtp_reduce_final_map"]
+        reduce_partial_map = var["sparse_mtp_reduce_partial_map"]
+        get_mla_metadata_v1(
+            var["sparse_cu_seqlens_q"].gpu[: num_tokens + 1],
+            var["sparse_kv_indptr"].gpu[: num_tokens + 1],
+            var["sparse_kv_last_page_lens"].gpu[:num_tokens],
+            self.padded_num_attention_heads,
+            1,  # nhead_kv
+            True,
+            work_meta_data,
+            work_info_set,
+            work_indptr,
+            reduce_indptr,
+            reduce_final_map,
+            reduce_partial_map,
+            page_size=self.block_size,
+            dtype_q=self.dtype_q,
+            dtype_kv=self.dtype_kv,
+            **split_params,
+        )
+        return {
+            "sparse_mtp_work_meta_data": work_meta_data,
+            "sparse_mtp_work_info_set": work_info_set,
+            "sparse_mtp_work_indptr": work_indptr,
+            "sparse_mtp_reduce_indptr": reduce_indptr,
+            "sparse_mtp_reduce_final_map": reduce_final_map,
+            "sparse_mtp_reduce_partial_map": reduce_partial_map,
+        }
 
     def set_mla_persistent_worker_buffers(
         self,
@@ -599,6 +699,12 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 var["sparse_kv_indptr"].np[scheduled_bs : bs + 1] = var[
                     "sparse_kv_indptr"
                 ].np[scheduled_bs]
+                logger.info(
+                    f"[sparse prepare_decode] {bs=} {scheduled_bs=} "
+                    f"context_lens={var['context_lens'].np[:bs].tolist()} "
+                    f"sparse_context_lens={sparse_context_lens.tolist()} "
+                    f"sparse_kv_indptr={var['sparse_kv_indptr'].np[:bs+1].tolist()}"
+                )
                 vars_used.append(("sparse_kv_indptr", bs + 1))
                 metadata_deps.add("sparse_kv_indptr")
 
@@ -624,21 +730,21 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
                 max_seqlen_k,
             )
 
+        is_sparse_mtp = self.is_sparse and max_seqlen_q > 1
         # metadata copies on main_stream
         positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
         ctx.update({el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata})
-        ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
+
+        if is_sparse_mtp:
+            ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
+            ctx_mla_ps_sparse = self._set_mla_persistent_worker_buffers_sparse_mtp(
+                sum_scheduled_tokens
+            )
+        else:
+            ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
+            ctx_mla_ps_sparse = None
         ctx.update(ctx_mla_ps)
         current_stream.wait_stream(prep_stream)
-        # if self.block_ratio > 1:
-        #     if "block_tables" in ctx:
-        #         block_table_convert_triton(
-        #             var["block_tables"].gpu[:bs],
-        #             var["block_tables_converted"].gpu[:bs],
-        #             var["context_lens"].gpu[:bs],
-        #             self.block_ratio,
-        #         )
-        #         ctx["block_tables_converted"] = var["block_tables_converted"].gpu[:bs]
         attn_metadata = AttentionMetaData(
             dropout_p=dropout_p,
             max_seqlen_q=max_seqlen_q,
@@ -646,14 +752,24 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx,
         )
         attn_metadata.dtype_q = self.dtype_q
-        if self.is_sparse and max_seqlen_q > 1:
-            attn_metadata.token_to_seq_idxs = torch.repeat_interleave(
-                torch.arange(scheduled_bs, dtype=torch.int32, device=self.device),
-                max_seqlen_q,
-            )
+
+        if ctx_mla_ps_sparse is not None:
+            for k, v in ctx_mla_ps_sparse.items():
+                setattr(attn_metadata, k, v)
+
+        if is_sparse_mtp:
+            attn_metadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
+                : sum_scheduled_tokens + 1
+            ]
             attn_metadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:sum_scheduled_tokens]
+            self._token_to_seq_idxs_gpu[:sum_scheduled_tokens] = torch.arange(
+                scheduled_bs, dtype=torch.int32, device=self.device
+            ).repeat_interleave(max_seqlen_q)
+            attn_metadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[
+                :sum_scheduled_tokens
+            ]
 
         # Use bs (graph_bs) >= 2 instead of scheduled_bs >= 2 to avoid accuracy issue:
         if self.model_runner.config.enable_tbo_decode and bs >= 2:
@@ -819,7 +935,16 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         sparse_kv_indptr = var["sparse_kv_indptr"].gpu if self.is_sparse else None
         max_q_len = var["mtp_k"] + 1 if "mtp_k" in var else 1
         sum_tokens = bs * max_q_len
-        ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
+        is_sparse_mtp = self.is_sparse and max_q_len > 1
+        if is_sparse_mtp:
+            # Two sets: normal for dense layers, sparse_mtp for sparse layers
+            ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
+            ctx_mla_ps_sparse = self._set_mla_persistent_worker_buffers_sparse_mtp(
+                sum_tokens
+            )
+        else:
+            ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_q_len)
+            ctx_mla_ps_sparse = None
         attn_matadata = AttentionMetaData(
             slot_mapping=var["slot_mapping"].gpu[:sum_tokens],
             context_lens=var["context_lens"].gpu[:bs],
@@ -838,20 +963,23 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             **ctx_mla_ps,
         )
         attn_matadata.dtype_q = self.dtype_q
-        if self.is_sparse and max_q_len > 1:
+        if ctx_mla_ps_sparse is not None:
+            for k, v in ctx_mla_ps_sparse.items():
+                setattr(attn_matadata, k, v)
+        if is_sparse_mtp:
             attn_matadata.sparse_cu_seqlens_q = var["sparse_cu_seqlens_q"].gpu[
                 : sum_tokens + 1
             ]
             attn_matadata.sparse_kv_indptr = var["sparse_kv_indptr"].gpu[
                 : sum_tokens + 1
             ]
-            attn_matadata.token_to_seq_idxs = torch.repeat_interleave(
-                torch.arange(bs, dtype=torch.int32, device=self.device),
-                max_q_len,
-            )
             attn_matadata.sparse_kv_last_page_lens = var[
                 "sparse_kv_last_page_lens"
             ].gpu[:sum_tokens]
+            self._token_to_seq_idxs_gpu[:sum_tokens] = torch.arange(
+                bs, dtype=torch.int32, device=self.device
+            ).repeat_interleave(max_q_len)
+            attn_matadata.token_to_seq_idxs = self._token_to_seq_idxs_gpu[:sum_tokens]
         positions = var["positions"].copy_to_gpu(sum_tokens)
         context = Context(
             positions=positions, is_prefill=False, batch_size=bs, graph_bs=bs

@@ -550,12 +550,15 @@ class MLAAttention(nn.Module):
         paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
         paged_kv_indptr = attn_metadata.kv_indptr
         paged_kv_indices = attn_metadata.kv_indices
+        paged_kv_last_page_lens = attn_metadata.kv_last_page_lens
         max_q_len = attn_metadata.max_seqlen_q
         if self.topk_indices_buffer is not None:
             if attn_metadata.max_seqlen_q > 1:
-                # MTP verify: per-token mode, reuse prefill kernel
+                # MTP verify: per-token layout with max_q_len=1.
+                # Persistent metadata is per-token (from _set_mla_persistent_worker_buffers_sparse_mtp).
                 paged_cu_seqlens_q = attn_metadata.sparse_cu_seqlens_q
                 paged_kv_indptr = attn_metadata.sparse_kv_indptr
+                paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
                 if self.layer_num == 0 and not torch.cuda.is_current_stream_capturing():
                     logger.info(
                         f"[sparse MTP _forward_decode] layer=0 B={B} "
@@ -596,19 +599,30 @@ class MLAAttention(nn.Module):
                 )
 
         dp_size = get_dp_group().world_size
-        # Sparse MTP: persistent metadata was computed with per-seq layout but
-        # kernel is called with per-token layout, so disable persistent mode.
-        is_sparse_mtp = self.topk_indices_buffer is not None and attn_metadata.max_seqlen_q > 1
-        use_persistent_mode = not (dp_size > 1) and not is_sparse_mtp
+        use_persistent_mode = not (dp_size > 1)
+
+        # Sparse layers in MTP verify use separate persistent metadata
+        # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
+        # (max_seqlen_qo=2).
+        is_sparse_mtp = (
+            self.topk_indices_buffer is not None
+            and attn_metadata.max_seqlen_q > 1
+        )
 
         if not use_persistent_mode:
-            # DP : disable persistent mode to avoid overflow
             work_meta_data = None
             work_indptr = None
             work_info_set = None
             reduce_indptr = None
             reduce_final_map = None
             reduce_partial_map = None
+        elif is_sparse_mtp:
+            work_meta_data = attn_metadata.sparse_mtp_work_meta_data
+            work_indptr = attn_metadata.sparse_mtp_work_indptr
+            work_info_set = attn_metadata.sparse_mtp_work_info_set
+            reduce_indptr = attn_metadata.sparse_mtp_reduce_indptr
+            reduce_final_map = attn_metadata.sparse_mtp_reduce_final_map
+            reduce_partial_map = attn_metadata.sparse_mtp_reduce_partial_map
         else:
             work_meta_data = attn_metadata.work_meta_data
             work_indptr = attn_metadata.work_indptr
@@ -616,12 +630,6 @@ class MLAAttention(nn.Module):
             reduce_indptr = attn_metadata.reduce_indptr
             reduce_final_map = attn_metadata.reduce_final_map
             reduce_partial_map = attn_metadata.reduce_partial_map
-
-        paged_kv_last_page_lens = attn_metadata.kv_last_page_lens
-        if is_sparse_mtp:
-            # Per-token mode: need B entries (one per token) instead of bs (one per seq).
-            # sparse_kv_last_page_lens is pre-filled with 1s (block_size=1).
-            paged_kv_last_page_lens = attn_metadata.sparse_kv_last_page_lens
 
         mla_decode_fwd(
             q,
