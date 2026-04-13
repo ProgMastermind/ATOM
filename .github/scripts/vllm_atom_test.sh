@@ -6,9 +6,9 @@ set -euo pipefail
 #   .github/scripts/vllm_atom_test.sh accuracy <mode> [model_name]
 #
 # Alternatively, pass a single model explicitly through environment variables:
-#   OOT_MODEL_NAME
-#   OOT_MODEL_PATH
-#   OOT_EXTRA_ARGS
+#   vLLM_ATOM_MODEL_NAME
+#   vLLM_ATOM_MODEL_PATH
+#   vLLM_ATOM_EXTRA_ARGS
 #
 # TYPE:
 #   launch   - launch vLLM server and wait until ready
@@ -39,26 +39,27 @@ MAX_WAIT_RETRIES=${MAX_WAIT_RETRIES:-60}
 WAIT_INTERVAL_SEC=${WAIT_INTERVAL_SEC:-30}
 VLLM_PORT=${VLLM_PORT:-8000}
 VLLM_HOST=${VLLM_HOST:-localhost}
-VLLM_PID_FILE=${VLLM_PID_FILE:-/tmp/vllm_oot.pid}
-VLLM_LOG_FILE=${VLLM_LOG_FILE:-/tmp/vllm_oot.log}
-RESULT_DIR=${RESULT_DIR:-/tmp/oot_accuracy_results}
-ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/oot_accuracy_output.txt}
+VLLM_PID_FILE=${VLLM_PID_FILE:-/tmp/vllm_atom.pid}
+VLLM_LOG_FILE=${VLLM_LOG_FILE:-/tmp/vllm_atom.log}
+RESULT_DIR=${RESULT_DIR:-/tmp/vllm_atom_accuracy_results}
+ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/vllm_atom_accuracy_output.txt}
 STREAM_VLLM_LOGS=${STREAM_VLLM_LOGS:-1}
 KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
-EXPLICIT_MODEL_NAME=${OOT_MODEL_NAME:-}
-EXPLICIT_MODEL_PATH=${OOT_MODEL_PATH:-}
-EXPLICIT_EXTRA_ARGS=${OOT_EXTRA_ARGS:-}
+EXPLICIT_MODEL_NAME=${vLLM_ATOM_MODEL_NAME:-}
+EXPLICIT_MODEL_PATH=${vLLM_ATOM_MODEL_PATH:-}
+EXPLICIT_EXTRA_ARGS=${vLLM_ATOM_EXTRA_ARGS:-}
+EXPLICIT_ENV_VARS=${vLLM_ATOM_ENV_VARS:-}
 LAST_VLLM_LOG_LINE=0
 
 declare -a ACTIVE_MODELS=()
 if [[ -n "${EXPLICIT_MODEL_NAME}" || -n "${EXPLICIT_MODEL_PATH}" || -n "${EXPLICIT_EXTRA_ARGS}" ]]; then
   if [[ -z "${EXPLICIT_MODEL_NAME}" || -z "${EXPLICIT_MODEL_PATH}" ]]; then
-    echo "OOT_MODEL_NAME and OOT_MODEL_PATH must both be set when using explicit model overrides."
+    echo "vLLM_ATOM_MODEL_NAME and vLLM_ATOM_MODEL_PATH must both be set when using explicit model overrides."
     exit 2
   fi
   ACTIVE_MODELS=("${EXPLICIT_MODEL_NAME}|${EXPLICIT_MODEL_PATH}|${EXPLICIT_EXTRA_ARGS}")
 else
-  echo "${MODE} mode requires OOT_MODEL_NAME and OOT_MODEL_PATH env vars from the workflow."
+  echo "${MODE} mode requires vLLM_ATOM_MODEL_NAME and vLLM_ATOM_MODEL_PATH env vars from the workflow."
   exit 2
 fi
 
@@ -157,10 +158,10 @@ launch_one_model() {
   export VLLM_CACHE_ROOT=/root/.cache/vllm
   export TORCHINDUCTOR_CACHE_DIR=/root/.cache/inductor
 
-  if [[ -n "${OOT_ENV_VARS:-}" ]]; then
+  if [[ -n "${EXPLICIT_ENV_VARS:-}" ]]; then
     while IFS= read -r _env_line; do
       [[ -n "${_env_line}" ]] && export "${_env_line}" && echo "Exported: ${_env_line}"
-    done <<< "$(printf '%b' "${OOT_ENV_VARS}")"
+    done <<< "$(printf '%b' "${EXPLICIT_ENV_VARS}")"
   fi
   rm -rf /root/.cache
 
