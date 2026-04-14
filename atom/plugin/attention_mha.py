@@ -162,6 +162,8 @@ class PagedAttentionImplPluginModeMethods:
                 output_zeros=False,
             )
         else:
+            if self.rotary_emb is not None and position is not None:
+                q, k = self.rotary_emb(position, q, k)
             if self.q_norm is not None:
                 q = self.q_norm(q)
             if self.k_norm is not None:
@@ -579,8 +581,10 @@ class PagedAttentionImplPluginModeMethods:
         # as vLLM cuda graph capture padding mechanism, here split the qkvo with
         # the actual tokens
         query = query[:num_actual_tokens]
-        qkv = qkv[:num_actual_tokens]
-        position = position[:num_actual_tokens]
+        if qkv is not None:
+            qkv = qkv[:num_actual_tokens]
+        if position is not None:
+            position = position[:num_actual_tokens]
         if key is not None:
             key = key[:num_actual_tokens]
         if value is not None:

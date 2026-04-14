@@ -17,6 +17,11 @@ on:
     # from") as the ATOM branch selector, so users do not need to type branch
     # names.
     inputs:
+      run_command_r7b_tp1:
+        description: "Command-R-7B TP1"
+        required: false
+        type: boolean
+        default: false
       run_qwen3_moe_tp8:
         description: "Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8"
         required: false
@@ -366,6 +371,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          - display_name: "Command-R-7B TP1"
+            model_name: "Command-R-7B TP1"
+            model_path: "CohereLabs/c4ai-command-r7b-12-2024"
+            extra_args: "--tensor-parallel-size 1 --enable-chunked-prefill --max-num-batched-tokens 65536 --max-model-len 131072 --no-enable-prefix-caching"
+            env_vars: ""
+            accuracy_test_threshold: 0.70
+            runner: linux-atom-mi35x-1
           - display_name: "DeepSeek-R1-FP8 TP8"
             model_name: "DeepSeek-R1-FP8"
             model_path: "deepseek-ai/DeepSeek-R1-0528"
@@ -792,6 +804,7 @@ jobs:
       - name: Resolve image source and model matrix
         id: meta
         env:
+          RUN_COMMAND_R7B_TP1: ${{ inputs.run_command_r7b_tp1 }}
           RUN_QWEN3_MOE_TP8: ${{ inputs.run_qwen3_moe_tp8 }}
           RUN_QWEN3_NEXT_80B_TP4: ${{ inputs.run_qwen3_next_80b_tp4 }}
           RUN_QWEN35_397B_FP8_TP8: ${{ inputs.run_qwen35_397b_fp8_tp8 }}
@@ -814,6 +827,15 @@ jobs:
 
           event = os.environ["GITHUB_EVENT_NAME"]
           models = [
+              {
+                  "toggle_env": "RUN_COMMAND_R7B_TP1",
+                  "model_name": "Command-R-7B TP1",
+                  "model_path": "CohereLabs/c4ai-command-r7b-12-2024",
+                  "extra_args": "--tensor-parallel-size 1 --enable-chunked-prefill --max-num-batched-tokens 65536 --max-model-len 131072 --no-enable-prefix-caching",
+                  "accuracy_test_threshold": 0.70,
+                  "env_vars": "",
+                  "runner": "linux-atom-mi35x-1",
+              },
               {
                   "toggle_env": "RUN_QWEN3_MOE_TP8",
                   "model_name": "Qwen3-235B-A22B-Instruct-2507-FP8 TP8+EP8",
