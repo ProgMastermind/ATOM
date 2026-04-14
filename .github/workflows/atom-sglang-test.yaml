@@ -112,7 +112,7 @@ jobs:
   build_sglang_image:
     if: ${{ github.event_name == 'pull_request' && github.event.action != 'closed' && github.event.pull_request.draft == false }}
     needs: [check-signal, download_aiter_wheel]
-    name: Reuse SGLANG CI image
+    name: Reuse SGLang-ATOM CI image
     runs-on: build-only-atom
     env:
       SGLANG_REF: v0.5.10
