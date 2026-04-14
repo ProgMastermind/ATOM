@@ -69,7 +69,9 @@ class AiterAttentionMetadataBuilder:
         self.block_size = 1024 if model_runner.block_size == 1024 else 16
         if envs.ATOM_ENABLE_TRITON_UNIFIED_ATTENTION_DECODE:
             # activate block_convertor when UA_decode is enabled
-            assert model_runner.block_size == 1024, "Please set --block-size to 1024 if ATOM_ENABLE_TRITON_UNIFIED_ATTENTION_DECODE=1"
+            assert (
+                model_runner.block_size == 1024
+            ), "Please set --block-size to 1024 if ATOM_ENABLE_TRITON_UNIFIED_ATTENTION_DECODE=1"
             self.block_size = 128 if model_runner.kv_cache_dtype == "fp8" else 64
         # Note: Cannot use super() here because the class is dynamically created by decorator
         # Use explicit parent class call instead

@@ -375,7 +375,9 @@ class PagedAttentionImpl(nn.Module):
                 max_context_partition_num,
                 query_group_size,
             )
-            exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
+            exp_sums = torch.empty(
+                intermediate_shape, dtype=torch.float32, device=q.device
+            )
             max_logits = torch.empty(
                 intermediate_shape, dtype=torch.float32, device=q.device
             )
