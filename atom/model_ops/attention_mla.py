@@ -682,6 +682,14 @@ class MLAAttention(nn.Module):
                     dtype=self.dtype,
                 )
 
+                kv_b_weight = self.kv_b_proj.weight
+                kv_b_scale = self.kv_b_proj.weight_scale
+                if kv_b_scale is None:
+                    kv_b_scale = torch.ones(
+                        kv_b_weight.shape[0],
+                        device=kv_b_weight.device,
+                        dtype=torch.float32,
+                    )
                 gather_kv_b_proj(
                     kv_cache,
                     self._k_scale,
@@ -689,7 +697,7 @@ class MLAAttention(nn.Module):
                     attn_metadata.kv_indices,
                     attn_metadata.cu_seqlens_k,
                     self.kv_b_proj.weight,
-                    self.kv_b_proj.weight_scale,
+                    kv_b_scale,
                     k_full,
                     v_full,
                     weight_preshuffle=True,
