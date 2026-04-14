@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Resolve a stable published OOT image reference for benchmarking.
+"""Resolve a stable published vLLM-ATOM image reference for benchmarking.
 
 Given a floating tag like ``vllm-latest``, this script looks up its manifest
 digest and then searches the same repository for the newest
@@ -31,7 +31,7 @@ MANIFEST_ACCEPT = ", ".join(
     )
 )
 NIGHTLY_RE = re.compile(r"^vllm-v(?P<version>.+)-nightly_(?P<date>\d{8})$")
-USER_AGENT = "ATOM OOT Image Resolver/1.0"
+USER_AGENT = "ATOM vLLM-ATOM Image Resolver/1.0"
 
 
 @dataclass(frozen=True)
@@ -231,7 +231,7 @@ def resolve_image(
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Resolve a floating OOT image tag to a same-digest nightly tag when possible."
+        description="Resolve a floating vLLM-ATOM image tag to a same-digest nightly tag when possible."
     )
     parser.add_argument(
         "--repository",

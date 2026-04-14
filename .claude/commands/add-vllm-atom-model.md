@@ -141,7 +141,7 @@ If this onboarding also updates CI matrix arguments (TP size, env vars, model id
 
 ### 8) Add CI Test Entry
 
-Update `.github/workflows/vllm-atom-test.yaml` and add the model entry to the
+Update `.github/workflows/atom-vllm-test.yaml` and add the model entry to the
 **nightly accuracy path only**.
 
 Do **not** add this model to the pull-request vLLM-ATOM matrix (`jobs.vllm-atom.strategy.matrix.include`).

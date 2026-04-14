@@ -532,7 +532,7 @@ jobs:
           MODEL_MOUNT="${MODEL_CACHE_MOUNT}"
           echo "Using model cache backend: ${MODEL_CACHE_DESC}"
 
-          cat > /tmp/oot_env_file.txt << 'EOF'
+          cat > /tmp/sglang_atom_env_file.txt << 'EOF'
           ${{ matrix.model.env_vars }}
           EOF
 
@@ -547,7 +547,7 @@ jobs:
             --security-opt seccomp=unconfined \
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
-            --env-file /tmp/oot_env_file.txt \
+            --env-file /tmp/sglang_atom_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
             "${SGLANG_IMAGE_TAG}"
