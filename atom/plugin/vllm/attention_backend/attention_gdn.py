@@ -28,7 +28,8 @@ from torch import nn
 
 USE_FLYDSL_GDR = True
 try:
-    from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
+    # from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
+    from .gdr_decode import gdr_decode_
 except ImportError:
     USE_FLYDSL_GDR = False
     print(
@@ -435,15 +436,15 @@ class GatedDeltaNet(nn.Module):
 
                 core_attn_out_non_spec = query_non_spec.new_empty(*value_non_spec.shape)
 
-                flydsl_gdr_decode(
-                    query=query_non_spec.contiguous(),
-                    key=key_non_spec.contiguous(),
-                    value=value_non_spec.contiguous(),
-                    a=a.contiguous(),
-                    b=b.contiguous(),
-                    dt_bias=self.dt_bias.contiguous(),
-                    A_log=self.A_log.contiguous(),
-                    indices=non_spec_state_indices_tensor.contiguous(),
+                gdr_decode_(
+                    query=query_non_spec,
+                    key=key_non_spec,
+                    value=value_non_spec,
+                    a=a,
+                    b=b,
+                    dt_bias=self.dt_bias,
+                    A_log=self.A_log,
+                    indices=non_spec_state_indices_tensor,
                     state=ssm_state,
                     out=core_attn_out_non_spec,
                     use_qk_l2norm=True,
