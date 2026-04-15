@@ -581,51 +581,46 @@ class MLAAttention(nn.Module):
             reduce_final_map = attn_metadata.reduce_final_map
             reduce_partial_map = attn_metadata.reduce_partial_map
 
-        # print(f"{paged_kv_indptr=}")
-        # print(f"{paged_kv_indices=}")
-        # print(f"{attn_metadata.kv_last_page_lens=}")
-        # print(f"{attn_metadata.max_seqlen_q=}")
-        # print(f"{attn_metadata.block_tables=}")
-        # print(f"{attn_metadata.max_seqlen_k=}")
-        # print(f"{attn_metadata.max_seqlen_q=}")
-        mla_decode_fwd_gluon(
-            q,
-            kv_buffer.view(-1, 64, 1, q.shape[-1]),
-            o,
-            attn_metadata.cu_seqlens_q,
-            attn_metadata.context_lens,
-            attn_metadata.max_seqlen_k,
-            attn_metadata.block_tables,
-            self.scale,
-            self.kv_lora_rank,
-            self.qk_rope_head_dim,
-            causal=True,
-            q_descale=self._q_scale,
-            kv_descale=self._k_scale,
-            out_scale=None,
-            use_gluon=False,
-            shuffled_kv_cache=False,
-        )
-        # mla_decode_fwd(
-        #     q,
-        #     kv_buffer.view(-1, 1, 1, q.shape[-1]),
-        #     o,
-        #     attn_metadata.cu_seqlens_q,
-        #     paged_kv_indptr,
-        #     paged_kv_indices,
-        #     attn_metadata.kv_last_page_lens,
-        #     attn_metadata.max_seqlen_q,
-        #     num_kv_splits=16,
-        #     sm_scale=self.scale,
-        #     work_meta_data=work_meta_data,
-        #     work_indptr=work_indptr,
-        #     work_info_set=work_info_set,
-        #     reduce_indptr=reduce_indptr,
-        #     reduce_final_map=reduce_final_map,
-        #     reduce_partial_map=reduce_partial_map,
-        #     q_scale=self._q_scale,
-        #     kv_scale=self._k_scale,
-        # )
+        if envs.ATOM_ENABLE_TRITON_MLA_DECODE:
+            mla_decode_fwd_gluon(
+                q,
+                kv_buffer.view(-1, 64, 1, q.shape[-1]),
+                o,
+                attn_metadata.cu_seqlens_q,
+                attn_metadata.context_lens,
+                attn_metadata.max_seqlen_k,
+                attn_metadata.block_tables,
+                self.scale,
+                self.kv_lora_rank,
+                self.qk_rope_head_dim,
+                causal=True,
+                q_descale=self._q_scale,
+                kv_descale=self._k_scale,
+                out_scale=None,
+                use_gluon=False,
+                shuffled_kv_cache=False,
+            )
+        else:
+            mla_decode_fwd(
+                q,
+                kv_buffer.view(-1, 1, 1, q.shape[-1]),
+                o,
+                attn_metadata.cu_seqlens_q,
+                paged_kv_indptr,
+                paged_kv_indices,
+                attn_metadata.kv_last_page_lens,
+                attn_metadata.max_seqlen_q,
+                num_kv_splits=16,
+                sm_scale=self.scale,
+                work_meta_data=work_meta_data,
+                work_indptr=work_indptr,
+                work_info_set=work_info_set,
+                reduce_indptr=reduce_indptr,
+                reduce_final_map=reduce_final_map,
+                reduce_partial_map=reduce_partial_map,
+                q_scale=self._q_scale,
+                kv_scale=self._k_scale,
+            )
 
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :].contiguous()
