@@ -28,8 +28,7 @@ from torch import nn
 
 USE_FLYDSL_GDR = True
 try:
-    # from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
-    from .gdr_decode import gdr_decode_
+    from aiter.ops.flydsl.linear_attention_kernels import flydsl_gdr_decode
 except ImportError:
     USE_FLYDSL_GDR = False
     print(
@@ -433,10 +432,8 @@ class GatedDeltaNet(nn.Module):
             )
         elif attn_metadata.num_decodes > 0:
             if USE_FLYDSL_GDR:
-
                 core_attn_out_non_spec = query_non_spec.new_empty(*value_non_spec.shape)
-
-                gdr_decode_(
+                flydsl_gdr_decode(
                     query=query_non_spec,
                     key=key_non_spec,
                     value=value_non_spec,
