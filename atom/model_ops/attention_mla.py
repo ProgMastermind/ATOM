@@ -638,9 +638,7 @@ class MLAAttention(nn.Module):
 
         if context.is_prefill and not use_prefill_mla:
             use_prefix_cache = (
-                attn_metadata.has_cached
-                and self.kv_b_proj.weight.dtype != dtypes.fp4x2
-                and self.qk_nope_head_dim == self.v_head_dim
+                attn_metadata.has_cached and self.kv_b_proj.weight.dtype != dtypes.fp4x2
             )
 
             prefill_q = self.q_proj(q, x_scale=q_scale).view(
@@ -675,7 +673,7 @@ class MLAAttention(nn.Module):
                     (
                         attn_metadata.total_kv,
                         self.num_heads,
-                        self.qk_nope_head_dim,
+                        self.v_head_dim,
                     ),
                     device=q.device,
                     dtype=self.dtype,
@@ -699,7 +697,9 @@ class MLAAttention(nn.Module):
                     kv_b_scale,
                     k_full,
                     v_full,
-                    weight_preshuffle=True,
+                    weight_preshuffle=getattr(
+                        self.kv_b_proj.weight, "is_shuffled", False
+                    ),
                 )
                 output = flash_attn_varlen_func(
                     q=prefill_q,
