@@ -23,7 +23,6 @@ from atom.model_ops.fla_ops.fused_sigmoid_gating import (
     fused_sigmoid_gating_delta_rule_update,
 )
 
-# from aiter.ops.triton.gated_delta_net import chunk_gated_delta_rule_opt
 from torch import nn
 
 USE_FLYDSL_GDR = True
@@ -34,57 +33,6 @@ except ImportError:
     print(
         "Failed to import flydsl_gdr_decode. Please make sure you have the latest version of aiter installed."
     )
-# from aiter.dist.parallel_state import get_tp_group
-
-
-# def maybe_dump_flydsl_gdr_inputs(
-#     layer_name: str,
-#     query: torch.Tensor,
-#     key: torch.Tensor,
-#     value: torch.Tensor,
-#     a: torch.Tensor,
-#     b: torch.Tensor,
-#     dt_bias: torch.Tensor,
-#     A_log: torch.Tensor,
-#     indices: torch.Tensor,
-#     state: torch.Tensor,
-# ):
-#     import os
-#     from pathlib import Path
-
-#     dump_path_env = os.getenv("ATOM_GDN_FLYDSL_DUMP_PATH")
-#     if not dump_path_env:
-#         return
-
-#     dump_path = Path(dump_path_env)
-#     if dump_path.exists() and dump_path.is_dir():
-#         dump_path = (
-#             dump_path / f"gdn_flydsl_{os.getpid()}_{layer_name.replace('/', '_')}.pt"
-#         )
-#     elif dump_path.suffix == "":
-#         dump_path.parent.mkdir(parents=True, exist_ok=True)
-#         dump_path = (
-#             dump_path / f"gdn_flydsl_{os.getpid()}_{layer_name.replace('/', '_')}.pt"
-#         )
-#     else:
-#         dump_path.parent.mkdir(parents=True, exist_ok=True)
-
-#     torch.save(
-#         {
-#             "layer_name": layer_name,
-#             "query": query.detach().cpu(),
-#             "key": key.detach().cpu(),
-#             "value": value.detach().cpu(),
-#             "a": a.detach().cpu(),
-#             "b": b.detach().cpu(),
-#             "dt_bias": dt_bias.detach().cpu(),
-#             "A_log": A_log.detach().cpu(),
-#             "indices": indices.detach().cpu(),
-#             "state": state.detach().cpu(),
-#         },
-#         dump_path,
-#     )
-#     os.environ.pop("ATOM_GDN_FLYDSL_DUMP_PATH", None)
 
 
 class ChunkGatedDeltaRule(nn.Module):
