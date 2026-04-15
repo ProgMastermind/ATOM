@@ -1,5 +1,5 @@
 ---
-name: add-atom-vllm-model
+name: add-vllm-atom-model
 description: Add a new model architecture to ATOM vLLM plugin by reusing or implementing model code, registering architecture mappings, updating plugin model registry, validating with smoke and accuracy tests, and adding CI matrix entries. Use when the user asks to onboard/support a new model in ATOM or ATOM plugin mode.
 ---
 
