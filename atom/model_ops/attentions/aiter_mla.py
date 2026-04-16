@@ -468,7 +468,11 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         ctx_mla_ps = self.set_mla_persistent_worker_buffers(bs, max_seqlen_q)
         ctx.update(ctx_mla_ps)
         current_stream.wait_stream(prep_stream)
-        if envs.ATOM_ENABLE_TRITON_MLA_DECODE and self.block_ratio > 1 and "block_tables" in ctx:
+        if (
+            envs.ATOM_ENABLE_TRITON_MLA_DECODE
+            and self.block_ratio > 1
+            and "block_tables" in ctx
+        ):
             if "block_tables" in ctx:
                 block_table_convert_triton(
                     var["block_tables"].gpu[:bs],

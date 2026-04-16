@@ -51,11 +51,15 @@ fused_qk_rope_concat_and_cache_mla = mark_trace(
     fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
 )
 fused_qk_rope_concat_and_cache_mla_triton = mark_trace(
-    fused_qk_rope_concat_and_cache_mla_triton, prefix="rope_and_kv_cache_triton", torch_compile=False
+    fused_qk_rope_concat_and_cache_mla_triton, 
+    prefix="rope_and_kv_cache_triton", 
+    torch_compile=False,
 )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
-mla_decode_fwd_gluon = mark_trace(mla_decode_fwd_gluon, prefix="mla_decode_gluon", torch_compile=False)
+mla_decode_fwd_gluon = mark_trace(
+    mla_decode_fwd_gluon, prefix="mla_decode_gluon", torch_compile=False
+)
 
 # torch.set_printoptions(threshold=10_000)
 
@@ -680,7 +684,10 @@ class MLAAttention(nn.Module):
                         k_nope.unsqueeze(1),
                         k_rope.unsqueeze(1),
                         kv_cache.view(
-                            -1, self.num_kv_heads, 64, self.kv_lora_rank + self.qk_rope_head_dim
+                            -1, 
+                            self.num_kv_heads, 
+                            64, 
+                            self.kv_lora_rank + self.qk_rope_head_dim,
                         ),
                         attn_metadata.slot_mapping.flatten(),
                         self._k_scale,
@@ -768,7 +775,10 @@ class MLAAttention(nn.Module):
                         k_nope.unsqueeze(1),
                         k_rope.unsqueeze(1),
                         kv_cache.view(
-                            -1, self.num_kv_heads, 64, self.kv_lora_rank + self.qk_rope_head_dim
+                            -1, 
+                            self.num_kv_heads, 
+                            64, 
+                            self.kv_lora_rank + self.qk_rope_head_dim,
                         ),
                         q_out=q_out,
                         slot_mapping=attn_metadata.slot_mapping,
@@ -787,7 +797,9 @@ class MLAAttention(nn.Module):
                         k_nope,
                         k_rope,
                         kv_cache.view(
-                            kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+                            kv_cache.shape[0], 
+                            -1, 
+                            self.kv_lora_rank + self.qk_rope_head_dim,
                         ),
                         q_out,
                         attn_metadata.slot_mapping,
