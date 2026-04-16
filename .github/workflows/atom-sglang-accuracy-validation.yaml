@@ -34,7 +34,7 @@ jobs:
     name: Prepare SGLANG validation image
     runs-on: build-only-atom
     outputs:
-      sglang_image_tag: ${{ steps.meta.outputs.sglang_image_tag }}
+      sglang_atom_image_tag: ${{ steps.meta.outputs.sglang_atom_image_tag }}
       cleanup_temp_image: ${{ steps.meta.outputs.cleanup_temp_image }}
       model_matrix: ${{ steps.meta.outputs.model_matrix }}
     steps:
@@ -92,7 +92,7 @@ jobs:
             else
               echo "Scheduled run uses published SGLANG image: ${NIGHTLY_SGLANG_IMAGE_TAG}"
             fi
-            echo "sglang_image_tag=${NIGHTLY_SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+            echo "sglang_atom_image_tag=${NIGHTLY_SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
             echo "cleanup_temp_image=false" >> "$GITHUB_OUTPUT"
             echo "manual_base_image_tag=" >> "$GITHUB_OUTPUT"
             exit 0
@@ -100,7 +100,7 @@ jobs:
 
           SHORT_SHA="$(git rev-parse --short=12 HEAD)"
           MANUAL_BASE_IMAGE_TAG="sglang_atom_manual_base:${GITHUB_RUN_ID}-${SHORT_SHA}"
-          SGLANG_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:sglang-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
+          SGLANG_ATOM_IMAGE_TAG="${VALIDATION_IMAGE_REPO}:sglang-full-manual-${GITHUB_RUN_ID}-${SHORT_SHA}"
           BUILD_CONTEXT="$(mktemp -d)"
           trap 'rm -rf "${BUILD_CONTEXT}"' EXIT
 
@@ -147,7 +147,7 @@ jobs:
             "${BUILD_CONTEXT}"
 
           docker build --network=host --no-cache \
-            -t "${SGLANG_IMAGE_TAG}" \
+            -t "${SGLANG_ATOM_IMAGE_TAG}" \
             --target sglang_atom \
             --build-arg SGLANG_BASE_IMAGE="${MANUAL_BASE_IMAGE_TAG}" \
             --build-arg MAX_JOBS=64 \
@@ -157,16 +157,16 @@ jobs:
             -f "${BUILD_CONTEXT}/docker/Dockerfile" \
             "${BUILD_CONTEXT}"
 
-          docker push "${SGLANG_IMAGE_TAG}"
+          docker push "${SGLANG_ATOM_IMAGE_TAG}"
 
-          echo "sglang_image_tag=${SGLANG_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "sglang_atom_image_tag=${SGLANG_ATOM_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
           echo "cleanup_temp_image=true" >> "$GITHUB_OUTPUT"
           echo "manual_base_image_tag=${MANUAL_BASE_IMAGE_TAG}" >> "$GITHUB_OUTPUT"
 
       - name: Clean up builder images
         if: ${{ always() && steps.meta.outputs.cleanup_temp_image == 'true' }}
         run: |
-          docker rmi "${{ steps.meta.outputs.sglang_image_tag }}" || true
+          docker rmi "${{ steps.meta.outputs.sglang_atom_image_tag }}" || true
           docker rmi "${{ steps.meta.outputs.manual_base_image_tag }}" || true
 
   sglang-model-accuracy:
@@ -182,7 +182,7 @@ jobs:
       contents: write
     env:
       CONTAINER_NAME: sglang_atom_validation_${{ strategy.job-index }}
-      SGLANG_IMAGE_TAG: ${{ needs.prepare-sglang-image.outputs.sglang_image_tag }}
+      SGLANG_ATOM_IMAGE_TAG: ${{ needs.prepare-sglang-image.outputs.sglang_atom_image_tag }}
     steps:
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
@@ -196,7 +196,7 @@ jobs:
 
       - name: Pull SGLANG image
         run: |
-          docker pull "${SGLANG_IMAGE_TAG}"
+          docker pull "${SGLANG_ATOM_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         run: |
@@ -251,7 +251,7 @@ jobs:
             --env-file /tmp/sglang_env_file.txt \
             -e HF_TOKEN="${HF_TOKEN:-}" \
             --name "$CONTAINER_NAME" \
-            "${SGLANG_IMAGE_TAG}"
+            "${SGLANG_ATOM_IMAGE_TAG}"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -415,4 +415,4 @@ jobs:
           docker exec "$CONTAINER_NAME" bash -lc "if [ -f /tmp/sglang_atom.pid ]; then kill \$(cat /tmp/sglang_atom.pid) || true; fi" || true
           docker stop "$CONTAINER_NAME" || true
           docker rm "$CONTAINER_NAME" || true
-          docker rmi "${SGLANG_IMAGE_TAG}" || true
+          docker rmi "${SGLANG_ATOM_IMAGE_TAG}" || true

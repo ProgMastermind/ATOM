@@ -120,7 +120,7 @@ jobs:
     steps:
       - name: Initialize SGLANG image tag
         run: |
-          echo "SGLANG_IMAGE_TAG=rocm/atom-dev:sglang-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
+          echo "SGLANG_ATOM_IMAGE_TAG=rocm/atom-dev:sglang-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
 
       - name: Checkout ATOM repo
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
@@ -138,22 +138,22 @@ jobs:
           set -euo pipefail
           echo "image_exists=false" >> "$GITHUB_OUTPUT"
 
-          if ! docker manifest inspect "${SGLANG_IMAGE_TAG}" >/dev/null 2>&1; then
-            echo "No existing SGLANG image found for ${SGLANG_IMAGE_TAG}; building a new one."
+          if ! docker manifest inspect "${SGLANG_ATOM_IMAGE_TAG}" >/dev/null 2>&1; then
+            echo "No existing SGLANG image found for ${SGLANG_ATOM_IMAGE_TAG}; building a new one."
             exit 0
           fi
 
-          echo "Found existing SGLANG image for ${SGLANG_IMAGE_TAG}; validating SGLang commit label."
-          if ! docker pull "${SGLANG_IMAGE_TAG}"; then
-            echo "Failed to pull existing image ${SGLANG_IMAGE_TAG}; rebuilding it."
+          echo "Found existing SGLANG image for ${SGLANG_ATOM_IMAGE_TAG}; validating SGLang commit label."
+          if ! docker pull "${SGLANG_ATOM_IMAGE_TAG}"; then
+            echo "Failed to pull existing image ${SGLANG_ATOM_IMAGE_TAG}; rebuilding it."
             exit 0
           fi
 
-          EXISTING_SGLANG_REF="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.sglang_ref" }}' "${SGLANG_IMAGE_TAG}" 2>/dev/null || true)"
-          EXISTING_AITER_ARTIFACT_ID="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.aiter_artifact_id" }}' "${SGLANG_IMAGE_TAG}" 2>/dev/null || true)"
+          EXISTING_SGLANG_REF="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.sglang_ref" }}' "${SGLANG_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
+          EXISTING_AITER_ARTIFACT_ID="$(docker inspect --format '{{ index .Config.Labels "com.rocm.atom.aiter_artifact_id" }}' "${SGLANG_ATOM_IMAGE_TAG}" 2>/dev/null || true)"
           if [ -n "${EXISTING_SGLANG_REF}" ] && [ "${EXISTING_SGLANG_REF}" = "${SGLANG_REF}" ] && [ -n "${EXISTING_AITER_ARTIFACT_ID}" ] && [ "${EXISTING_AITER_ARTIFACT_ID}" = "${AITER_ARTIFACT_ID}" ]; then
             echo "image_exists=true" >> "$GITHUB_OUTPUT"
-            echo "Reusing existing SGLANG image for ${SGLANG_IMAGE_TAG} (SGLang commit ${EXISTING_SGLANG_REF}, aiter artifact ${EXISTING_AITER_ARTIFACT_ID})."
+            echo "Reusing existing SGLANG image for ${SGLANG_ATOM_IMAGE_TAG} (SGLang commit ${EXISTING_SGLANG_REF}, aiter artifact ${EXISTING_AITER_ARTIFACT_ID})."
           else
             echo "Existing image label mismatch or missing."
             echo "Expected SGLang commit ${SGLANG_REF}, got ${EXISTING_SGLANG_REF:-<missing>}."
@@ -275,8 +275,8 @@ jobs:
       - name: Push Docker image
         if: ${{ (github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork) && steps.existing_sglang_image.outputs.image_exists != 'true' }}
         run: |
-          docker tag sglang_atom:ci "${SGLANG_IMAGE_TAG}"
-          docker push "${SGLANG_IMAGE_TAG}"
+          docker tag sglang_atom:ci "${SGLANG_ATOM_IMAGE_TAG}"
+          docker push "${SGLANG_ATOM_IMAGE_TAG}"
 
       - name: Skip remote build for fork PR
         if: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
@@ -289,7 +289,7 @@ jobs:
           rm -f Dockerfile.mod || true
           docker rmi "sglang_atom_base:ci" || true
           docker rmi "sglang_atom:ci" || true
-          docker rmi "${SGLANG_IMAGE_TAG}" || true
+          docker rmi "${SGLANG_ATOM_IMAGE_TAG}" || true
 
   atom-sglang-accuracy:
     needs: [check-signal, download_aiter_wheel, build_sglang_image]
@@ -450,15 +450,15 @@ jobs:
           IS_FORK_PR: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork }}
         run: |
           if [ "${IS_FORK_PR}" = "true" ]; then
-            echo "SGLANG_IMAGE_TAG=sglang_atom:ci" >> "$GITHUB_ENV"
+            echo "SGLANG_ATOM_IMAGE_TAG=sglang_atom:ci" >> "$GITHUB_ENV"
           else
-            echo "SGLANG_IMAGE_TAG=rocm/atom-dev:sglang-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
+            echo "SGLANG_ATOM_IMAGE_TAG=rocm/atom-dev:sglang-pre-build-${GITHUB_COMMIT_SHA}" >> "$GITHUB_ENV"
           fi
 
       - name: Pull SGLANG image
         if: ${{ github.event_name != 'pull_request' || !github.event.pull_request.head.repo.fork }}
         run: |
-          docker pull "${SGLANG_IMAGE_TAG}"
+          docker pull "${SGLANG_ATOM_IMAGE_TAG}"
 
       - name: Prepare model cache mount
         run: |
@@ -500,7 +500,7 @@ jobs:
             --ulimit memlock=-1 \
             --ulimit stack=67108864 \
             --name "$CONTAINER_NAME" \
-            "$SGLANG_IMAGE_TAG"
+            "$SGLANG_ATOM_IMAGE_TAG"
         env:
           GITHUB_WORKSPACE: ${{ github.workspace }}
 
@@ -662,7 +662,7 @@ jobs:
           docker rmi "sglang_atom_base:ci" || true
           docker rmi "sglang_atom:ci" || true
           KEEP_COUNT="${SGLANG_IMAGE_CACHE_KEEP:-3}"
-          if [[ "${SGLANG_IMAGE_TAG}" == rocm/atom-dev:sglang-pre-build-* ]]; then
+          if [[ "${SGLANG_ATOM_IMAGE_TAG}" == rocm/atom-dev:sglang-pre-build-* ]]; then
             echo "Keeping current SGLANG image tag and the ${KEEP_COUNT} most recent sglang-pre-build tags."
             mapfile -t OLD_SGLANG_TAGS < <(
               docker image ls --filter=reference='rocm/atom-dev:sglang-pre-build-*' --format '{{.Repository}}:{{.Tag}}' \
@@ -675,7 +675,7 @@ jobs:
                 | awk -v keep="${KEEP_COUNT}" 'NR > keep { print $2 }'
             )
             for tag in "${OLD_SGLANG_TAGS[@]}"; do
-              if [ "${tag}" = "${SGLANG_IMAGE_TAG}" ]; then
+              if [ "${tag}" = "${SGLANG_ATOM_IMAGE_TAG}" ]; then
                 continue
               fi
               echo "Removing old SGLANG image tag: ${tag}"
