@@ -221,7 +221,7 @@ class GatedDeltaNet(nn.Module):
         ssm_state = self_kv_cache[1]
         num_actual_tokens = attn_metadata.num_actual_tokens
         num_accepted_tokens = attn_metadata.num_accepted_tokens
-
+        # print("non_spec_query_start_loc: ", non_spec_query_start_loc, flush=True)
         mixed_qkv = mixed_qkv[:num_actual_tokens]
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
@@ -369,9 +369,23 @@ class GatedDeltaNet(nn.Module):
 
         # 2.2: Process the remaining part
         if attn_metadata.num_prefills > 0:
-            prefill_state_indices = non_spec_state_indices_tensor[attn_metadata.num_decode_tokens + attn_metadata.num_spec_decode_tokens:num_actual_tokens]
-            initial_state = ssm_state[prefill_state_indices].contiguous()
+            prefill_state_indices = non_spec_state_indices_tensor[attn_metadata.num_decodes:]
+            initial_state = ssm_state[non_spec_state_indices_tensor]
             initial_state[~has_initial_state, ...] = 0
+            print("num decode tokens: ", attn_metadata.num_decode_tokens, flush=True)
+            print("num decodes: ", attn_metadata.num_decodes, flush=True)
+            # print("num prefill tokens: ", attn_metadata.num_prefills, flush=True)
+            # print("num spec decode tokens: ", attn_metadata.num_spec_decode_tokens, flush=True)
+            # print("num actual tokens: ", num_actual_tokens, flush=True)
+            # print("initial state shape: ", initial_state.shape, flush=True)
+            # print("prefill state indices shape: ", prefill_state_indices.shape, flush=True)
+            print("inital state shape before slicing: ", initial_state.shape, flush=True)
+            initial_state = initial_state[attn_metadata.num_decodes:].contiguous()
+            print("initial state shape after slicing: ", initial_state.shape, flush=True)
+            print("non_spec_query_start_loc: ", non_spec_query_start_loc, flush=True)
+            # print("")
+            print("cu_seqlens: ", non_spec_query_start_loc[attn_metadata.num_decodes:] - non_spec_query_start_loc[attn_metadata.num_decodes], flush=True)
+            print("num tokens: ", query_non_spec_prefill.shape, flush=True)
             (
                 core_attn_out_non_spec_prefill,
                 last_recurrent_state,
@@ -383,15 +397,16 @@ class GatedDeltaNet(nn.Module):
                 beta=beta_non_spec_prefill,
                 initial_state=initial_state,
                 output_final_state=True,
-                cu_seqlens=non_spec_query_start_loc,
+                cu_seqlens=non_spec_query_start_loc[attn_metadata.num_decodes:] - non_spec_query_start_loc[attn_metadata.num_decodes],
                 use_qk_l2norm_in_kernel=True,
             )
             # Init cache
             ssm_state[prefill_state_indices] = last_recurrent_state.to(
                 ssm_state.dtype
             )
+            core_attn_out[attn_metadata.num_decode_tokens:num_actual_tokens] = core_attn_out_non_spec_prefill.squeeze(0)
         if attn_metadata.num_decodes > 0:
-            decode_state_indices = non_spec_state_indices_tensor[:attn_metadata.num_decode_tokens]
+            decode_state_indices = non_spec_state_indices_tensor[:attn_metadata.num_decodes]
             core_attn_out_non_spec_decode, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -426,7 +441,7 @@ class GatedDeltaNet(nn.Module):
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
-        else:
-            core_attn_out[attn_metadata.num_decode_tokens:num_actual_tokens] = core_attn_out_non_spec_prefill.squeeze(0)
+        # else:
+        #     core_attn_out[attn_metadata.num_decode_tokens:num_actual_tokens] = core_attn_out_non_spec_prefill.squeeze(0)
 
         return core_attn_out
