@@ -21,7 +21,9 @@ from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import mla_decode_fwd as mla_decode_fwd_gluon
 from aiter.ops.triton.kv_cache import cat_and_cache_mla as concat_and_cache_mla_triton
-from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_cat_and_cache_mla as fused_qk_rope_concat_and_cache_mla_triton
+from aiter.ops.triton.fusions.fused_kv_cache import (
+    fused_qk_rope_cat_and_cache_mla as fused_qk_rope_concat_and_cache_mla_triton,
+)
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
@@ -54,8 +56,8 @@ fused_qk_rope_concat_and_cache_mla = mark_trace(
     fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
 )
 fused_qk_rope_concat_and_cache_mla_triton = mark_trace(
-    fused_qk_rope_concat_and_cache_mla_triton, 
-    prefix="rope_and_kv_cache_triton", 
+    fused_qk_rope_concat_and_cache_mla_triton,
+    prefix="rope_and_kv_cache_triton",
     torch_compile=False,
 )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
