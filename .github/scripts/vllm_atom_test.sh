@@ -46,6 +46,7 @@ ACCURACY_LOG_FILE=${ACCURACY_LOG_FILE:-/tmp/vllm_atom_accuracy_output.txt}
 STREAM_VLLM_LOGS=${STREAM_VLLM_LOGS:-1}
 KEEP_SERVER_ALIVE_ON_EXIT=${KEEP_SERVER_ALIVE_ON_EXIT:-0}
 LM_EVAL_NUM_FEWSHOT=${LM_EVAL_NUM_FEWSHOT:-3}
+VLLM_ATOM_DOCKER_IMAGE=${VLLM_ATOM_DOCKER_IMAGE:-}
 EXPLICIT_MODEL_NAME=${vLLM_ATOM_MODEL_NAME:-}
 EXPLICIT_MODEL_PATH=${vLLM_ATOM_MODEL_PATH:-}
 EXPLICIT_EXTRA_ARGS=${vLLM_ATOM_EXTRA_ARGS:-}
@@ -271,6 +272,26 @@ PY
   if [[ "${result_file}" != "${flat_result_file}" ]]; then
     cp -f "${result_file}" "${flat_result_file}"
     result_file="${flat_result_file}"
+  fi
+
+  if [[ -n "${VLLM_ATOM_DOCKER_IMAGE}" ]]; then
+    RESULT_FILE="${result_file}" \
+    VLLM_ATOM_DOCKER_IMAGE="${VLLM_ATOM_DOCKER_IMAGE}" \
+    python - <<'PY'
+import json
+import os
+
+result_file = os.environ["RESULT_FILE"]
+with open(result_file, "r", encoding="utf-8") as f:
+    data = json.load(f)
+
+metadata = data.setdefault("atom_ci_metadata", {})
+if os.environ.get("VLLM_ATOM_DOCKER_IMAGE"):
+    metadata["docker_image"] = os.environ["VLLM_ATOM_DOCKER_IMAGE"]
+
+with open(result_file, "w", encoding="utf-8") as f:
+    json.dump(data, f, indent=2)
+PY
   fi
 
   local value
