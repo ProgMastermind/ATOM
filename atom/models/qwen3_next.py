@@ -353,39 +353,41 @@ class Qwen3NextAttention(nn.Module):
         )
 
         # TODO: maybe dual attention
-        if is_vllm():
-            from vllm.model_executor.layers.attention import Attention
+        # if is_vllm():
+        #     from vllm.model_executor.layers.attention import Attention
 
-            self.attn = Attention(
-                self.num_heads,
-                self.head_dim,
-                self.scaling,
-                num_kv_heads=self.num_kv_heads,
-                cache_config=self.atom_config.plugin_config.vllm_config.cache_config,
-                quant_config=self.atom_config.plugin_config.vllm_config.quant_config,
-                prefix=f"{prefix}.attn",
-                **(
-                    {
-                        "layer_idx": extract_layer_index(prefix),
-                        "dual_chunk_attention_config": self.dual_chunk_attention_config,
-                    }
-                    if self.dual_chunk_attention_config
-                    else {}
-                ),
-            )
-        else:
-            from atom.model_ops.base_attention import Attention
+        #     self.attn = Attention(
+        #         self.num_heads,
+        #         self.head_dim,
+        #         self.scaling,
+        #         num_kv_heads=self.num_kv_heads,
+        #         cache_config=self.atom_config.plugin_config.vllm_config.cache_config,
+        #         quant_config=self.atom_config.plugin_config.vllm_config.quant_config,
+        #         prefix=f"{prefix}.attn",
+        #         **(
+        #             {
+        #                 "layer_idx": extract_layer_index(prefix),
+        #                 "dual_chunk_attention_config": self.dual_chunk_attention_config,
+        #             }
+        #             if self.dual_chunk_attention_config
+        #             else {}
+        #         ),
+        #     )
+        # else:
+        from atom.model_ops.base_attention import Attention
 
-            self.attn = Attention(
-                self.num_heads,
-                self.head_dim,
-                self.scaling,
-                num_kv_heads=self.num_kv_heads,
-                quant_config=quant_config,
-                use_mla=False,
-                layer_num=extract_layer_index(prefix),
-                prefix=f"{prefix}",
-            )
+        self.attn = Attention(
+            self.num_heads,
+            self.head_dim,
+            self.scaling,
+            num_kv_heads=self.num_kv_heads,
+            kv_cache_dtype=atom_config.kv_cache_dtype,
+            quant_config=quant_config,
+            use_mla=False,
+            layer_num=extract_layer_index(prefix),
+            config=atom_config,
+            prefix=f"{prefix}",
+        )
 
         self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
@@ -422,7 +424,6 @@ class Qwen3NextAttention(nn.Module):
         q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
-
         if self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate

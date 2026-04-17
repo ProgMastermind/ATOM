@@ -14,10 +14,117 @@ from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from typing import TYPE_CHECKING, Optional
 from atom.utils import envs
 from atom.model_ops.base_attention import cp_mha_gather_cache
-
+import triton
+import triton.language as tl
 import logging
 
 logger = logging.getLogger("atom")
+
+@triton.jit
+def reshape_and_cache_shuffle_kernel(
+    key_ptr,  # [num_tokens, num_kv_heads, head_size]
+    value_ptr,  # [num_tokens, num_kv_heads, head_size]
+    key_cache_ptr,  # [num_blocks, num_kv_heads, head_size // x, block_size, x]
+    value_cache_ptr,  # [num_blocks, num_kv_heads, block_size // x, head_size, x]
+    slot_mapping_ptr,  # [num_tokens]
+    k_scale_ptr,  # [num_blocks, num_kv_heads, block_size]
+    v_scale_ptr,  # [num_blocks, num_kv_heads, block_size]
+    x,
+    k_stride0,
+    v_stride0,
+    block_size,
+    head_size,
+    num_kv_heads,
+    kcache_block_stride,  # key_cache.stride(0) — actual elements between blocks
+    vcache_block_stride,  # value_cache.stride(0) — actual elements between blocks
+    BLOCK_SIZE: tl.constexpr,
+    QUANT: tl.constexpr,
+    IS_FNUZ: tl.constexpr,
+):
+    tid = tl.program_id(0)
+    head_id = tl.program_id(1)
+    offset = tl.arange(0, BLOCK_SIZE)
+    src_offset_k = tid * k_stride0 + head_id * head_size
+    src_offset_v = tid * v_stride0 + head_id * head_size
+    slot_id = tl.load(slot_mapping_ptr + tid)
+    if slot_id < 0:
+        return
+    block_id = slot_id // block_size
+    block_offset = slot_id % block_size
+    # Use actual block stride instead of computed product of inner dimensions.
+    # When KV cache shares memory with mamba/linear attention layers (hybrid
+    # models like Qwen3.5), blocks are not contiguous — stride[0] > product of
+    # inner dims.  Using the real stride ensures we write to the correct offset.
+    dst_k_offset = (
+        block_id * kcache_block_stride
+        + head_id * head_size * block_size
+    )
+    dst_v_offset = (
+        block_id * vcache_block_stride
+        + head_id * head_size * block_size
+    )
+    dst_k_shuffle_offset = (
+        dst_k_offset + offset // x * block_size * x + block_offset * x + offset % x
+    )
+    # v_cache layout is [num_blocks, num_kv_heads, head_size, block_size]
+    # (plain, NOT shuffled — only k_cache uses shuffle layout)
+    dst_v_shuffle_offset = (
+        dst_v_offset
+        + offset * block_size
+        + block_offset
+    )
+    k_val = tl.load(key_ptr + src_offset_k + offset)
+    v_val = tl.load(value_ptr + src_offset_v + offset)
+    if QUANT:
+        k_scale = 1.0
+        v_scale = 1.0
+        k_dtype = key_cache_ptr.type.element_ty
+        v_dtype = value_cache_ptr.type.element_ty
+        k_val = (k_val.to(tl.float32) / k_scale).to(k_dtype)
+        v_val = (v_val.to(tl.float32) / v_scale).to(v_dtype)
+    tl.store(key_cache_ptr + dst_k_shuffle_offset, k_val)
+    tl.store(value_cache_ptr + dst_v_shuffle_offset, v_val)
+
+def reshape_and_cache_shuffle_triton(
+    key: torch.Tensor,
+    value: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    slot_mapping: torch.Tensor,
+    kv_cache_dtype: str,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+):
+    num_tokens = slot_mapping.shape[0]
+    _, num_kv_heads, head_size = key.shape
+    num_blocks, _, _, block_size, x = key_cache.shape
+    QUANT = False
+    if kv_cache_dtype.startswith("fp8"):
+        QUANT = True
+    grid = (
+        num_tokens,
+        num_kv_heads,
+    )
+    reshape_and_cache_shuffle_kernel[grid](
+        key,
+        value,
+        key_cache,
+        value_cache,
+        slot_mapping,
+        k_scales,
+        v_scales,
+        x,
+        key.stride(0),
+        value.stride(0),
+        block_size,
+        head_size,
+        num_kv_heads,
+        key_cache.stride(0),
+        value_cache.stride(0),
+        BLOCK_SIZE=head_size,
+        QUANT=QUANT,
+        IS_FNUZ=True,
+    )
 
 if TYPE_CHECKING:
     from atom.utils.forward_context import AttentionMetaData
@@ -29,6 +136,10 @@ ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _QWEN_GLUON_PA_DECODE_BS = 64
+
+
+def _is_fp8_kv_cache(kv_cache_dtype: str) -> bool:
+    return kv_cache_dtype.startswith("fp8")
 
 
 class PagedAttentionImplPluginModeMethods:
@@ -72,30 +183,24 @@ class PagedAttentionImplPluginModeMethods:
                 dtype=k_cache.dtype,
                 device="meta",
             )
-            # ATOM: [num_blocks, num_kv_heads, head_size, block_size],
-            # vLLM: [num_blocks, num_kv_heads, block_size // x, head_size, x],
+            new_key_cache = k_cache.view_as(k_cache_template)
+            # ATOM v_cache layout is 4D: [num_blocks, num_kv_heads, head_size, block_size]
+            # This matches what reshape_and_cache_with_pertoken_quant and
+            # pa_decode_gluon expect with asm_layout=True.
             v_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, block_size // x, head_size, x],
+                [num_blocks, num_kv_heads, head_size, block_size],
                 dtype=v_cache.dtype,
                 device="meta",
             )
-            new_key_cache = k_cache.view_as(k_cache_template)
             new_value_cache = v_cache.view_as(v_cache_template)
         else:
             new_key_cache = k_cache
             new_value_cache = v_cache
 
-        # if flash kv_cache layout, the shape of kv_cache is:
-        #
-        # key_cache:   [num_blocks, block_size, num_kv_heads, head_size]
-        # value_cache: [num_blocks, num_kv_heads, head_size, block_size]
-        #
-        # if not, the shape is:
-        #
+        # After view_as, the cache shapes are:
         # key_cache:   [num_blocks, num_kv_heads, head_size // x, block_size, x]
         # value_cache: [num_blocks, num_kv_heads, head_size, block_size]
-        #
-        # and the origin kv cache layout in fwd_args is not flash
+        # This matches ATOM server mode's layout expectations.
 
         attn_metadata = attention_metadata
 
@@ -166,7 +271,20 @@ class PagedAttentionImplPluginModeMethods:
                 q = self.q_norm(q)
             if self.k_norm is not None:
                 k = self.k_norm(k)
-            if self.kv_cache_dtype == "fp8":
+            # Match server mode: use asm_layout only for asm paged attention,
+            # not for triton/gluon decode (which expects non-shuffled v_cache).
+            asm_layout = not use_triton_attn
+            if _is_fp8_kv_cache(self.kv_cache_dtype):
+                if not hasattr(self, '_debug_logged'):
+                    logger.warning(
+                        f"FP8 cache write: k.shape={k.shape}, v.shape={v.shape}, "
+                        f"k_cache.shape={new_key_cache.shape}, v_cache.shape={new_value_cache.shape}, "
+                        f"k_scale.shape={k_scale.shape if k_scale is not None else None}, "
+                        f"v_scale.shape={v_scale.shape if v_scale is not None else None}, "
+                        f"asm_layout={asm_layout}, use_triton_attn={use_triton_attn}, "
+                        f"head_dim={self.head_dim}, kv_cache_dtype={self.kv_cache_dtype}"
+                    )
+                    self._debug_logged = True
                 aiter.reshape_and_cache_with_pertoken_quant(
                     k,
                     v,
@@ -175,7 +293,7 @@ class PagedAttentionImplPluginModeMethods:
                     k_scale,
                     v_scale,
                     attn_metadata.slot_mapping,
-                    asm_layout=True,
+                    asm_layout=asm_layout,
                 )
             else:
                 aiter.reshape_and_cache(
@@ -187,7 +305,7 @@ class PagedAttentionImplPluginModeMethods:
                     kv_cache_dtype="auto",
                     k_scale=None,
                     v_scale=None,
-                    asm_layout=True,
+                    asm_layout=asm_layout,
                 )
 
         return q, k, v, k_cache, v_cache, k_scale, v_scale
@@ -237,9 +355,10 @@ class PagedAttentionImplPluginModeMethods:
         if k_scale is not None and k_scale.numel() > 1:
             k_scale = k_scale.unsqueeze(-1)
             v_scale = v_scale.unsqueeze(-1)
+        is_bf16_kv = not _is_fp8_kv_cache(self.kv_cache_dtype)
         compute_type = (
             torch.bfloat16
-            if self.kv_cache_dtype == "bf16" or per_tensor
+            if is_bf16_kv or per_tensor
             else aiter.dtypes.fp8
         )
 
@@ -262,8 +381,8 @@ class PagedAttentionImplPluginModeMethods:
             context_partition_size,
             compute_type,
             None,
-            None if self.kv_cache_dtype == "bf16" else k_scale,
-            None if self.kv_cache_dtype == "bf16" else v_scale,
+            None if is_bf16_kv else k_scale,
+            None if is_bf16_kv else v_scale,
             exp_sums=exp_sums,
             max_logits=max_logits,
             temporary_output=temporary_output,
@@ -272,7 +391,6 @@ class PagedAttentionImplPluginModeMethods:
             sliding_window=self.sliding_window,
             ps=True,
         )
-
         return o
 
     def paged_attention_asm_plugin_mode(
@@ -300,6 +418,59 @@ class PagedAttentionImplPluginModeMethods:
             V_QScale=v_scale,
             out_=out[:num_decode_tokens],
             high_precision=0,
+        )
+
+        return
+
+    def paged_attention_flash_plugin_mode(
+        self,
+        q: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k_scale: torch.Tensor,
+        v_scale: torch.Tensor,
+        num_decodes: int,
+        num_decode_tokens: int,
+        attn_metadata: "AttentionMetaData",
+        out: torch.Tensor,
+    ):
+        """Decode attention for bf16 kv cache in vLLM flash layout
+        [num_blocks, block_size, num_kv_heads, head_size]."""
+        num_seqs = num_decodes
+        _, num_heads, head_size = q.shape
+        max_seq_len = attn_metadata.plugin_metadata.seq_lens[:num_decodes].max().item()
+        max_num_partitions = (max_seq_len + _PARTITION_SIZE_ROCM - 1) // _PARTITION_SIZE_ROCM
+        nbytes_per_qo_elem = q.element_size()
+        workspace_buffer = torch.empty(
+            (num_seqs * num_heads * max_num_partitions * head_size) * nbytes_per_qo_elem
+            + 2 * (num_seqs * num_heads * max_num_partitions) * 4,
+            dtype=torch.uint8,
+            device=q.device,
+        )
+        # query_start_loc: cumulative start positions for each seq (num_decodes+1 entries)
+        query_start_loc = attn_metadata.plugin_metadata.query_start_loc[:num_decodes]
+        import aiter  # noqa: F401
+        torch.ops.aiter.paged_attention_v1(
+            out[:num_decode_tokens],
+            workspace_buffer,
+            q[:num_decode_tokens],
+            k_cache,
+            v_cache,
+            self.scale,
+            attn_metadata.plugin_metadata.block_table[:num_decodes],
+            query_start_loc,
+            attn_metadata.plugin_metadata.seq_lens[:num_decodes],
+            max_seq_len,
+            None,  # alibi_slopes
+            self.kv_cache_dtype,
+            "NHD",
+            0.0,  # logits_soft_cap
+            k_scale if k_scale is not None else torch.tensor(1.0, device=q.device),
+            v_scale if v_scale is not None else torch.tensor(1.0, device=q.device),
+            None,  # fp8_out_scale
+            _PARTITION_SIZE_ROCM,
+            1,  # max_query_len
+            self.sliding_window if self.sliding_window > 0 else 0,
         )
 
         return
@@ -657,7 +828,7 @@ class PagedAttentionImplPluginModeMethods:
                 device="meta",
             )
             v_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, block_size // x, head_size, x],
+                [num_blocks, num_kv_heads, head_size, block_size],
                 dtype=v_cache.dtype,
                 device="meta",
             )
@@ -699,34 +870,43 @@ class PagedAttentionImplPluginModeMethods:
         if num_decodes > 0:
             assert attn_metadata.plugin_metadata.decode_metadata is not None
 
-            num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
-            x = 16 // k_cache.element_size()
-            k_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, head_size // x, block_size, x],
-                dtype=k_cache.dtype,
-                device="meta",
-            )
-            v_cache_template = torch.empty(
-                [num_blocks, num_kv_heads, block_size // x, head_size, x],
-                dtype=v_cache.dtype,
-                device="meta",
-            )
-            new_key_cache = k_cache.view_as(k_cache_template)
-            new_value_cache = v_cache.view_as(v_cache_template)
-
-            if self.use_triton_attn:
-                self.paged_attention_triton_plugin_mode(
-                    q=query[:num_decode_tokens],
-                    k_cache=new_key_cache,
-                    v_cache=new_value_cache,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                    out=output_actual_tokens[:num_decode_tokens],
-                    attn_metadata=attn_metadata,
+            if _is_fp8_kv_cache(self.kv_cache_dtype):
+                # fp8: kv_cache was written in shuffle layout, use shuffle-layout kernels
+                num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
+                x = 16 // k_cache.element_size()
+                k_cache_template = torch.empty(
+                    [num_blocks, num_kv_heads, head_size // x, block_size, x],
+                    dtype=k_cache.dtype,
+                    device="meta",
                 )
-            else:
-                # Qwen only uses gluon pa decode when bs=64
-                if num_decodes == _QWEN_GLUON_PA_DECODE_BS:
+                v_cache_template = torch.empty(
+                    [num_blocks, num_kv_heads, head_size, block_size],
+                    dtype=v_cache.dtype,
+                    device="meta",
+                )
+                new_key_cache = k_cache.view_as(k_cache_template)
+                new_value_cache = v_cache.view_as(v_cache_template)
+
+                if not hasattr(self, '_debug_decode_logged'):
+                    logger.warning(
+                        f"FP8 decode: k_cache.shape={new_key_cache.shape}, v_cache.shape={new_value_cache.shape}, "
+                        f"k_scale.shape={k_scale.shape if k_scale is not None else None}, "
+                        f"v_scale.shape={v_scale.shape if v_scale is not None else None}, "
+                        f"use_triton_attn={self.use_triton_attn}, num_decodes={num_decodes}"
+                    )
+                    self._debug_decode_logged = True
+
+                if self.use_triton_attn:
+                    self.paged_attention_triton_plugin_mode(
+                        q=query[:num_decode_tokens],
+                        k_cache=new_key_cache,
+                        v_cache=new_value_cache,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        out=output_actual_tokens[:num_decode_tokens],
+                        attn_metadata=attn_metadata,
+                    )
+                elif num_decodes == _QWEN_GLUON_PA_DECODE_BS:
                     self.paged_attention_triton_plugin_mode(
                         q=query[:num_decode_tokens],
                         k_cache=new_key_cache,
@@ -748,9 +928,46 @@ class PagedAttentionImplPluginModeMethods:
                         out=output_actual_tokens[:num_decode_tokens],
                         attn_metadata=attn_metadata,
                     )
+            else:
+                # bf16: kv_cache was written in shuffle layout by rope_cache_plugin_mode,
+                # create ATOM-format views for the decode kernels.
+                num_blocks_d, block_size_d, num_kv_heads_d, head_size_d = k_cache.shape
+                x_d = 16 // k_cache.element_size()
+                k_cache_template_d = torch.empty(
+                    [num_blocks_d, num_kv_heads_d, head_size_d // x_d, block_size_d, x_d],
+                    dtype=k_cache.dtype,
+                    device="meta",
+                )
+                v_cache_template_d = torch.empty(
+                    [num_blocks_d, num_kv_heads_d, head_size_d, block_size_d],
+                    dtype=v_cache.dtype,
+                    device="meta",
+                )
+                new_key_cache_d = k_cache.view_as(k_cache_template_d)
+                new_value_cache_d = v_cache.view_as(v_cache_template_d)
+
+                if self.use_triton_attn:
+                    self.paged_attention_triton_plugin_mode(
+                        q=query[:num_decode_tokens],
+                        k_cache=new_key_cache_d,
+                        v_cache=new_value_cache_d,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        out=output_actual_tokens[:num_decode_tokens],
+                        attn_metadata=attn_metadata,
+                    )
+                else:
+                    self.paged_attention_triton_plugin_mode(
+                        q=query[:num_decode_tokens],
+                        k_cache=new_key_cache_d,
+                        v_cache=new_value_cache_d,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        out=output_actual_tokens[:num_decode_tokens],
+                        attn_metadata=attn_metadata,
+                    )
 
         output = output.view(-1, self.num_heads * self.head_dim)
-
         return output
 
 
@@ -760,6 +977,7 @@ def PagedAttentionImplDecoratorForPluginMode(cls):
         "rope_cache_plugin_mode",
         "paged_attention_triton_plugin_mode",
         "paged_attention_asm_plugin_mode",
+        "paged_attention_flash_plugin_mode",
         "extend_for_sliding_window",
         "extend_forward",
         "forward_impl_plugin_mode",

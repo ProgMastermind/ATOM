@@ -129,13 +129,33 @@ class vllmAiterAttentionBackendMethods:
             MultipleOf,
         )  # pyright: ignore[reportMissingImports]
 
-        return [MultipleOf(16)]
+        return [16]
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
         if block_size is None:
             return True
         return block_size % 16 == 0
+
+    @classmethod
+    def get_kv_cache_block_dim(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        """Discover which tensor dim is the block index, since different
+        backends lay out dims differently."""
+        _S = 1234567
+        shape = cls.get_kv_cache_shape(
+            _S,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+        return shape.index(_S)
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
