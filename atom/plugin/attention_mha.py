@@ -29,6 +29,7 @@ ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _QWEN_GLUON_PA_DECODE_BS = 64
+_NO_PS_FIXED_SPLITS = 64  # covers up to 64 * 256 = 16384 context length
 
 
 class PagedAttentionImplPluginModeMethods:
@@ -126,7 +127,6 @@ class PagedAttentionImplPluginModeMethods:
                 [self.num_heads, self.num_kv_heads, self.num_kv_heads], dim=1
             )
         elif use_triton_attn and self.rotary_emb is not None:
-
             k_scale = v_scale = self.per_tensor_scale
             self.per_token_quant = False
             qkv = qkv.view(qkv.shape[0], -1, self.head_dim)
@@ -181,6 +181,16 @@ class PagedAttentionImplPluginModeMethods:
                     v_scale=None,
                     asm_layout=True,
                 )
+                # reshape_and_cache_shuffle_triton(
+                #     k,
+                #     v,
+                #     new_key_cache,
+                #     new_value_cache,
+                #     attn_metadata.slot_mapping,
+                #     self.kv_cache_dtype,
+                #     k_scale,
+                #     v_scale,
+                # )
 
         return q, k, v, k_cache, v_cache, k_scale, v_scale
 
@@ -193,16 +203,23 @@ class PagedAttentionImplPluginModeMethods:
         v_scale: torch.Tensor,
         out: torch.Tensor,
         attn_metadata: "AttentionMetaData",
+        ps: bool = True,
     ):
         o = out
         num_seqs, num_q_heads_total, head_size = q.shape
         num_blocks, num_kv_heads, _, block_size, _ = k_cache.shape
         query_group_size = num_q_heads_total // num_kv_heads
         assert num_q_heads_total % num_kv_heads == 0
-
-        max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
-
         context_partition_size = 256
+
+        use_ps = self.adopt_persistent_kernel(
+            head_size, num_kv_heads, num_q_heads_total
+        )
+        if use_ps:
+            max_context_partition_num = get_recommended_splits(num_seqs, num_kv_heads)
+        else:
+            max_context_partition_num = _NO_PS_FIXED_SPLITS
+
         if self.sliding_window > 0:
             max_context_partition_num = 1
             context_partition_size = 128
@@ -213,6 +230,9 @@ class PagedAttentionImplPluginModeMethods:
             num_kv_heads,
             max_context_partition_num,
             query_group_size,
+        )
+        compute_type = (
+            torch.bfloat16 if self.kv_cache_dtype == "bf16" else aiter.dtypes.fp8
         )
         exp_sums = torch.empty(intermediate_shape, dtype=torch.float32, device=q.device)
         max_logits = torch.empty(
@@ -225,15 +245,9 @@ class PagedAttentionImplPluginModeMethods:
             device=q.device,
         )
 
-        per_tensor = False
         if k_scale is not None and k_scale.numel() > 1:
             k_scale = k_scale.unsqueeze(-1)
             v_scale = v_scale.unsqueeze(-1)
-        compute_type = (
-            torch.bfloat16
-            if self.kv_cache_dtype == "bf16" or per_tensor
-            else aiter.dtypes.fp8
-        )
 
         num_decode_seqs = q.shape[0]
         seq_lens_decode = attn_metadata.plugin_metadata.seq_lens[:num_decode_seqs]
@@ -262,7 +276,7 @@ class PagedAttentionImplPluginModeMethods:
             alibi_slopes=None,
             sinks=self.sinks,
             sliding_window=self.sliding_window,
-            ps=True,
+            ps=use_ps,
         )
 
         return o
@@ -494,6 +508,12 @@ class PagedAttentionImplPluginModeMethods:
             suffix_output=out,
             suffix_lse=lse,
         )
+
+    def adopt_persistent_kernel(self, head_size, num_kv_heads, num_q_heads):
+        non_ps_database = {(256, 4, 1)}
+        if (head_size, num_q_heads, num_kv_heads) in non_ps_database:
+            return False
+        return True
 
     def forward_impl_plugin_mode(
         self,
@@ -735,6 +755,7 @@ def PagedAttentionImplDecoratorForPluginMode(cls):
         "extend_for_sliding_window",
         "extend_forward",
         "forward_impl_plugin_mode",
+        "adopt_persistent_kernel",
     ]
 
     logger.info(

@@ -127,13 +127,33 @@ class vllmAiterAttentionBackendMethods:
             MultipleOf,
         )  # pyright: ignore[reportMissingImports]
 
-        return [MultipleOf(16)]
+        return [16]
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:
         if block_size is None:
             return True
         return block_size % 16 == 0
+
+    @classmethod
+    def get_kv_cache_block_dim(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str = "auto",
+    ) -> int:
+        """Discover which tensor dim is the block index, since different
+        backends lay out dims differently."""
+        _S = 1234567
+        shape = cls.get_kv_cache_shape(
+            _S,
+            block_size,
+            num_kv_heads,
+            head_size,
+            cache_dtype_str=cache_dtype_str,
+        )
+        return shape.index(_S)
 
     @classmethod
     def get_preferred_block_size(cls, default_block_size: int) -> int:
@@ -230,9 +250,9 @@ def create_attn_metadata_builder_init_method(base_class):
         while len(sliding_window_sizes) > 0:
             sliding_window_config = sliding_window_sizes.pop()
             if sliding_window_config is not None and sliding_window_config[0] != -1:
-                assert (
-                    self.aot_sliding_window is None
-                ), "Aiter Backend only support one valid sliding window"
+                assert self.aot_sliding_window is None, (
+                    "Aiter Backend only support one valid sliding window"
+                )
                 self.aot_sliding_window = sliding_window_config
 
         # for extend path to store the fetched key and value
@@ -1059,9 +1079,7 @@ class vllmMLAAttentionMetadataBuilderMethods:
                         dtype=torch.int32,
                     )
 
-                chunked_context_metadata_cls = (
-                    AiterMLACommonPrefillMetadataForPluginMode.AiterMLAChunkedContextMetadataForPluginMode
-                )
+                chunked_context_metadata_cls = AiterMLACommonPrefillMetadataForPluginMode.AiterMLAChunkedContextMetadataForPluginMode
                 if self.dcp_world_size > 1:
                     chunked_context_metadata = chunked_context_metadata_cls(
                         cu_seq_lens=cu_seq_lens_cpu.to(device, non_blocking=True),
@@ -1203,9 +1221,9 @@ def create_mla_attn_metadata_builder_init_method(base_class):
         num_attention_heads = getattr(
             hf_config, "num_attention_heads", None
         ) or getattr(text_config, "num_attention_heads", None)
-        assert (
-            num_attention_heads is not None
-        ), "num_attention_heads is not found in config"
+        assert num_attention_heads is not None, (
+            "num_attention_heads is not found in config"
+        )
 
         self.num_attention_heads = num_attention_heads // get_tp_group().world_size
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
