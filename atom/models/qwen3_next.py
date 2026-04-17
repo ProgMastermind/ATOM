@@ -110,7 +110,9 @@ def mamba_v2_sharded_weight_loader(
             param.data[
                 boundary : (boundary + take), ...  # type: ignore[misc]
             ] = loaded_weight[
-                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
+                loaded_start_idx : (
+                    loaded_start_idx + take
+                )  # type: ignore[misc]
             ]  # type: ignore[misc]
 
             # move indexing boundaries
@@ -352,28 +354,6 @@ class Qwen3NextAttention(nn.Module):
             dual_chunk_attention_config=self.dual_chunk_attention_config,
         )
 
-        # TODO: maybe dual attention
-        # if is_vllm():
-        #     from vllm.model_executor.layers.attention import Attention
-
-        #     self.attn = Attention(
-        #         self.num_heads,
-        #         self.head_dim,
-        #         self.scaling,
-        #         num_kv_heads=self.num_kv_heads,
-        #         cache_config=self.atom_config.plugin_config.vllm_config.cache_config,
-        #         quant_config=self.atom_config.plugin_config.vllm_config.quant_config,
-        #         prefix=f"{prefix}.attn",
-        #         **(
-        #             {
-        #                 "layer_idx": extract_layer_index(prefix),
-        #                 "dual_chunk_attention_config": self.dual_chunk_attention_config,
-        #             }
-        #             if self.dual_chunk_attention_config
-        #             else {}
-        #         ),
-        #     )
-        # else:
         from atom.model_ops.base_attention import Attention
 
         self.attn = Attention(
