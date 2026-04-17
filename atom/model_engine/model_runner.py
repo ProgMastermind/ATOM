@@ -495,6 +495,12 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.world_size}"
+        if getattr(config, "enable_disagg", False):
+            import hashlib
+
+            self._disagg_session_id = hashlib.md5(
+                config.disagg_kvcache_ipc_addr.encode()
+            ).hexdigest()[:12]
         self.hf_text_config = get_hf_text_config(hf_config)
         if self.hf_text_config.model_type in ["llama"] and self.config.torch_dtype in [
             torch.bfloat16,
@@ -1477,77 +1483,151 @@ class ModelRunner:
         kv_cache_data = {f"layer_{i}": t for i, t in enumerate(kv_cache_tensors)}
         set_kv_cache_data(kv_cache_data)
 
-    def export_model_weight_ipc_handles(self) -> dict:
+    # ------------------------------------------------------------------
+    # Disagg IPC helpers (TP-aware)
+    #
+    # With TP>1, AsyncIOProcManager broadcasts each RPC to all ranks but only
+    # rank 0's return value reaches the engine (the other ranks' output sockets
+    # are wired to None).  For IPC handle exchange we therefore use a per-rank
+    # temp-file rendezvous: every rank pickles its local handles to
+    #   /tmp/atom_disagg_<tag>_rank<N>.pkl
+    # Rank 0 waits until all N files exist, then returns the list of paths to
+    # the engine.  On the import side every rank reads its own file (index=self.rank).
+    # ------------------------------------------------------------------
+
+    def _disagg_rank_file_path(self, tag: str, rank: int) -> str:
+        import tempfile
+
+        return os.path.join(
+            tempfile.gettempdir(),
+            f"atom_disagg_{self._disagg_session_id}_{tag}_rank{rank}.pkl",
+        )
+
+    def _disagg_write_rank_file(self, tag: str, payload) -> str:
+        """Pickle *payload* to a session-unique per-rank temp file.
+
+        Uses a session ID derived from the disagg IPC address so that files
+        from different engine runs never collide.  No deletion: all ranks
+        write concurrently when they receive the broadcast RPC, so rank 0
+        must never delete sibling files.
+        """
+        import pickle
+
+        path = self._disagg_rank_file_path(tag, self.rank)
+        with open(path, "wb") as f:
+            pickle.dump(payload, f)
+        return path
+
+    def _disagg_collect_rank_files(self, tag: str) -> list[str] | None:
+        """Rank 0: poll until all world_size rank files exist, return paths.
+        Other ranks: return None immediately (rank 0 is the sole publisher).
+        """
+        import time
+
+        if self.rank != 0:
+            return None
+        paths = [self._disagg_rank_file_path(tag, r) for r in range(self.world_size)]
+        deadline = time.monotonic() + 120  # 2 min timeout
+        while time.monotonic() < deadline:
+            if all(os.path.exists(p) for p in paths):
+                return paths
+            time.sleep(0.05)
+        raise TimeoutError(
+            f"Timed out waiting for disagg rank files for tag={tag!r}: "
+            + str([p for p in paths if not os.path.exists(p)])
+        )
+
+    def export_model_weight_ipc_handles(self) -> list[str] | None:
         """Export all model parameters as CUDA IPC handles (prefill process only).
 
-        Called by PrefillEngineCore._send_ready_signal() after load_model() completes.
-        Returns a dict {param_name: meta_dict} that can be pickled and sent to
-        decode over ZMQ.  Decode calls import_model_weight_ipc_handles() to
-        replace its own weight tensors with zero-copy views into this allocation.
+        TP-aware: each rank writes its own handles to a temp file.  Rank 0 waits
+        for all ranks' files and returns the list of paths; other ranks return None.
+        Decode calls import_model_weight_ipc_handles(paths) to replace its own
+        weight tensors with zero-copy views into prefill's allocation.
         """
         from atom.model_engine.ipc_utils import export_model_weight_handles
 
-        logger.info("ModelRunner: export_model_weight_ipc_handles called")
-        result = export_model_weight_handles(self.model)
-        logger.info(
-            f"ModelRunner: export_model_weight_ipc_handles done ({len(result)} params)"
-        )
-        return result
+        logger.info(f"ModelRunner rank {self.rank}: export_model_weight_ipc_handles")
+        handles = export_model_weight_handles(self.model)
+        self._disagg_write_rank_file("weights", handles)
+        paths = self._disagg_collect_rank_files("weights")
+        if paths is not None:
+            logger.info(f"ModelRunner rank 0: all {self.world_size} weight files ready")
+        return paths  # non-None only for rank 0
 
-    def import_model_weight_ipc_handles(self, handles: dict) -> bool:
+    def import_model_weight_ipc_handles(self, paths: list[str]) -> bool:
         """Replace model parameters with views into prefill's GPU allocation.
 
-        Called by DecodeEngineCore._init_disagg() after receiving the handles
-        dict from prefill.  After this call decode's model parameters point into
-        prefill's GPU memory — the decode process's original weight tensors are
-        freed.  Returns True as sentinel for async_proc wait_out=True.
+        TP-aware: each rank reads its own handles file (index=self.rank) and
+        deletes it after import.  Returns True as sentinel for wait_out=True.
         """
         from atom.model_engine.ipc_utils import import_model_weights
         import gc
-        import torch
+        import pickle
 
+        path = paths[self.rank]
+        logger.info(f"ModelRunner rank {self.rank}: reading weight handles from {path}")
+        with open(path, "rb") as f:
+            handles = pickle.load(f)
+        os.remove(path)
         import_model_weights(self.model, handles)
-        # Release the now-unreferenced original weight storage.
         gc.collect()
         torch.cuda.empty_cache()
-        logger.info("ModelRunner: model weight IPC import complete — own weights freed")
+        logger.info(
+            f"ModelRunner rank {self.rank}: weight IPC import complete — own weights freed"
+        )
         return True
 
-    def export_kv_cache_ipc_handle(self) -> dict:
+    def export_kv_cache_ipc_handle(self) -> list[str] | None:
         """Export self.kv_cache (and self.kv_scale for fp8) as CUDA IPC handles.
 
-        Call after allocate_kv_cache().  The returned dict can be pickled
-        and sent to the decode process over ZMQ.
+        TP-aware: each rank writes its handles to a temp file.  Rank 0 waits for
+        all ranks and returns the list of paths; other ranks return None.
         """
         from atom.model_engine.ipc_utils import export_kv_cache_handle
 
-        logger.info("ModelRunner: export_kv_cache_ipc_handle called")
+        logger.info(f"ModelRunner rank {self.rank}: export_kv_cache_ipc_handle")
         kv_scale = getattr(self, "kv_scale", None)
-        result = export_kv_cache_handle(self.kv_cache, kv_scale)
-        logger.info("ModelRunner: export_kv_cache_ipc_handle done")
-        return result
+        handles = export_kv_cache_handle(self.kv_cache, kv_scale)
+        self._disagg_write_rank_file("kvcache", handles)
+        paths = self._disagg_collect_rank_files("kvcache")
+        if paths is not None:
+            logger.info(
+                f"ModelRunner rank 0: all {self.world_size} kvcache files ready"
+            )
+        return paths  # non-None only for rank 0
 
-    def import_kv_cache_ipc_handle(self, args: dict, num_kvcache_blocks: int) -> bool:
+    def import_kv_cache_ipc_handle(
+        self, paths: list[str], num_kvcache_blocks: int
+    ) -> bool:
         """Import kvcache from prefill's GPU allocation into this (decode) process.
 
-        Sets self.num_physical_kvcache_blocks (required by _bind_kv_cache_to_modules)
-        from num_kvcache_blocks since allocate_kv_cache() was skipped for decode.
-        Also imports kv_scale when present (fp8 kv cache dtype).
-        All attention module bindings are refreshed immediately.
-        Returns True as sentinel for async_proc wait_out=True.
+        TP-aware: each rank reads its own handles file (index=self.rank) and
+        deletes it after import.  Also imports kv_scale when present (fp8).
+        Returns True as sentinel for wait_out=True.
         """
         from atom.model_engine.ipc_utils import import_kv_cache
+        import pickle
 
         self.num_physical_kvcache_blocks = (
             num_kvcache_blocks * self.attn_metadata_builder.block_ratio
         )
-        logger.info("ModelRunner: calling rebuild_cuda_tensor (hipIpcOpenMemHandle)...")
-        self.kv_cache, kv_scale = import_kv_cache(args)
+        path = paths[self.rank]
+        logger.info(
+            f"ModelRunner rank {self.rank}: reading kvcache handles from {path}"
+        )
+        with open(path, "rb") as f:
+            meta = pickle.load(f)
+        os.remove(path)
+        logger.info(f"ModelRunner rank {self.rank}: hipIpcOpenMemHandle for kvcache...")
+        self.kv_cache, kv_scale = import_kv_cache(meta)
         if kv_scale is not None:
             self.kv_scale = kv_scale
-        logger.info("ModelRunner: rebuild_cuda_tensor complete, binding KV cache...")
+        logger.info(
+            f"ModelRunner rank {self.rank}: kvcache IPC import done, binding..."
+        )
         self._bind_kv_cache_to_modules()
-        logger.info("ModelRunner: import_kv_cache_ipc_handle done")
+        logger.info(f"ModelRunner rank {self.rank}: import_kv_cache_ipc_handle done")
         return True
 
     def create_prefill_stream(self) -> bool:

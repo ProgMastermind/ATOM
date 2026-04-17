@@ -85,21 +85,39 @@ def import_kv_cache(meta: dict) -> tuple[torch.Tensor, torch.Tensor | None]:
 # ---------------------------------------------------------------------------
 
 
+_MLA_ABSORBED_ATTRS = ("W_K", "W_K_scale", "W_V", "W_V_scale")
+_MLA_ABSORBED_PREFIX = "__mla__"
+
+
 def export_model_weight_handles(model: nn.Module) -> dict:
     """Export all model parameter tensors as CUDA IPC handles.
 
+    Also exports MLA weight-absorbed tensors (W_K/W_K_scale/W_V/W_V_scale)
+    which are plain tensor attributes set by process_weights_after_loading(),
+    not nn.Parameters, so named_parameters() misses them.
+
     Must be called from the process that allocated the weights (prefill),
-    after load_model() completes.  Returns a dict {param_name: meta_dict}
-    where each meta_dict can be passed to _import_tensor().
+    after load_model() completes.  Returns a dict {key: meta_dict}.
     """
     handles = {}
     for name, param in model.named_parameters():
         handles[name] = _export_tensor(param.data)
+
+    # Export MLA absorbed weights (non-Parameter tensor attributes).
+    for mod_name, mod in model.named_modules():
+        for attr in _MLA_ABSORBED_ATTRS:
+            t = getattr(mod, attr, None)
+            if t is not None and isinstance(t, torch.Tensor) and t.is_cuda:
+                key = f"{_MLA_ABSORBED_PREFIX}{mod_name}.{attr}"
+                handles[key] = _export_tensor(t)
+
     return handles
 
 
 def import_model_weights(model: nn.Module, handles: dict) -> None:
     """Replace model parameters with views into another process's GPU allocation.
+
+    Also restores MLA absorbed tensors exported by export_model_weight_handles.
 
     Must be called from the consumer process (decode) after receiving the
     handles dict from the producer (prefill).  After this call the decode
@@ -108,8 +126,15 @@ def import_model_weights(model: nn.Module, handles: dict) -> None:
     their reference counts drop to zero.
     """
     params = dict(model.named_parameters())
+    modules = dict(model.named_modules())
+
     for name, meta in handles.items():
-        if name not in params:
-            continue
-        shared_tensor = _import_tensor(meta)
-        params[name].data = shared_tensor
+        if name.startswith(_MLA_ABSORBED_PREFIX):
+            # MLA absorbed tensor: restore as plain attribute on the module.
+            rest = name[len(_MLA_ABSORBED_PREFIX) :]  # "<mod_name>.<attr>"
+            mod_name, _, attr = rest.rpartition(".")
+            mod = modules.get(mod_name)
+            if mod is not None:
+                setattr(mod, attr, _import_tensor(meta))
+        elif name in params:
+            params[name].data = _import_tensor(meta)

@@ -796,6 +796,12 @@ class DecodeEngineCore(EngineCore):
         self.runner_mgr.call_func(
             "import_model_weight_ipc_handles", weight_handles, wait_out=True
         )
+        # Give the GPU allocator a moment to reclaim the freed weight memory
+        # before prefill measures free VRAM for KV cache sizing.  Without this,
+        # the freed pages may not yet be visible and prefill can OOM on alloc.
+        import time
+
+        time.sleep(2)
         logger.info(
             "DecodeEngineCore: weight import complete, sending ACK to prefill..."
         )
