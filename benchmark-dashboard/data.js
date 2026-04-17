@@ -1,98 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1776450282898,
+  "lastUpdate": 1776465949229,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "email": "103567126+valarLip@users.noreply.github.com",
-            "name": "Lingpeng Jin",
-            "username": "valarLip"
-          },
-          "committer": {
-            "email": "noreply@github.com",
-            "name": "GitHub",
-            "username": "web-flow"
-          },
-          "distinct": true,
-          "id": "2f3b89860d3bd114c57da5976a007166b5603514",
-          "message": "fix(dashboard): unify trends chart click to showPopover (#498)\n\nTrends tab chart onClick was using switchToTrace (jump to Data tab),\ninconsistent with Performance/Tradeoff tabs which use showPopover.\nNow all charts show popover on click with the clicked historical\ndata point, not the latest config.",
-          "timestamp": "2026-04-07T16:59:12+08:00",
-          "tree_id": "66d93330c830b7413ae5307167208a1140fa672d",
-          "url": "https://github.com/ROCm/ATOM/commit/2f3b89860d3bd114c57da5976a007166b5603514"
-        },
-        "date": 1775572385910,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::DeepSeek-R1-0528 accuracy (GSM8K)",
-            "value": 0.9477,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24073195111 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | strict-match: 0.9424 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528 MTP accuracy (GSM8K)",
-            "value": 0.9447,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24073195111 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | strict-match: 0.9393 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 accuracy (GSM8K)",
-            "value": 0.9447,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24073195111 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | strict-match: 0.9409 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP accuracy (GSM8K)",
-            "value": 0.5625,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24073195111 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | strict-match: 0.508 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
-          },
-          {
-            "name": "ATOM::GLM-5-FP8 accuracy (GSM8K)",
-            "value": 0.9469,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24073195111 | Threshold: 0.93 | Baseline: 0.9545 | BaselineModel: zai-org/GLM-5 | BaselineNote: HF: amd/GLM-5-MXFP4 card shows GLM-5 baseline=0.9545 (5-shot) | strict-match: 0.95 | fewshot: 3 | Model: /models/zai-org/GLM-5-FP8"
-          },
-          {
-            "name": "ATOM::Kimi-K2.5-MXFP4 accuracy (GSM8K)",
-            "value": 0.934,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24073195111 | Threshold: 0.93 | Baseline: 0.9409 | BaselineModel: moonshotai/Kimi-K2.5 | BaselineNote: HF: amd/Kimi-K2.5-MXFP4 card shows Kimi-K2.5 baseline=0.9409 | strict-match: 0.934 | fewshot: 3 | Model: /models/amd/Kimi-K2.5-MXFP4"
-          },
-          {
-            "name": "ATOM::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
-            "value": 0.7582,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24073195111 | Threshold: 0.73 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | strict-match: 0.7597 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
-          },
-          {
-            "name": "ATOM::Qwen3-235B-A22B-Instruct-2507-FP8 accuracy (GSM8K)",
-            "value": 0.903,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24073195111 | Threshold: 0.87 | Baseline: 0.909 | BaselineModel: Qwen/Qwen3-235B-A22B-Instruct-2507 | BaselineNote: HF: amd/Qwen3-235B-A22B-Instruct-2507-MXFP4 card shows baseline=0.909 | strict-match: 0.8855 | fewshot: 3 | Model: /models/Qwen/Qwen3-235B-A22B-Instruct-2507-FP8"
-          },
-          {
-            "name": "ATOM::Qwen3-Next-80B-A3B-Thinking accuracy (GSM8K)",
-            "value": 0.6793,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24073195111 | Threshold: 0.65 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Thinking | BaselineNote: No public GSM8K baseline; HF card has no GSM8K | strict-match: 0.7991 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Thinking"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b accuracy (GSM8K)",
-            "value": 0.4155,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24073195111 | Threshold: 0.38 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | strict-match: 0.2282 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          },
-          {
-            "name": "ATOM::gpt-oss-120b (2 GPUs) accuracy (GSM8K)",
-            "value": 0.417,
-            "unit": "score",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24073195111 | Threshold: 0.38 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | strict-match: 0.2434 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -56905,6 +56815,82 @@ window.BENCHMARK_DATA = {
             "value": 0.4223,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24575521269 | Threshold: 0.39 | Baseline: 0.41 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202604171524 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.2123 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "f8453e3fc0f65191fb2034602dc9a2066a78020b",
+          "message": "ci: add Qwen3.5-397B-A17B-MXFP4 to per-PR accuracy test (#586)\n\n* ci: add Qwen3.5-397B-A17B-MXFP4 to per-PR accuracy test\n\n- Model: amd/Qwen3.5-397B-A17B-MXFP4, tp=4\n- Test level: pr\n- Accuracy threshold: 0.87 (GSM8K 3-shot flexible-extract)\n\n* fix(ci): fallback to rocminfo when rocm-smi returns generic GPU name\n\nSome docker images (e.g. ROCm 7.2.2) have rocm-smi return \"Radeon\nGraphics\" instead of the actual GPU model in Card Series. Add a\nfallback to rocminfo Marketing Name (filtered by GPU UUID) when\nrocm-smi returns empty or generic \"Radeon Graphics\".\n\nApplied to all three benchmark workflows: atom-benchmark,\natom-sglang-benchmark, atom-vllm-benchmark.\n\n* ci: add Qwen3.5-397B-A17B to accuracy tests and nightly benchmark\n\nAccuracy tests:\n- Qwen3.5-397B-A17B-FP8: nightly, tp=4, threshold=0.85\n- Qwen3.5-397B-A17B-MXFP4: per-PR, tp=4, threshold=0.835\n\nNightly benchmark:\n- Qwen3.5-397B-A17B-FP8: tp=4\n- Qwen3.5-397B-A17B-MXFP4: tp=4",
+          "timestamp": "2026-04-17T14:46:09Z",
+          "url": "https://github.com/ROCm/ATOM/commit/f8453e3fc0f65191fb2034602dc9a2066a78020b"
+        },
+        "date": 1776465947211,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM-vLLM::DeepSeek-R1-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.9439,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24579985435 | Threshold: 0.93 | Baseline: 0.93 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260417 | GPU: AMD Radeon Graphics | VRAM: 252GB | ROCm: 7.2.2 | strict-match: 0.9356 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2-Thinking-MXFP4 TP8 accuracy (GSM8K)",
+            "value": 0.9348,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24579985435 | Threshold: 0.9 | Baseline: 0.9 | BaselineModel: amd/Kimi-K2-Thinking-MXFP4 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260417 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.9318 | fewshot: 3 | Model: /models/amd/Kimi-K2-Thinking-MXFP4"
+          },
+          {
+            "name": "ATOM-vLLM::Kimi-K2.5-MXFP4 TP8 accuracy (GSM8K)",
+            "value": 0.931,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24579985435 | Threshold: 0.92 | Baseline: 0.93 | BaselineModel: amd/Kimi-K2.5-MXFP4 | BaselineNote: Reference value from recipes/atom_vllm/Kimi-K2.5.md | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260417 | GPU: AMD Radeon Graphics | VRAM: 252GB | ROCm: 7.2.2 | strict-match: 0.9318 | fewshot: 3 | Model: /models/amd/Kimi-K2.5-MXFP4"
+          },
+          {
+            "name": "ATOM-vLLM::Llama-3.1-8B-Instruct TP1 accuracy (GSM8K)",
+            "value": 0.7665,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24579985435 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Llama-3.1-8B-Instruct | BaselineNote: Threshold aligned with existing 8B Llama baseline used in CI (3-shot GSM8K). | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260417 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.6793 | fewshot: 3 | Model: /models/meta-llama/Llama-3.1-8B-Instruct"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3-Next-80B-A3B-Instruct-FP8 TP4 accuracy (GSM8K)",
+            "value": 0.0159,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24579985435 | Threshold: 0.76 | Baseline: 0.76 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260417 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.0 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Instruct-FP8"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B TP8 accuracy (GSM8K)",
+            "value": 0,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24579985435 | Threshold: 0.83 | Baseline: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260417 | GPU: AMD Radeon Graphics | VRAM: 252GB | ROCm: 7.2.2 | strict-match: 0.0 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B"
+          },
+          {
+            "name": "ATOM-vLLM::Qwen3.5-397B-A17B-FP8 TP8 accuracy (GSM8K)",
+            "value": 0.0106,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24579985435 | Threshold: 0.83 | Baseline: 0.83 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260417 | GPU: AMD Radeon Graphics | VRAM: 252GB | ROCm: 7.2.2 | strict-match: 0.0008 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b TP1 accuracy (GSM8K)",
+            "value": 0.4124,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24579985435 | Threshold: 0.38 | Baseline: 0.38 | BaselineModel: openai/gpt-oss-120b | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260417 | GPU: AMD Radeon Graphics | VRAM: 252GB | ROCm: 7.2.2 | strict-match: 0.2381 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          },
+          {
+            "name": "ATOM-vLLM::gpt-oss-120b TP2 accuracy (GSM8K)",
+            "value": 0.4033,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/24579985435 | Threshold: 0.38 | Baseline: 0.38 | BaselineModel: openai/gpt-oss-120b | Docker: rocm/atom-dev:vllm-v0.19.0-nightly_20260417 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.2 | strict-match: 0.2328 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
