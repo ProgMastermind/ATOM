@@ -370,7 +370,9 @@ class GatedDeltaNet(nn.Module):
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
             )
+            core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
         elif attn_metadata.num_decodes > 0:
+            o = core_attn_out[:attn_metadata.num_decode_tokens]
             core_attn_out_non_spec, last_recurrent_state = (
                 fused_sigmoid_gating_delta_rule_update(
                     A_log=self.A_log,
@@ -380,6 +382,7 @@ class GatedDeltaNet(nn.Module):
                     q=query_non_spec,
                     k=key_non_spec,
                     v=value_non_spec,
+                    o=o,
                     initial_state=ssm_state,
                     inplace_final_state=True,
                     cu_seqlens=non_spec_query_start_loc[
@@ -404,7 +407,5 @@ class GatedDeltaNet(nn.Module):
             core_attn_out[:num_actual_tokens] = merged_out.squeeze(0)
         elif spec_sequence_masks is not None:
             core_attn_out[:num_actual_tokens] = core_attn_out_spec.squeeze(0)
-        else:
-            core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
         return core_attn_out
