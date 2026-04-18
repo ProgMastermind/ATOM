@@ -1,0 +1,530 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+"""
+Triton fused kernel: GemmaRMSNorm + RoPE + KV cache write for Qwen3-Next.
+
+Accepts separate q, k, v tensors (after torch.split from QKVGParallelLinear):
+  - Q: GemmaRMSNorm + neox RoPE → contiguous q_out
+  - K: GemmaRMSNorm + neox RoPE → contiguous k_out + FP8 quant SHUFFLE cache write
+  - V: FP8 quant + SHUFFLE cache write (no norm, no RoPE)
+
+Returns freshly allocated contiguous (q_out, k_out).
+"""
+
+import torch
+from torch import Tensor
+import triton
+import triton.language as tl
+
+from atom.utils.custom_register import direct_register_custom_op
+from atom.config import get_current_atom_config
+
+
+@triton.jit
+def _fused_qkv_norm_rope_cache_kernel(
+    # Separate Q, K, V input pointers (may be strided views from torch.split)
+    q_ptr,
+    q_stride_t,
+    k_ptr,
+    k_stride_t,
+    v_ptr,
+    v_stride_t,
+    # Contiguous output pointers
+    q_out_ptr,
+    k_out_ptr,
+    # Norm weights
+    qw_ptr,
+    kw_ptr,
+    # RoPE cos/sin caches: [max_pos, rotary_dim//2]
+    cos_cache_ptr,
+    sin_cache_ptr,
+    cos_sin_stride_pos,
+    # Positions
+    pos_ptr,
+    # KV cache pointers (SHUFFLE layout)
+    k_cache_ptr,
+    v_cache_ptr,
+    # KV cache strides (5D SHUFFLE: [num_blocks, num_kv_heads, D//X, block_size, X])
+    kc_stride_block,
+    kc_stride_head,
+    kc_stride_dx,
+    kc_stride_slot,
+    kc_stride_x,
+    # V cache strides (5D SHUFFLE: [num_blocks, num_kv_heads, block_size//X, head_dim, X])
+    vc_stride_block,
+    vc_stride_head,
+    vc_stride_sc,
+    vc_stride_d,
+    vc_stride_x,
+    # KV scale pointers (per-token scales: [num_blocks, num_kv_heads, block_size])
+    k_scale_ptr,
+    v_scale_ptr,
+    ks_stride_block,
+    ks_stride_head,
+    vs_stride_block,
+    vs_stride_head,
+    # Slot mapping
+    slot_mapping_ptr,
+    # Dimensions
+    num_heads: tl.constexpr,
+    num_kv_heads: tl.constexpr,
+    eps: tl.constexpr,
+    # Cache layout
+    BLOCK_SIZE: tl.constexpr,
+    X_SIZE: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    ROTARY_DIM: tl.constexpr,
+    ROTARY_DIM_HALF: tl.constexpr,
+    IS_FP8: tl.constexpr,
+):
+    # Grid: (num_tokens * (num_heads + num_kv_heads),)
+    pid = tl.program_id(0)
+    total_heads = num_heads + num_kv_heads
+    token_id = pid // total_heads
+    head_id = pid % total_heads
+
+    d_offs = tl.arange(0, BLOCK_D)
+
+    if head_id < num_heads:
+        # ============ Q head processing: GemmaRMSNorm + RoPE ============
+        h = head_id
+        # Input offset uses strided layout
+        q_in_offset = token_id * q_stride_t + h * BLOCK_D
+
+        # Load q from strided input
+        q = tl.load(q_ptr + q_in_offset + d_offs).to(tl.float32)
+
+        # GemmaRMSNorm: x * rsqrt(mean(x^2) + eps) * (1 + weight)
+        variance = tl.sum(q * q, axis=0) / BLOCK_D
+        q_normed = q * tl.math.rsqrt(variance + eps)
+        qw = tl.load(qw_ptr + d_offs).to(tl.float32)
+        q_normed = q_normed * (1.0 + qw)
+
+        # RoPE (neox-style, partial rotary)
+        pos = tl.load(pos_ptr + token_id)
+
+        rot_mask = d_offs < ROTARY_DIM
+        first_half_mask = d_offs < ROTARY_DIM_HALF
+        d_cos_idx = tl.where(
+            first_half_mask,
+            d_offs,
+            tl.where(
+                d_offs < ROTARY_DIM,
+                d_offs - ROTARY_DIM_HALF,
+                tl.zeros_like(d_offs),
+            ),
+        )
+        cos_base = pos * cos_sin_stride_pos
+        cos_vals = tl.load(
+            cos_cache_ptr + cos_base + d_cos_idx, mask=rot_mask, other=1.0
+        ).to(tl.float32)
+        sin_vals = tl.load(
+            sin_cache_ptr + cos_base + d_cos_idx, mask=rot_mask, other=0.0
+        ).to(tl.float32)
+
+        # Neox RoPE rotation in registers (no global memory scratch)
+        gather_idx = tl.where(
+            first_half_mask,
+            d_offs + ROTARY_DIM_HALF,
+            tl.where(d_offs < ROTARY_DIM, d_offs - ROTARY_DIM_HALF, d_offs),
+        )
+        q_gathered_raw = tl.load(q_ptr + q_in_offset + gather_idx).to(tl.float32)
+        qw_gathered = tl.load(qw_ptr + gather_idx).to(tl.float32)
+        q_gathered_normed = (
+            q_gathered_raw * tl.math.rsqrt(variance + eps) * (1.0 + qw_gathered)
+        )
+        q_rot = tl.where(first_half_mask, -q_gathered_normed, q_gathered_normed)
+        q_rot = tl.where(rot_mask, q_rot, 0.0)
+
+        q_roped = q_normed * cos_vals + q_rot * sin_vals
+
+        # Write to contiguous q_out: [T, num_heads * BLOCK_D]
+        q_out_offset = token_id * (num_heads * BLOCK_D) + h * BLOCK_D
+        tl.store(
+            q_out_ptr + q_out_offset + d_offs,
+            q_roped.to(q_out_ptr.dtype.element_ty),
+        )
+    else:
+        # ============ KV head processing ============
+        kv_h = head_id - num_heads
+
+        # --- K: GemmaRMSNorm + RoPE → contiguous k_out + cache write ---
+        # Input offset uses strided layout
+        k_in_offset = token_id * k_stride_t + kv_h * BLOCK_D
+        k = tl.load(k_ptr + k_in_offset + d_offs).to(tl.float32)
+
+        # GemmaRMSNorm on k
+        k_variance = tl.sum(k * k, axis=0) / BLOCK_D
+        k_normed = k * tl.math.rsqrt(k_variance + eps)
+        kw = tl.load(kw_ptr + d_offs).to(tl.float32)
+        k_normed = k_normed * (1.0 + kw)
+
+        # RoPE on k (neox-style, partial rotary)
+        pos = tl.load(pos_ptr + token_id)
+
+        rot_mask = d_offs < ROTARY_DIM
+        first_half_mask = d_offs < ROTARY_DIM_HALF
+        d_cos_idx = tl.where(
+            first_half_mask,
+            d_offs,
+            tl.where(
+                d_offs < ROTARY_DIM, d_offs - ROTARY_DIM_HALF, tl.zeros_like(d_offs)
+            ),
+        )
+        cos_base = pos * cos_sin_stride_pos
+        cos_vals = tl.load(
+            cos_cache_ptr + cos_base + d_cos_idx, mask=rot_mask, other=1.0
+        ).to(tl.float32)
+        sin_vals = tl.load(
+            sin_cache_ptr + cos_base + d_cos_idx, mask=rot_mask, other=0.0
+        ).to(tl.float32)
+
+        # Neox RoPE rotation in registers
+        gather_idx = tl.where(
+            first_half_mask,
+            d_offs + ROTARY_DIM_HALF,
+            tl.where(d_offs < ROTARY_DIM, d_offs - ROTARY_DIM_HALF, d_offs),
+        )
+        k_gathered_raw = tl.load(k_ptr + k_in_offset + gather_idx).to(tl.float32)
+        kw_gathered = tl.load(kw_ptr + gather_idx).to(tl.float32)
+        k_gathered_normed = (
+            k_gathered_raw * tl.math.rsqrt(k_variance + eps) * (1.0 + kw_gathered)
+        )
+        k_rot = tl.where(first_half_mask, -k_gathered_normed, k_gathered_normed)
+        k_rot = tl.where(rot_mask, k_rot, 0.0)
+
+        k_roped = k_normed * cos_vals + k_rot * sin_vals
+
+        # Write to contiguous k_out: [T, num_kv_heads * BLOCK_D]
+        k_out_offset = token_id * (num_kv_heads * BLOCK_D) + kv_h * BLOCK_D
+        tl.store(
+            k_out_ptr + k_out_offset + d_offs,
+            k_roped.to(k_out_ptr.dtype.element_ty),
+        )
+
+        # --- V: load for cache write (no norm, no RoPE) ---
+        v_in_offset = token_id * v_stride_t + kv_h * BLOCK_D
+        v = tl.load(v_ptr + v_in_offset + d_offs)
+
+        # === KV cache write (SHUFFLE layout) ===
+        slot = tl.load(slot_mapping_ptr + token_id).to(tl.int64)
+        if slot >= 0:
+            block_idx = slot // BLOCK_SIZE
+            slot_in_block = slot % BLOCK_SIZE
+
+            if IS_FP8:
+                # FP8 per-token quantization for k
+                k_abs_max = tl.max(tl.abs(k_roped), axis=0)
+                k_scale = k_abs_max / 240.0
+                k_scale = tl.where(k_scale == 0.0, 1.0, k_scale)
+                k_quant = (k_roped / k_scale).to(k_cache_ptr.dtype.element_ty)
+
+                tl.store(
+                    k_scale_ptr
+                    + block_idx * ks_stride_block
+                    + kv_h * ks_stride_head
+                    + slot_in_block,
+                    k_scale,
+                )
+            else:
+                k_quant = k_roped.to(k_cache_ptr.dtype.element_ty)
+
+            # K cache SHUFFLE write: [num_blocks, num_kv_heads, head_dim//X, block_size, X]
+            k_quant_2d = tl.reshape(k_quant, (BLOCK_D // X_SIZE, X_SIZE))
+            dx_offs = tl.arange(0, BLOCK_D // X_SIZE).to(tl.int64)
+            x_offs = tl.arange(0, X_SIZE).to(tl.int64)
+            k_cache_ptrs = (
+                k_cache_ptr
+                + block_idx * kc_stride_block
+                + kv_h * kc_stride_head
+                + dx_offs[:, None] * kc_stride_dx
+                + slot_in_block * kc_stride_slot
+                + x_offs[None, :] * kc_stride_x
+            )
+            tl.store(k_cache_ptrs, k_quant_2d)
+
+            if IS_FP8:
+                # FP8 per-token quantization for v
+                v_f32 = v.to(tl.float32)
+                v_abs_max = tl.max(tl.abs(v_f32), axis=0)
+                v_scale = v_abs_max / 240.0
+                v_scale = tl.where(v_scale == 0.0, 1.0, v_scale)
+                v_quant = (v_f32 / v_scale).to(v_cache_ptr.dtype.element_ty)
+
+                tl.store(
+                    v_scale_ptr
+                    + block_idx * vs_stride_block
+                    + kv_h * vs_stride_head
+                    + slot_in_block,
+                    v_scale,
+                )
+            else:
+                v_quant = v.to(v_cache_ptr.dtype.element_ty)
+
+            # V cache SHUFFLE write: [num_blocks, num_kv_heads, block_size//X, head_dim, X]
+            slot_chunk = slot_in_block // X_SIZE
+            x_off = slot_in_block % X_SIZE
+            v_cache_ptrs = (
+                v_cache_ptr
+                + block_idx * vc_stride_block
+                + kv_h * vc_stride_head
+                + slot_chunk * vc_stride_sc
+                + d_offs.to(tl.int64) * vc_stride_d
+                + x_off * vc_stride_x
+            )
+            tl.store(v_cache_ptrs, v_quant)
+
+
+def _get_kv_cache_and_metadata_server(attn_wrapper):
+    """Get kv_cache, kv_scale, slot_mapping from ATOM's ForwardContext."""
+    from atom.utils.forward_context import get_forward_context
+
+    fwd_ctx = get_forward_context()
+    if fwd_ctx is None or fwd_ctx.kv_cache_data is None:
+        return None, None, None, None, None, None
+    impl = attn_wrapper.impl
+    layer_num = impl.layer_num
+    kv_data = fwd_ctx.kv_cache_data[f"layer_{layer_num}"]
+    k_cache = kv_data.k_cache
+    v_cache = kv_data.v_cache
+    k_scale = kv_data.k_scale
+    v_scale = kv_data.v_scale
+    kv_cache_dtype = impl.kv_cache_dtype
+    slot_mapping = fwd_ctx.attn_metadata.slot_mapping
+
+    # Server mode k_cache is already in SHUFFLE layout (5D)
+    # V cache may need reshaping
+    x = 16 // k_cache.element_size()
+    if k_cache.dim() == 5 and v_cache.dim() == 4:
+        n, nh, hd, bs = v_cache.shape
+        v_cache = v_cache.view(n, nh, bs // x, hd, x)
+
+    return k_cache, v_cache, k_scale, v_scale, slot_mapping, kv_cache_dtype
+
+
+def _get_kv_cache_and_metadata_plugin(vllm_layer_name: str):
+    """Get kv_cache, kv_scale, slot_mapping from vLLM forward context."""
+    from vllm.model_executor.layers.attention.attention import (
+        get_attention_context,
+    )
+
+    try:
+        attn_metadata, attn_layer, kv_cache, slot_mapping = get_attention_context(
+            vllm_layer_name
+        )
+    except KeyError:
+        return None, None, None, None, None, None
+    if kv_cache.numel() == 0:
+        return None, None, None, None, None, None
+    k_cache, v_cache = kv_cache.unbind(0)
+    num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
+
+    impl = attn_layer.impl
+    kv_cache_dtype = impl.kv_cache_dtype
+    if kv_cache_dtype == "fp8":
+        from aiter import dtypes
+
+        k_cache = k_cache.view(dtypes.d_dtypes[kv_cache_dtype])
+        v_cache = v_cache.view(dtypes.d_dtypes[kv_cache_dtype])
+        if (
+            getattr(impl, "k_scale", None) is None
+            or getattr(impl, "v_scale", None) is None
+        ):
+            impl.per_tensor_scale = impl.kv_scale
+            impl.kv_scale = torch.zeros(
+                2,
+                num_blocks,
+                num_kv_heads,
+                block_size,
+                dtype=torch.float32,
+                device=k_cache.device,
+            )
+        impl.k_scale = impl.kv_scale[0]
+        impl.v_scale = impl.kv_scale[1]
+        attn_layer.k_scale = impl.k_scale
+        attn_layer.v_scale = impl.v_scale
+    k_scale = getattr(impl, "k_scale", None)
+    v_scale = getattr(impl, "v_scale", None)
+
+    x = 16 // k_cache.element_size()
+    k_cache_shuffle = k_cache.view(
+        num_blocks, num_kv_heads, head_size // x, block_size, x
+    )
+    v_cache_shuffle = v_cache.view(
+        num_blocks, num_kv_heads, block_size // x, head_size, x
+    )
+
+    return (
+        k_cache_shuffle,
+        v_cache_shuffle,
+        k_scale,
+        v_scale,
+        slot_mapping,
+        kv_cache_dtype,
+    )
+
+
+def fused_qkv_norm_rope_cache(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    positions: Tensor,
+    layer_name: str,
+) -> tuple[Tensor, Tensor]:
+    """GemmaRMSNorm + RoPE + KV cache write for Qwen3-Next.
+
+    Accepts separate q, k, v tensors (from QKVGParallelLinear split).
+    Inputs may be strided views from torch.split.
+    - Q: GemmaRMSNorm + RoPE → freshly allocated contiguous q_out
+    - K: GemmaRMSNorm + RoPE → freshly allocated contiguous k_out + FP8 quant SHUFFLE cache write
+    - V: FP8 quant SHUFFLE cache write (no norm, no RoPE)
+
+    Returns contiguous (q_out, k_out).
+    """
+    atom_config = get_current_atom_config()
+    sfc = atom_config.compilation_config.static_forward_context
+
+    model_attn = sfc[f"{layer_name}._model_attn"]
+    num_heads = model_attn.num_heads
+    num_kv_heads = model_attn.num_kv_heads
+    head_dim = model_attn.head_dim
+
+    T = q.shape[0]
+
+    # Try to get KV cache from forward context (plugin or server mode).
+    # During profile/dummy runs the cache is not available — fall back to eager.
+    k_cache, v_cache, k_scale, v_scale, slot_mapping, kv_cache_dtype = (
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+    )
+    try:
+        k_cache, v_cache, k_scale, v_scale, slot_mapping, kv_cache_dtype = (
+            _get_kv_cache_and_metadata_plugin(layer_name)
+        )
+    except Exception:
+        pass
+    if k_cache is None:
+        try:
+            attn_wrapper = sfc.get(layer_name)
+            if attn_wrapper is not None:
+                k_cache, v_cache, k_scale, v_scale, slot_mapping, kv_cache_dtype = (
+                    _get_kv_cache_and_metadata_server(attn_wrapper)
+                )
+        except Exception:
+            pass
+
+    if k_cache is None:
+        return _fallback_norm_rope(q, k, positions, model_attn)
+
+    # Extract norm weights and RoPE caches from the model attention module.
+    q_norm = model_attn.q_norm
+    k_norm = model_attn.k_norm
+    rotary_emb = model_attn.rotary_emb
+    eps = q_norm.variance_epsilon
+    rotary_dim = rotary_emb.rotary_dim
+
+    # Separate cos/sin caches: [max_pos, rotary_dim//2]
+    cos_cache = rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
+    sin_cache = rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
+
+    is_fp8 = kv_cache_dtype == "fp8"
+
+    block_size = k_cache.shape[3]  # k_cache: [B, H, D//X, block_size, X]
+    x_size = k_cache.shape[4]
+
+    # Allocate contiguous output tensors
+    q_out = q.new_empty((T, num_heads * head_dim), dtype=q.dtype)
+    k_out = k.new_empty((T, num_kv_heads * head_dim), dtype=k.dtype)
+
+    total_heads = num_heads + num_kv_heads
+    grid = (T * total_heads,)
+
+    _fused_qkv_norm_rope_cache_kernel[grid](
+        q,
+        q.stride(0),
+        k,
+        k.stride(0),
+        v,
+        v.stride(0),
+        q_out,
+        k_out,
+        q_norm.weight,
+        k_norm.weight,
+        cos_cache,
+        sin_cache,
+        cos_cache.stride(0),
+        positions,
+        k_cache,
+        v_cache,
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        k_cache.stride(3),
+        k_cache.stride(4),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        v_cache.stride(3),
+        v_cache.stride(4),
+        k_scale if k_scale is not None else q,  # dummy pointer when no scale
+        v_scale if v_scale is not None else q,
+        k_scale.stride(0) if k_scale is not None and k_scale.dim() >= 1 else 0,
+        k_scale.stride(1) if k_scale is not None and k_scale.dim() >= 2 else 0,
+        v_scale.stride(0) if v_scale is not None and v_scale.dim() >= 1 else 0,
+        v_scale.stride(1) if v_scale is not None and v_scale.dim() >= 2 else 0,
+        slot_mapping,
+        num_heads=num_heads,
+        num_kv_heads=num_kv_heads,
+        eps=eps,
+        BLOCK_SIZE=block_size,
+        X_SIZE=x_size,
+        BLOCK_D=head_dim,
+        ROTARY_DIM=rotary_dim,
+        ROTARY_DIM_HALF=rotary_dim // 2,
+        IS_FP8=is_fp8,
+    )
+
+    return q_out, k_out
+
+
+def _fallback_norm_rope(q, k, positions, model_attn):
+    """Eager fallback for profile/dummy runs (no KV cache available)."""
+    qk_norm = model_attn.qk_norm
+    rotary_emb = model_attn.rotary_emb
+    q, k = qk_norm(q, k)
+    q, k = rotary_emb(positions, q, k)
+
+    return q, k
+
+
+def _fake_fused_qkv_norm_rope_cache(
+    q: Tensor,
+    k: Tensor,
+    v: Tensor,
+    positions: Tensor,
+    layer_name: str,
+) -> tuple[Tensor, Tensor]:
+    atom_config = get_current_atom_config()
+    sfc = atom_config.compilation_config.static_forward_context
+    model_attn = sfc[f"{layer_name}._model_attn"]
+    num_heads = model_attn.num_heads
+    num_kv_heads = model_attn.num_kv_heads
+    head_dim = model_attn.head_dim
+    T = q.shape[0]
+    return (
+        q.new_empty((T, num_heads * head_dim)),
+        q.new_empty((T, num_kv_heads * head_dim)),
+    )
+
+
+direct_register_custom_op(
+    op_name="fused_qkv_norm_rope_cache",
+    op_func=fused_qkv_norm_rope_cache,
+    mutates_args=[],
+    fake_impl=_fake_fused_qkv_norm_rope_cache,
+)

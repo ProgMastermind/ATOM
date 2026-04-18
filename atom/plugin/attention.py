@@ -123,9 +123,6 @@ class vllmAiterAttentionBackendMethods:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        from vllm.v1.attention.backend import (
-            MultipleOf,
-        )  # pyright: ignore[reportMissingImports]
 
         return [16]
 
@@ -250,9 +247,9 @@ def create_attn_metadata_builder_init_method(base_class):
         while len(sliding_window_sizes) > 0:
             sliding_window_config = sliding_window_sizes.pop()
             if sliding_window_config is not None and sliding_window_config[0] != -1:
-                assert self.aot_sliding_window is None, (
-                    "Aiter Backend only support one valid sliding window"
-                )
+                assert (
+                    self.aot_sliding_window is None
+                ), "Aiter Backend only support one valid sliding window"
                 self.aot_sliding_window = sliding_window_config
 
         # for extend path to store the fetched key and value
@@ -1079,7 +1076,9 @@ class vllmMLAAttentionMetadataBuilderMethods:
                         dtype=torch.int32,
                     )
 
-                chunked_context_metadata_cls = AiterMLACommonPrefillMetadataForPluginMode.AiterMLAChunkedContextMetadataForPluginMode
+                chunked_context_metadata_cls = (
+                    AiterMLACommonPrefillMetadataForPluginMode.AiterMLAChunkedContextMetadataForPluginMode
+                )
                 if self.dcp_world_size > 1:
                     chunked_context_metadata = chunked_context_metadata_cls(
                         cu_seq_lens=cu_seq_lens_cpu.to(device, non_blocking=True),
@@ -1221,9 +1220,9 @@ def create_mla_attn_metadata_builder_init_method(base_class):
         num_attention_heads = getattr(
             hf_config, "num_attention_heads", None
         ) or getattr(text_config, "num_attention_heads", None)
-        assert num_attention_heads is not None, (
-            "num_attention_heads is not found in config"
-        )
+        assert (
+            num_attention_heads is not None
+        ), "num_attention_heads is not found in config"
 
         self.num_attention_heads = num_attention_heads // get_tp_group().world_size
         self.padded_num_attention_heads = max(self.num_attention_heads, _MLA_MIN_HEADS)
@@ -2309,7 +2308,10 @@ def unified_attention_with_output_base_for_plugin_mode(
         # [watch out] accept_output_buffer must be False for plugin mode
         # because we don't want vllm to manipulate the q k v and output buffer
         # ATOM needs to handle all of the buffer here
-        if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        if envs.ATOM_RESHAPE_AND_CACHE_OUTSIDE:
+            # q, k, v already normed + RoPEd + cache updated by model file
+            output = self.attn(q, k, v)
+        elif envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
             output = self.attn(q, positions, qkv)
         else:
             # calculate the q and k with rotary embedding

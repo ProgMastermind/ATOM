@@ -93,6 +93,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD": lambda: int(
         os.getenv("ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD", "1024")
     ),
+    "ATOM_RESHAPE_AND_CACHE_OUTSIDE": lambda: os.getenv(
+        "ATOM_RESHAPE_AND_CACHE_OUTSIDE", "0"
+    ).lower()
+    == "1",
     # --- MTP (relaxed mtp for quantized mtp) ---
     "ATOM_ENABLE_RELAXED_MTP": lambda: os.getenv("ATOM_ENABLE_RELAXED_MTP", "0").lower()
     == "1",

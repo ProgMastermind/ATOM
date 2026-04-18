@@ -49,6 +49,7 @@ from atom.utils.decorators import support_torch_compile
 from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
+from aiter import QuantType
 
 if is_vllm():
     from vllm.config import get_current_vllm_config
@@ -57,6 +58,10 @@ ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
+ATOM_RESHAPE_AND_CACHE_OUTSIDE = envs.ATOM_RESHAPE_AND_CACHE_OUTSIDE
+
+if ATOM_RESHAPE_AND_CACHE_OUTSIDE:
+    import atom.model_ops.triton_fused_qkv_norm_rope_cache  # noqa: F401
 
 
 def mamba_v2_sharded_weight_loader(
@@ -107,9 +112,7 @@ def mamba_v2_sharded_weight_loader(
             param.data[
                 boundary : (boundary + take), ...  # type: ignore[misc]
             ] = loaded_weight[
-                loaded_start_idx : (
-                    loaded_start_idx + take
-                )  # type: ignore[misc]
+                loaded_start_idx : (loaded_start_idx + take)  # type: ignore[misc]
             ]  # type: ignore[misc]
 
             # move indexing boundaries
@@ -387,6 +390,19 @@ class Qwen3NextAttention(nn.Module):
             self.head_dim,
             prefix=f"{prefix}.qk_norm",
         )
+        self.use_fused_sigmoid_mul_quant = (
+            ATOM_RESHAPE_AND_CACHE_OUTSIDE
+            and self.attn_output_gate
+            and self.o_proj.quant_type == QuantType.per_1x128
+        )
+
+        if ATOM_RESHAPE_AND_CACHE_OUTSIDE:
+            # Register self under a separate key so the custom op can find
+            # q_norm, k_norm, rotary_emb on the model Attention class.
+            # PagedAttention registers at `prefix` and doesn't carry these.
+            # The fused kernel reads cos/sin caches directly from rotary_emb.
+            compilation_config = atom_config.compilation_config
+            compilation_config.static_forward_context[f"{prefix}._model_attn"] = self
 
     def forward(
         self,
@@ -404,17 +420,29 @@ class Qwen3NextAttention(nn.Module):
             q, k, v = torch.split(
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
-
-        q, k = self.qk_norm(q, k)
-
-        q, k = self.rotary_emb(positions, q, k)
+        if ATOM_RESHAPE_AND_CACHE_OUTSIDE:
+            q, k = torch.ops.aiter.fused_qkv_norm_rope_cache(
+                q, k, v, positions, self.prefix
+            )
+        else:
+            q, k = self.qk_norm(q, k)
+            q, k = self.rotary_emb(positions, q, k)
 
         attn_output = self.attn(q, k, v)
-        if self.attn_output_gate:
+
+        if self.use_fused_sigmoid_mul_quant:
+            from atom.model_ops.triton_fused_sigmoid_mul_quant import (
+                fused_sigmoid_mul_fp8_quant,
+            )
+
+            attn_output, attn_scale = fused_sigmoid_mul_fp8_quant(attn_output, gate)
+            output[:] = self.o_proj(attn_output, x_scale=attn_scale)
+        elif self.attn_output_gate:
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
-
-        output[:] = self.o_proj(attn_output)
+            output[:] = self.o_proj(attn_output)
+        else:
+            output[:] = self.o_proj(attn_output)
 
         return output
 

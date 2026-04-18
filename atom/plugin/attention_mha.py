@@ -25,6 +25,7 @@ if TYPE_CHECKING:
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
+ATOM_RESHAPE_AND_CACHE_OUTSIDE = envs.ATOM_RESHAPE_AND_CACHE_OUTSIDE
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
@@ -64,6 +65,13 @@ class PagedAttentionImplPluginModeMethods:
         v_scale: torch.Tensor,
         flash_layout: bool = False,
     ):
+        # When ATOM_RESHAPE_AND_CACHE_OUTSIDE is set, qk_norm + RoPE + cache
+        # write was already done by the model file via the custom torch op.
+        # Just return q, k, v and cache tensors unchanged.
+        if ATOM_RESHAPE_AND_CACHE_OUTSIDE:
+            self.use_triton_attn = self.sliding_window != -1 or self.head_dim != 128
+            return q, k, v, k_cache, v_cache, k_scale, v_scale
+
         num_blocks, block_size, num_kv_heads, head_size = k_cache.shape
         x = 16 // k_cache.element_size()
 
@@ -181,16 +189,6 @@ class PagedAttentionImplPluginModeMethods:
                     v_scale=None,
                     asm_layout=True,
                 )
-                # reshape_and_cache_shuffle_triton(
-                #     k,
-                #     v,
-                #     new_key_cache,
-                #     new_value_cache,
-                #     attn_metadata.slot_mapping,
-                #     self.kv_cache_dtype,
-                #     k_scale,
-                #     v_scale,
-                # )
 
         return q, k, v, k_cache, v_cache, k_scale, v_scale
 
@@ -538,11 +536,14 @@ class PagedAttentionImplPluginModeMethods:
         if attn_metadata is None:
             return output.fill_(0)
 
-        # when using this optimization, the qkv tensor and
-        # position tensor are passed through q,k,v
-        # when not using this optimization, the position is not
-        # needed as the ROPE has been calculated outside of attention
-        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        # When ATOM_RESHAPE_AND_CACHE_OUTSIDE is set, q/k/v arrive already
+        # normed and RoPEd from the model file — no smuggling needed.
+        # When using the old fusion path (ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION),
+        # the qkv tensor and position are smuggled through q, k, v args.
+        if (
+            not ATOM_RESHAPE_AND_CACHE_OUTSIDE
+            and ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
+        ):
             assert (
                 position is None
             ), "position should be None because it is passed through k"

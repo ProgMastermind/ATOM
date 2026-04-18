@@ -19,6 +19,7 @@ import logging
 
 from atom.plugin.prepare import is_plugin_mode, is_vllm
 from atom.plugin.attention_mha import PagedAttentionImplDecoratorForPluginMode
+from atom.utils import envs
 from atom.utils.decorators import mark_trace
 from atom.model_ops.base_attention import cp_mha_gather_cache
 
@@ -126,6 +127,11 @@ class PagedAttentionImpl(nn.Module):
         v_cache = kv_cache_data[f"layer_{self.layer_num}"].v_cache
         k_scale = kv_cache_data[f"layer_{self.layer_num}"].k_scale
         v_scale = kv_cache_data[f"layer_{self.layer_num}"].v_scale
+
+        # When ATOM_RESHAPE_AND_CACHE_OUTSIDE is set, qk_norm + RoPE + cache
+        # write was already done by the model file via the custom torch op.
+        if envs.ATOM_RESHAPE_AND_CACHE_OUTSIDE:
+            return q, k, v, k_cache, v_cache, k_scale, v_scale
 
         use_triton_attn = self.sliding_window != -1 or self.head_dim != 128
         self.use_triton_attn = use_triton_attn
