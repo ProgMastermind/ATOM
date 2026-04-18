@@ -760,7 +760,7 @@ controls ATOM’s runtime behaviour.</p>
 </tr>
 </tbody>
 </table>
-<p><strong>Auto-derived fields</strong> (set in <code class="docutils literal notranslate"><span class="pre">__post_init__</span></code>, not user-supplied):</p>
+<p><strong>Auto-derived fields</strong> (set in <code class="docutils literal notranslate"><span class="pre">__post_init__</span></code> or by <code class="docutils literal notranslate"><span class="pre">ModelRunner.get_num_blocks()</span></code>, not user-supplied):</p>
 <table class="docutils align-default">
 <thead>
 <tr class="row-odd"><th class="head"><p>Field</p></th>
@@ -776,6 +776,18 @@ controls ATOM’s runtime behaviour.</p>
 <tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">generation_config</span></code></p></td>
 <td><p><code class="docutils literal notranslate"><span class="pre">GenerationConfig</span></code></p></td>
 <td><p>Loaded automatically via <code class="docutils literal notranslate"><span class="pre">get_generation_config(model)</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">mamba_equiv_per_req</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p>Number of KV cache block equivalents reserved per request for GDN recurrent state (hybrid models only); computed by <code class="docutils literal notranslate"><span class="pre">ModelRunner.get_num_blocks()</span></code></p></td>
+</tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">num_mamba_groups</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p>Number of per-request GDN state slot groups available (= <code class="docutils literal notranslate"><span class="pre">max_num_seqs</span></code> for hybrid models, 0 otherwise); computed by <code class="docutils literal notranslate"><span class="pre">ModelRunner.get_num_blocks()</span></code></p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">max_mamba_slots</span></code></p></td>
+<td><p><code class="docutils literal notranslate"><span class="pre">int</span></code></p></td>
+<td><p>Maximum number of GDN state slots (including slots for speculative tokens); computed by <code class="docutils literal notranslate"><span class="pre">ModelRunner.get_num_blocks()</span></code></p></td>
 </tr>
 </tbody>
 </table>
