@@ -274,12 +274,20 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         only_update: bool = False,
         num_reject_tokens: torch.Tensor = None,
     ):
+        # NOTE: deliberately omit `max_split_per_batch` so aiter falls back to
+        # the default (-1) and lets the MLA decode-stage1 kernel use
+        # `num_clusters` work splits (all available CUs). This mirrors vLLM's
+        # AiterMLAMetadataBuilder._build_decode in
+        # `vllm/v1/attention/backends/mla/rocm_aiter_mla.py`. The historical
+        # ATOM cap of 16 (introduced in #47 and propagated to the plugin)
+        # capped per-batch splits to `min(num_clusters, 16 * bs)`, which
+        # severely under-utilizes the GPU at small batch / large KV and made
+        # `mla_a8w8_qh16_qseqlen1_gqaratio16_ps` ~4x slower than vLLM.
         split_params = {
             "kv_granularity": max(self.block_size, 16),
             "max_seqlen_qo": max_q_len,
             "uni_seqlen_qo": max_q_len,
             "fast_mode": 1,
-            "max_split_per_batch": 16,
         }
         var = self.model_runner.forward_vars
         work_meta_data = var["work_meta_data"]
@@ -754,7 +762,9 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
             max_seqlen_qo=max_q_len,
             uni_seqlen_qo=max_q_len,
             fast_mode=1,
-            max_split_per_batch=16,
+            # See note in `set_mla_persistent_worker_buffers` above:
+            # omit `max_split_per_batch` (defaults to -1 = use all CUs) to
+            # match vLLM's MLA decode metadata configuration.
         )
 
     def build_for_cudagraph_capture(self, bs: int) -> AttentionMetaData:
