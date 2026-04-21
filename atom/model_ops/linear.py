@@ -11,11 +11,12 @@ from aiter import (
     dtypes,
     gemm_a4w4,
     gemm_a8w8,
-    gemm_a16w16,
     gemm_a8w8_blockscale_bpreshuffle,
     gemm_a8w8_bpreshuffle,
     get_hip_quant,
 )
+
+from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16
 
 # import torch.distributed as dist
 from aiter.dist.parallel_state import get_tp_group
@@ -40,6 +41,8 @@ logger = logging.getLogger("atom")
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
+def use_triton_gemm_a16w16() -> bool:
+    return envs.ATOM_USE_TRITON_GEMM_A16W16
 
 if use_triton_gemm():
     try:
@@ -60,20 +63,24 @@ if use_triton_gemm():
         logger.warning(f"Triton w8a8 GEMM not available: {e}")
         gemm_a8w8_blockscale_bpreshuffle_triton = None
     
+else:
+    gemm_afp4wfp4_preshuffle = None
+    gemm_a8w8_blockscale_bpreshuffle_triton = None
+
+# from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
+
+if use_triton_gemm_a16w16():
     # for gptoss -- double check that this is not meant to be anywhere else
     try:
-        from aiter.ops.triton.gemm_a16w16 import ( # gluon?
+        from aiter.ops.triton.gemm.basic.gemm_a16w16 import ( # gluon?
             gemm_a16w16,
         )  # noqa: E402
+        logger.warning(f"Triton w16a16 imported")
     except ImportError as e:
         logger.warning(f"Triton w16a16 GEMM not available: {e}")
         gemm_a16w16 = None
 else:
-    gemm_afp4wfp4_preshuffle = None
-    gemm_a8w8_blockscale_bpreshuffle_triton = None
     gemm_a16w16 = None
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
-
 
 def divide(numerator, denominator):
     assert (
@@ -216,8 +223,7 @@ def gemm_a8w8_blockscale_preshuffle_impl(
 def gemm_a16w16_fake(
     x: torch.Tensor,
     weight: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
+    bias: torch.Tensor = None,
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
 ) -> torch.Tensor:
@@ -229,12 +235,11 @@ def gemm_a16w16_fake(
 def gemm_a16w16_impl(
     x: torch.Tensor,
     weight: torch.Tensor,
-    x_scale: torch.Tensor,
-    w_scale: torch.Tensor,
+    bias: torch.Tensor = None,
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
 ) -> torch.Tensor:
-    y = gemm_a16w16(x, weight, x_scale, w_scale, dtype)
+    y = gemm_a16w16(x, weight, bias=bias, dtype=dtype)
     return y
 
 
@@ -425,22 +430,27 @@ class LinearBase(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
+        logger.warning("forward")
         if self.quant_type.value == QuantType.No.value:
-            # y = tgemm.mm(
-            #     x,
-            #     self.weight,
-            #     self.bias,
-            #     otype=otype,
-            # )
-            # changed to a16w16 but need to check if that's the correct approach
-            y = gemm_a16w16(
-                x,
-                self.weight,
-                x_scale,
-                self.weight_scale,
-                self.bias,
-                dtype=otype,
-            )
+            logger.warning("no quant")
+            # fairly certain this is always true but check just in case
+            if (gemm_a16w16):
+                # changed to a16w16 but need to check if that's the correct approach
+                logger.warning("gemma16w16")
+                y = gemm_a16w16_impl(
+                    x,
+                    self.weight,
+                    bias=self.bias,
+                    dtype=otype,
+                )
+            else:
+                y = tgemm.mm(
+                    x,
+                    self.weight,
+                    self.bias,
+                    otype=otype,
+                )
+            
         else:
             if x_scale is None:
                 quant_func = self.quant_func
