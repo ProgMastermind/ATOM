@@ -125,6 +125,10 @@ def register_model() -> None:
 
     apply_graph_capture_patch()
 
+    if not envs.ATOM_VLLM_SAMPLER:
+        logger.info("Disable ATOM vLLM sampler patch")
+        return
+
     # The sampler patch follows the ATOM platform/plugin-mode lifecycle: if the
     # ATOM vLLM platform is enabled, we also install the ATOM greedy sampler
     # patch; if plugin mode is disabled, register_model() has already returned.

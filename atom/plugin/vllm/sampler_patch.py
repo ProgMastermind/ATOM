@@ -42,6 +42,10 @@ def apply_vllm_sampler_patch() -> None:
         logger.info("Skip ATOM vLLM sampler patch because ATOM platform is disabled.")
         return
 
+    if not envs.ATOM_VLLM_SAMPLER:
+        logger.info("Skip ATOM vLLM sampler patch because ATOM_VLLM_SAMPLER=0.")
+        return
+
     # Only vLLM V1 is patched. V2 keeps the original vLLM sampler path.
     try:
         if _patch_v1_sampler():
