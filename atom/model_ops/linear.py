@@ -70,12 +70,10 @@ else:
 # from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
 if use_triton_gemm_a16w16():
-    # for gptoss -- double check that this is not meant to be anywhere else
     try:
-        from aiter.ops.triton.gemm.basic.gemm_a16w16 import ( # gluon?
+        from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
             gemm_a16w16,
         )  # noqa: E402
-        logger.warning(f"Triton w16a16 imported")
     except ImportError as e:
         logger.warning(f"Triton w16a16 GEMM not available: {e}")
         gemm_a16w16 = None
@@ -431,9 +429,8 @@ class LinearBase(nn.Module):
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
         if self.quant_type.value == QuantType.No.value:
-            # fairly certain this is always true but check just in case
+            # if triton kernel available, call it
             if (gemm_a16w16):
-                # changed to a16w16 but need to check if that's the correct approach
                 y = gemm_a16w16_impl(
                     x,
                     self.weight,
