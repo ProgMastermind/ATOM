@@ -565,7 +565,9 @@ class GemmaRMSNorm(nn.Module):
         num_groups = N // group_size
 
         out_fp8 = torch.empty((M, N), dtype=fp8, device=x.device)
-        out_scale = torch.empty((num_groups, M), dtype=torch.float32, device=x.device)
+        out_scale = torch.empty(
+            (num_groups, M), dtype=torch.float32, device=x.device
+        ).view(M, num_groups)
         out_bf16 = (
             torch.empty((M, N), dtype=x.dtype, device=x.device)
             if self.write_bf16
