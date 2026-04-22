@@ -566,7 +566,11 @@ class GemmaRMSNorm(nn.Module):
 
         out_fp8 = torch.empty((M, N), dtype=fp8, device=x.device)
         out_scale = torch.empty((num_groups, M), dtype=torch.float32, device=x.device)
-        out_bf16 = torch.empty((M, N), dtype=x.dtype, device=x.device) if self.write_bf16 else None
+        out_bf16 = (
+            torch.empty((M, N), dtype=x.dtype, device=x.device)
+            if self.write_bf16
+            else None
+        )
         res_out = torch.empty_like(x) if residual is not None else None
 
         fused_qk_rmsnorm_group_quant(
