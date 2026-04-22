@@ -15,7 +15,7 @@ The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and gener
 ### Qwen3-Next-80B-A3B-Instruct-FP8 (TP=1, MI355X)
 
 ```bash
-export ATOM_DISABLE_VLLM_PLUGIN_ATTENTION=1
+export ATOM_RESHAPE_AND_CACHE_OUTSIDE=1
 export ATOM_USE_CUSTOM_ALL_GATHER=0
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
