@@ -337,9 +337,20 @@ def load_model(
                     maybe_matching_name,
                     f"mlp.experts.{hf_config.n_routed_experts}.",
                 )
+            # Check fused expert format before packed_modules_mapping to avoid
+            # expert weights (e.g. moe.gate_proj) being incorrectly matched
+            # by packed_modules_mapping entries (e.g. gate_proj -> gate_up_proj).
+            if detect_fused_expert_fn is not None and not is_fused_expert:
+                if detect_fused_expert_fn(name):
+                    is_fused_expert = True
+                    if get_fused_expert_mapping_fn is not None:
+                        fused_expert_params_mapping = get_fused_expert_mapping_fn()
             for k in packed_modules_mapping:
                 # We handle the experts below in expert_params_mapping
                 if "mlp.experts." in name and name not in params_dict:
+                    continue
+                # Skip fused expert weights — handled below in expert loading path
+                if is_fused_expert and detect_fused_expert_fn is not None and detect_fused_expert_fn(name):
                     continue
                 if k in name:
                     packed_value = packed_modules_mapping[k]

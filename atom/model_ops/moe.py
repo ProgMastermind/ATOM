@@ -485,7 +485,11 @@ class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
 
         layer.w13_weight = atom_parameter(self._maybe_pad_weight(layer.w13_weight.data))
         layer.w2_weight = atom_parameter(self._maybe_pad_weight(layer.w2_weight.data))
-        # reshaping weights is required for aiter moe kernel.
+        # Shuffle weights for CK/ASM kernels.
+        # Previously skipped for gfx950 bf16 g1u1 on the assumption that the CK
+        # 2-stage preshuffle_off (NSwizzle=0) kernel expected un-shuffled weights.
+        # Verified 2026-04-23: preshuffle_off GEMM is wrong on gfx950; preshuffle_on
+        # (NSwizzle=1) is correct. Always shuffle so the right kernel path is used.
         shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def get_fused_moe_quant_config(
@@ -998,6 +1002,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     global_num_experts=global_num_experts,
                     expert_map=expert_map,
                 )
+                _tp_size = getattr(self, 'tp_size', getattr(self.moe, 'tp_size', 1)) if hasattr(self, 'moe') else getattr(self, 'tp_size', 1)
+                _ep_size = getattr(self, 'ep_size', getattr(self.moe, 'ep_size', 1)) if hasattr(self, 'moe') else getattr(self, 'ep_size', 1)
+                if layer.reduce_results and (_tp_size > 1 or _ep_size > 1):
+                    from aiter.dist.parallel_state import get_tp_group
+                    _moe_result = get_tp_group().all_reduce(
+                        _moe_result, ca_fp8_quant=False
+                    )
                 return _moe_result
 
             assert (
@@ -2556,6 +2567,14 @@ class FusedMoE(torch.nn.Module):
         routed_scaling_factor: float = 1.0,
     ):
 
+        # Model-provided custom routing (e.g. sigmoid + bias + scaling for Step-3.5)
+        if custom_routing_function is not None:
+            return custom_routing_function(
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+            )
+
         # DeekSeekv2 uses grouped_top_k
         if use_grouped_topk:
             assert topk_group is not None
@@ -2696,6 +2715,7 @@ class FusedMoE(torch.nn.Module):
 
             hidden_states = naive_multicast(hidden_states, cu_tokens_across_dp_cpu)
             router_logits = naive_multicast(router_logits, cu_tokens_across_dp_cpu)
+
 
         # Matrix multiply.
         final_hidden_states = self.quant_method.apply(

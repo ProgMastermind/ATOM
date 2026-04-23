@@ -19,6 +19,9 @@ EngineArgs.add_cli_args(parser)
 parser.add_argument(
     "--temperature", type=float, default=0.6, help="temperature for sampling"
 )
+parser.add_argument(
+    "--max-tokens", type=int, default=256, help="max tokens to generate"
+)
 
 
 def generate_cuda_graph_sizes(max_size):
@@ -46,9 +49,11 @@ def main():
     engine_args = EngineArgs.from_cli_args(args)
     llm = engine_args.create_engine()
 
-    tokenizer = AutoTokenizer.from_pretrained(args.model)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.model, trust_remote_code=getattr(args, "trust_remote_code", False)
+    )
 
-    sampling_params = SamplingParams(temperature=args.temperature, max_tokens=256)
+    sampling_params = SamplingParams(temperature=args.temperature, max_tokens=args.max_tokens)
 
     prompts = [
         tokenizer.apply_chat_template(
@@ -60,9 +65,6 @@ def main():
         for prompt in prompts
     ]
     print("This is prompts:", prompts)
-    # print("Warming up...")
-    # _ = llm.generate(["warmup"], sampling_params)
-    # print("Warm up done")
 
     print("\n" + "=" * 70)
     print("Starting profiling...")
