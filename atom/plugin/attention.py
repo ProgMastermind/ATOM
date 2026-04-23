@@ -2308,10 +2308,7 @@ def unified_attention_with_output_base_for_plugin_mode(
         # [watch out] accept_output_buffer must be False for plugin mode
         # because we don't want vllm to manipulate the q k v and output buffer
         # ATOM needs to handle all of the buffer here
-        if envs.ATOM_RESHAPE_AND_CACHE_OUTSIDE:
-            # q, k, v already normed + RoPEd + cache updated by model file
-            output = self.attn(q, k, v)
-        elif envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+        if envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
             output = self.attn(q, positions, qkv)
         else:
             # calculate the q and k with rotary embedding

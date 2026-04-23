@@ -58,10 +58,6 @@ ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
-ATOM_RESHAPE_AND_CACHE_OUTSIDE = envs.ATOM_RESHAPE_AND_CACHE_OUTSIDE
-
-if ATOM_RESHAPE_AND_CACHE_OUTSIDE:
-    import atom.model_ops.triton_fused_qkv_norm_rope_cache  # noqa: F401
 
 
 def mamba_v2_sharded_weight_loader(
@@ -365,7 +361,26 @@ class Qwen3NextAttention(nn.Module):
             dual_chunk_attention_config=self.dual_chunk_attention_config,
         )
 
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.qk_norm = DualRMSNorm(
+            self.q_norm,
+            self.k_norm,
+            self.num_heads,
+            self.num_kv_heads,
+            self.head_dim,
+            prefix=f"{prefix}.qk_norm",
+        )
+
         from atom.model_ops.base_attention import Attention
+
+        fusion_kwargs = {}
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            fusion_kwargs = dict(
+                rotary_emb=self.rotary_emb,
+                q_norm=self.q_norm,
+                k_norm=self.k_norm,
+            )
 
         self.attn = Attention(
             self.num_heads,
@@ -378,31 +393,14 @@ class Qwen3NextAttention(nn.Module):
             layer_num=extract_layer_index(prefix),
             config=atom_config,
             prefix=f"{prefix}",
+            **fusion_kwargs,
         )
 
-        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.qk_norm = DualRMSNorm(
-            self.q_norm,
-            self.k_norm,
-            self.num_heads,
-            self.num_kv_heads,
-            self.head_dim,
-            prefix=f"{prefix}.qk_norm",
-        )
         self.use_fused_sigmoid_mul_quant = (
-            ATOM_RESHAPE_AND_CACHE_OUTSIDE
+            ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
             and self.attn_output_gate
             and self.o_proj.quant_type == QuantType.per_1x128
         )
-
-        if ATOM_RESHAPE_AND_CACHE_OUTSIDE:
-            # Register self under a separate key so the custom op can find
-            # q_norm, k_norm, rotary_emb on the model Attention class.
-            # PagedAttention registers at `prefix` and doesn't carry these.
-            # The fused kernel reads cos/sin caches directly from rotary_emb.
-            compilation_config = atom_config.compilation_config
-            compilation_config.static_forward_context[f"{prefix}._model_attn"] = self
 
     def forward(
         self,
@@ -414,22 +412,27 @@ class Qwen3NextAttention(nn.Module):
         qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
 
         if self.attn_output_gate:
-            gate, q, k, v = torch.split(
-                qkv, [self.q_size, self.q_size, self.kv_size, self.kv_size], dim=-1
+            gate, qkv = torch.split(
+                qkv, [self.q_size, self.q_size + self.kv_size + self.kv_size], dim=-1
+            )
+            q, k, v = torch.split(
+                qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
         else:
             q, k, v = torch.split(
                 qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
             )
-        if ATOM_RESHAPE_AND_CACHE_OUTSIDE:
-            q, k = torch.ops.aiter.fused_qkv_norm_rope_cache(
-                q, k, v, positions, self.prefix
+        if ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION:
+            # Pass the packed [q, k, v] tensor (gate excluded) for smuggling
+            # through vLLM's typed custom op which requires Tensor args.
+            # qkv_packed = qkv[:, self.q_size :] if self.attn_output_gate else qkv
+            attn_output = self.attn(
+                query=q, key=k, value=v, positions=positions, qkv=qkv
             )
         else:
             q, k = self.qk_norm(q, k)
             q, k = self.rotary_emb(positions, q, k)
-
-        attn_output = self.attn(q, k, v)
+            attn_output = self.attn(q, k, v)
 
         if self.use_fused_sigmoid_mul_quant:
             from atom.model_ops.triton_fused_sigmoid_mul_quant import (

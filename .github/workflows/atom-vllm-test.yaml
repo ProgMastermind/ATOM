@@ -145,7 +145,7 @@ jobs:
             # FIXME: Remove these temporary Qwen3.5 workarounds after the
             # aiter fix landed
             env_vars: |
-              ATOM_RESHAPE_AND_CACHE_OUTSIDE=1
+              ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
               ATOM_USE_CUSTOM_ALL_GATHER=0
             accuracy_test_threshold: 0.76
             runner: linux-atom-mi35x-4
