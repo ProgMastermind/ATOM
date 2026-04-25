@@ -495,7 +495,6 @@ class ModelRunner:
         self.is_deepseek_v32 = (
             hasattr(hf_config, "index_topk") if self.use_mla else False
         )
-        # self.is_deepseek_v32 = False
         # Calculate local device rank considering both TP and DP
         # When data parallelism is enabled on the same node, different DP ranks
         # need to use different sets of GPUs
