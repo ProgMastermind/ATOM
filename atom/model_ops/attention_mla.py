@@ -589,8 +589,7 @@ class MLAAttention(nn.Module):
         # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
         # (max_seqlen_qo=2).
         is_sparse_mtp = (
-            self.topk_indices_buffer is not None
-            and attn_metadata.max_seqlen_q > 1
+            self.topk_indices_buffer is not None and attn_metadata.max_seqlen_q > 1
         )
 
         if not use_persistent_mode:
@@ -1066,9 +1065,7 @@ def _gather_kv_indices_sparse_kernel(
     out_end = tl.load(sparse_kv_indptr + token_id + 1)
     kv_len = out_end - out_start
 
-    pos = tl.load(
-        topk_indices + token_id * ti_stride0 + col_id * ti_stride1
-    )
+    pos = tl.load(topk_indices + token_id * ti_stride0 + col_id * ti_stride1)
 
     kv_base = tl.load(kv_indptr + req_id)
     kv_end = tl.load(kv_indptr + req_id + 1)
