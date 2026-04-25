@@ -1559,25 +1559,38 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 block_n = 1
                 block_k = 32
             tp_size = get_tp_group().world_size
+            # Pad intermediate_size_per_partition to the nearest multiple of
+            # block_n so that both the CK blockscale kernel alignment constraints
+            # and the block-quantization scale alignment constraints are satisfied.
+            # For tp=4, inter_dim=320 is not divisible by block_n=128; padding to
+            # 384 (=3×128) satisfies both stage1 NPerBlock=128 and block_n=128.
+            # The weight loader already supports partial loading into a padded
+            # buffer via the MXFP4 alignment path (_load_w13 / _load_w2).
+            padded_inter = (
+                (intermediate_size_per_partition + block_n - 1) // block_n * block_n
+            )
             # NOTE: To ensure proper alignment of the block-wise quantization
             # scales, the output_size of the weights for both the gate and up
             # layers must be divisible by block_n.
             # Required by column parallel or enabling merged weights
-            if intermediate_size_per_partition % block_n != 0:
+            if padded_inter % block_n != 0:
                 raise ValueError(
                     f"The output_size of gate's and up's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
+                    f"{padded_inter} is not divisible by "
                     f"weight quantization block_n = {block_n}."
                 )
-            if tp_size > 1 and intermediate_size_per_partition % block_k != 0:
+            if tp_size > 1 and padded_inter % block_k != 0:
                 # Required by row parallel
                 raise ValueError(
                     f"The input_size of down's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
+                    f"{padded_inter} is not divisible by "
                     f"weight quantization block_k = {block_k}."
                 )
 
         # WEIGHTS
+        # Allocated at original (un-padded) size; inter_dim padding is applied
+        # later in _process_block_quant (after normalize, before shuffle_weights),
+        # mirroring the BF16 approach in UnquantizedFusedMoEMethod.
         w13_weight = atom_parameter(
             torch.empty(
                 num_experts,
@@ -1696,6 +1709,36 @@ class Fp8MoEMethod(FusedMoEMethodBase):
     def _process_block_quant(self, layer: nn.Module) -> None:
         assert self.quant_config.is_dynamic
         self._normalize_weights_and_scales(layer)
+
+        # Inter-dim padding for block-quantized FP8 (mirrors BF16 approach in
+        # UnquantizedFusedMoEMethod.process_weights_after_loading).
+        # When inter_dim is not a multiple of block_n (e.g. tp=4: 320 % 128 ≠ 0),
+        # zero-pad both weights to the nearest block_n multiple BEFORE shuffling.
+        # Padding area is zero so dequant(0, scale) = 0 is numerically safe.
+        # Scale tensors use ceil(inter/block_n) and are already shape-compatible.
+        inter_dim = layer.w2_weight.shape[-1]
+        block_n = 128 if self.quant_type == QuantType.per_1x128 else 32
+        align = 64 if inter_dim <= 192 else block_n
+        inter_pad = (inter_dim + align - 1) // align * align
+        if inter_pad != inter_dim:
+            E = layer.w13_weight.shape[0]
+            hidden = layer.w13_weight.shape[-1]
+            w13 = layer.w13_weight.data
+            w13_new = torch.zeros(
+                E, 2 * inter_pad, hidden,
+                dtype=w13.dtype, device=w13.device
+            )
+            w13_new[:, :inter_dim, :] = w13[:, :inter_dim, :]        # gate
+            w13_new[:, inter_pad:inter_pad + inter_dim, :] = w13[:, inter_dim:, :]  # up
+            layer.w13_weight = atom_parameter(w13_new)
+
+            w2 = layer.w2_weight.data
+            w2_new = torch.zeros(
+                E, hidden, inter_pad,
+                dtype=w2.dtype, device=w2.device
+            )
+            w2_new[:, :, :inter_dim] = w2
+            layer.w2_weight = atom_parameter(w2_new)
 
         if not self.need_normalize_e4m3fn_to_e4m3fnuz:
             layer.w13_weight = atom_parameter(layer.w13_weight.data)
@@ -2255,10 +2298,16 @@ class FusedMoE(torch.nn.Module):
         expert_shard_size = expert_data.shape[shard_dim] // 2
         # Derive shard size from loaded_weight (unpadded checkpoint) to avoid
         # out-of-bounds when expert_data is padded (e.g. MXFP4 alignment).
-        load_shard_size = loaded_weight.shape[shard_dim] // self.tp_size
-        loaded_weight = loaded_weight.narrow(
-            shard_dim, load_shard_size * tp_rank, load_shard_size
-        )
+        # Use ceil so that the last partial scale block (e.g. per_1x128 with
+        # inter=1280 and tp=4: 10 blocks / 4 = 2.5 → ceil=3) is included.
+        # Without ceil, the 3rd scale block is never copied and stays at the
+        # torch.ones() initial value of 1.0, causing ~5000× dequant error.
+        load_shard_size = (
+            loaded_weight.shape[shard_dim] + self.tp_size - 1
+        ) // self.tp_size
+        start = load_shard_size * tp_rank
+        size = min(load_shard_size, loaded_weight.shape[shard_dim] - start)
+        loaded_weight = loaded_weight.narrow(shard_dim, start, size)
         # Narrow parameter and load.
         # w1, gate_proj: Load into first logical weight of w13.
         if shard_id == "w1":
@@ -2294,10 +2343,13 @@ class FusedMoE(torch.nn.Module):
         if not load_full:
             # Derive shard size from loaded_weight (unpadded checkpoint) to
             # avoid out-of-bounds when expert_data is padded (e.g. MXFP4).
-            load_shard_size = loaded_weight.shape[shard_dim] // self.tp_size
-            loaded_weight = loaded_weight.narrow(
-                shard_dim, load_shard_size * tp_rank, load_shard_size
-            )
+            # Use ceil (same reason as _load_w13: partial last scale block).
+            load_shard_size = (
+                loaded_weight.shape[shard_dim] + self.tp_size - 1
+            ) // self.tp_size
+            start = load_shard_size * tp_rank
+            size = min(load_shard_size, loaded_weight.shape[shard_dim] - start)
+            loaded_weight = loaded_weight.narrow(shard_dim, start, size)
             if load_shard_size != shard_size:
                 expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         # w2, down_proj: Load into only logical weight of w2.
