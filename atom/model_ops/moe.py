@@ -1718,7 +1718,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # Scale tensors use ceil(inter/block_n) and are already shape-compatible.
         inter_dim = layer.w2_weight.shape[-1]
         block_n = 128 if self.quant_type == QuantType.per_1x128 else 32
-        align = 64 if inter_dim <= 192 else block_n
+        # align=64: inter_dim=320 (tp=4) is 64-aligned -> no padding needed with NPerBlock=64 kernel
+        # inter_dim=160 (tp=8) -> pads to 192; inter_dim=640 (tp=2) -> no padding
+        align = 64
         inter_pad = (inter_dim + align - 1) // align * align
         if inter_pad != inter_dim:
             E = layer.w13_weight.shape[0]
