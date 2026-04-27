@@ -4,8 +4,12 @@ from atom.models.qwen3 import Qwen3ForCausalLM
 from atom.models.qwen3_moe import Qwen3MoeForCausalLM
 from atom.models.glm4_moe import Glm4MoeForCausalLM
 from atom.models.deepseek_v2 import DeepseekV3ForCausalLM
+from atom.models.qwen3_5 import (
+    Qwen3_5MoeForConditionalGenerationTextOnly,
+    Qwen3_5ForConditionalGenerationTextOnly,
+)
 from atom.config import Config
-from atom.plugin.prepare import is_vllm, is_sglang
+from atom.plugin.prepare import is_vllm, is_sglang, is_rtpllm
 
 logger = logging.getLogger("atom")
 
@@ -14,6 +18,8 @@ _ATOM_SUPPORTED_MODELS = {
     "Qwen3MoeForCausalLM": Qwen3MoeForCausalLM,
     "Glm4MoeForCausalLM": Glm4MoeForCausalLM,
     "DeepseekV3ForCausalLM": DeepseekV3ForCausalLM,
+    "Qwen3_5MoeForConditionalGeneration": Qwen3_5MoeForConditionalGenerationTextOnly,
+    "Qwen3_5ForConditionalGeneration": Qwen3_5ForConditionalGenerationTextOnly,
 }
 
 
@@ -62,6 +68,8 @@ def set_attn_cls() -> None:
     elif is_sglang():
         ops.Attention = ops.RadixAttention
         logger.info("Set Attention to RadixAttention for SGLang")
+    elif is_rtpllm():
+        logger.info("Keep Attention backend unchanged for rtp-llm")
 
 
 def init_aiter_dist(config: Config) -> None:
@@ -104,6 +112,11 @@ def init_aiter_dist(config: Config) -> None:
         else:
             dp_master_ip = "127.0.0.1"
             dp_master_port = config.plugin_config.sglang_port_args.nccl_port
+    elif config.plugin_config.is_rtpllm:
+        import os
+
+        dp_master_ip = os.getenv("MASTER_ADDR", "127.0.0.1")
+        dp_master_port = int(os.getenv("MASTER_PORT", "29500"))
 
     distributed_init_method = get_distributed_init_method(dp_master_ip, dp_master_port)
 
