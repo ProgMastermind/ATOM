@@ -86,6 +86,7 @@ def parse_vllm_iteration(name: str) -> Optional[IterationInfo]:
         batch_type = "mixed"
     return IterationInfo(ctx_reqs, ctx_tok, gen_reqs, gen_tok, batch_type)
 
+
 _SLIM_ARGS_KEYS = frozenset({"kernel", "correlation"})
 
 
@@ -212,6 +213,7 @@ def get_kernel_names_for_module(
                 if kname:
                     names.append(kname)
     return names
+
 
 _CXXFILT_PATH: Optional[str] = None
 _DEMANGLE_CACHE: Dict[str, str] = {}
