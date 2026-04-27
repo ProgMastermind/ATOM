@@ -1718,10 +1718,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # Scale tensors use ceil(inter/block_n) and are already shape-compatible.
         inter_dim = layer.w2_weight.shape[-1]
         block_n = 128 if self.quant_type == QuantType.per_1x128 else 32
-        # NOTE: stage2 KPerBlock=64 is not supported on gfx950 FP8 mfma (KPack=32 constraint).
-        # Both w13 and w2 must use the same inter_dim, so full padding is still required.
-        # align=64 for inter<=192 (tp=8 inter=160->192), align=block_n(=128) for inter>192 (tp=4 inter=320->384)
-        align = 64 if inter_dim <= 192 else block_n
+        # FP8 blockscale stage2 requires KPerBlock=128 (gfx950 FP8 mfma KPack=32 constraint
+        # prevents KPerBlock=64). align must always be block_n(=128) so that inter_pad%128==0.
+        # Bug fix: previously used align=64 for inter<=192 (copied from BF16 path), but
+        # 192%128=64!=0 → stage2 kernel dispatch fails. Correct: always align to block_n.
+        # tp=8 inter=160 → 256 (3×128→no, ceil(160/128)*128=256); tp=4 inter=320 → 384.
+        align = block_n
         inter_pad = (inter_dim + align - 1) // align * align
         if inter_pad != inter_dim:
             E = layer.w13_weight.shape[0]
