@@ -618,6 +618,7 @@ class ModelRunner:
         )
         self.physical_block_size = self.attn_metadata_builder.block_size
         self.forward_done_event = torch.cuda.Event()
+        self._done_event = torch.cuda.Event()
         self.warmup_model()
         logger.info(f"Model warmup done: {config.model}")
 
@@ -1096,7 +1097,7 @@ class ModelRunner:
         cudagraph_overhead = self._estimate_cudagraph_overhead()
 
         # Safety margin (2% of total)
-        safety_margin = int(total * 0.02)
+        safety_margin = int(total * 0.04)
 
         # Budget: this server may use up to gpu_memory_utilization * total.
         # Subtract our own PyTorch usage + CUDA graph estimate + safety.
@@ -1694,9 +1695,9 @@ class ModelRunner:
         dynamically each iteration via _optimal_cu_fraction().
         """
         self._prefill_streams = {}
-        for f in self._CU_POOL_FRACTIONS:
-            mask = self._cu_mask_for_fraction(f, upper=False)
-            self._prefill_streams[f] = self._stream_with_cu_mask(mask)
+        # for f in self._CU_POOL_FRACTIONS:
+        #     mask = self._cu_mask_for_fraction(f, upper=False)
+        #     self._prefill_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask)
         self._prefill_streams[None] = torch.cuda.Stream()
         logger.info(
@@ -1712,13 +1713,14 @@ class ModelRunner:
         forward() selects the stream dynamically each iteration.
         """
         self._decode_streams = {}
-        for f in self._CU_POOL_FRACTIONS:
-            mask = self._cu_mask_for_fraction(f, upper=True)
-            self._decode_streams[f] = self._stream_with_cu_mask(mask)
+        # for f in self._CU_POOL_FRACTIONS:
+        #     mask = self._cu_mask_for_fraction(f, upper=True)
+        #     self._decode_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask)
         self._decode_streams[None] = torch.cuda.Stream()
+        #torch.cuda.set_stream(self._decode_streams[None])
         self._model_fwd_event = torch.cuda.Event()
-        self._done_event = torch.cuda.Event()
+        #self._done_event = torch.cuda.Event()
         logger.info(
             f"Decode stream pool created: fractions={list(self._decode_streams.keys())}"
         )
@@ -1741,11 +1743,13 @@ class ModelRunner:
                 batch
             )
             logits, _ = self.run_model(input_ids, batch)
-            # Sample the first generated token from each sequence's last logit.
+            # Sample the first generated token from each sequence's last logit
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
             sampled_cpu = sampled.view(-1).tolist()
         # Synchronize so decode's default stream sees all KV writes.
-        #stream.synchronize()
+        stream.synchronize()
+        # sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
+        # sampled_cpu = sampled.view(-1).tolist()
         reset_forward_context()
         return sampled_cpu
 
@@ -1970,7 +1974,7 @@ class ModelRunner:
                     logits = self.graph_logits[graph_key][:num_tokens]
                 else:
                     logits = self.model.compute_logits(hidden_states)
-
+        
         return logits, hidden_states
 
     def postprocess(
@@ -2086,7 +2090,9 @@ class ModelRunner:
         # different stream hangs on ROCm/HIP, so the None-fraction (full-CU)
         # path must stay on the default stream.
         if decode_streams is not None:
-            stream = decode_streams[batch.cu_stream_fraction]
+            #torch.cuda.current_stream().synchronize()
+            stream = decode_streams[None]
+            #stream.wait_event(self._done_event)
             with torch.cuda.stream(stream):
                 input_ids, temperatures, top_ks, top_ps, all_greedy = (
                     self.prepare_model(batch)
@@ -2098,7 +2104,7 @@ class ModelRunner:
         else:
             input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(batch)
             logits, hidden_states = self.run_model(input_ids, batch)
-
+        
         # postprocess (sampling + async CPU copy) always runs on default stream.
         fwd_output = self.postprocess(
             batch,
@@ -2109,6 +2115,7 @@ class ModelRunner:
             all_greedy,
             hidden_states,
         )
+        #self._done_event.record()
         reset_forward_context()
         return fwd_output
 

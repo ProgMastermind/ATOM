@@ -803,7 +803,7 @@ class DecodeScheduler(Scheduler):
         super().__init__(config)
         # seq_id → Sequence; blocks allocated, BlockAssignment sent, awaiting PrefillDone.
         self.prefill_waiting: dict[int, Sequence] = {}
-
+        self.prefill_done: deque[Sequence] = deque()
         # Shared memory for dynamic CU partitioning.
         self._cu_shm = None
         # if disagg_cu_shm_name:
@@ -818,13 +818,13 @@ class DecodeScheduler(Scheduler):
         self._prefill_lock = threading.Lock()
 
     def is_finished(self) -> bool:
-        return not self.waiting and not self.prefill_waiting and not self.running
+        return not self.waiting and not self.prefill_waiting and not self.running and not self.prefill_done
 
     def has_requests(self) -> bool:
-        return bool(self.waiting or self.prefill_waiting or self.running)
+        return bool(self.waiting or self.prefill_waiting or self.running or self.prefill_done)
 
     def get_num_unfinished_requests(self) -> int:
-        return len(self.waiting) + len(self.prefill_waiting) + len(self.running)
+        return len(self.waiting) + len(self.prefill_waiting) + len(self.running) + len(self.prefill_done)
 
     def allocate_waiting(self) -> list[Sequence]:
         """Allocate KV blocks for sequences in waiting; move them to prefill_waiting.
@@ -859,10 +859,8 @@ class DecodeScheduler(Scheduler):
             seq = self.prefill_waiting.pop(seq_id, None)
             if seq is not None:
                 seq.num_cached_tokens = num_tokens_computed
-                seq.status = SequenceStatus.RUNNING
-                seq.type = SequenceType.DECODE
                 seq.append_token(sampled_token_id)
-                self.running.append(seq)
+                self.prefill_done.append(seq)
 
     def schedule(self):
         """Schedule decode-only batches.
@@ -870,16 +868,32 @@ class DecodeScheduler(Scheduler):
         Sequences are promoted directly from prefill_waiting to running by
         on_prefill_done(); this method only schedules the running queue.
         """
+        with self._prefill_lock:
+            while self.prefill_done:
+                seq = self.prefill_done.popleft()
+                seq.status = SequenceStatus.RUNNING
+                seq.type = SequenceType.DECODE
+                # Append the first generated token sampled by the prefill process.
+                # In non-disagg mode, Scheduler.postprocess() does this after the
+                # prefill forward (is_deferred_out=True always appends one placeholder
+                # that is later overwritten with the real token from the async queue).
+                # In disagg mode the prefill process ran sampling and sent us the real
+                # token; appending it here puts num_tokens, context_lens, and
+                # slot_mapping in the same state as non-disagg before the first decode
+                # step.
+                self.running.append(seq)
+
         if not self.running:
             return None
 
         scheduled_seqs: dict[int, Sequence] = {}
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
-
+       
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq, self.mtp_k + 1):
+                logger.info("Cannot allocate")
                 if self.running:
                     self.preempt(self.running.pop())
                 else:
@@ -896,6 +910,8 @@ class DecodeScheduler(Scheduler):
 
         if not scheduled_seqs:
             return None
+
+        self.running.extendleft(reversed(scheduled_seqs.values()))
 
         total_tokens_num_decode = sum(num_scheduled_tokens)
 
@@ -914,7 +930,7 @@ class DecodeScheduler(Scheduler):
         #     # Stream pool is keyed by None (no mask) or a positive float.
         #     cu_fraction = raw if raw and raw > 0.0 else None
 
-        self.running.extendleft(reversed(scheduled_seqs.values()))
+        
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,
@@ -929,3 +945,12 @@ class DecodeScheduler(Scheduler):
             ),
             scheduled_seqs,
         )
+
+    # def postprocess(
+    #     self,
+    #     seqs: list[Sequence],
+    #     fwd_output: ScheduledBatchOutput,
+    #     stream_output_queue=None,
+    # ) -> list[Sequence]:
+    #     with self._prefill_lock:
+    #         super().postprocess(seqs, fwd_output, stream_output_queue)
