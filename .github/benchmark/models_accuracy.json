@@ -170,7 +170,7 @@
   {
     "model_name": "GLM-5.1-MXFP4 MTP",
     "model_path": "amd/GLM-5.1-MXFP4",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --default-chat-template-kwargs '{\"enable_thinking\":false}' --method mtp",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 4 --default-chat-template-kwargs '{\"enable_thinking\":false}' --method mtp --num-speculative-tokens 3",
     "env_vars": "",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "pr",
