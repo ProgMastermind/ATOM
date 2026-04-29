@@ -6,7 +6,7 @@ from typing import Type
 
 from atom.model_ops.attentions.backends import AttentionBackend
 from atom.utils import resolve_obj_by_qualname
-from atom.plugin.prepare import is_sglang, is_vllm
+from atom.plugin.prepare import is_vllm
 
 
 def get_attn_backend(
@@ -19,7 +19,6 @@ def get_attn_backend(
         block_size=block_size,
         use_mla=use_mla,
         use_gdn=use_gdn,
-        use_sglang=is_sglang(),
         use_vllm=is_vllm(),
     )
 
@@ -29,20 +28,17 @@ def _cached_get_attn_backend(
     block_size: int,
     use_mla: bool = False,
     use_gdn: bool = False,
-    use_sglang: bool = False,
     use_vllm: bool = False,
 ) -> Type[AttentionBackend]:
 
     # get device-specific attn_backend
-    attention_cls = get_attn_backend_cls(
-        block_size, use_mla, use_gdn, use_sglang, use_vllm
-    )
+    attention_cls = get_attn_backend_cls(block_size, use_mla, use_gdn, use_vllm)
     if not attention_cls:
         raise ValueError(f"Invalid attention backend for {attention_cls}")
     return resolve_obj_by_qualname(attention_cls)
 
 
-def get_attn_backend_cls(block_size, use_mla, use_gdn, use_sglang, use_vllm) -> str:
+def get_attn_backend_cls(block_size, use_mla, use_gdn, use_vllm) -> str:
     if use_mla:
         # if block_size == 1:
         return "atom.model_ops.attentions.aiter_mla.AiterMLABackend"  # noqa: E501
@@ -54,9 +50,5 @@ def get_attn_backend_cls(block_size, use_mla, use_gdn, use_sglang, use_vllm) -> 
     if use_gdn:
         if use_vllm:
             return "atom.plugin.vllm.attention_backend.gdn_attn.GDNAttentionBackend"
-        if use_sglang:
-            return (
-                "atom.plugin.sglang.attention_backend.attention_gdn.GDNAttentionBackend"
-            )
         return "atom.model_ops.attentions.gdn_attn.GDNAttentionBackend"
     return "atom.model_ops.attentions.aiter_attention.AiterBackend"  # noqa: E501
