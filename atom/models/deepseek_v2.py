@@ -1012,8 +1012,8 @@ def sparse_attn_indexer(
         # dummy runner
         return weights
     num_decode_tokens = context.batch_size if not context.is_prefill else 0
-    ori_block_size = get_current_atom_config().kv_cache_block_size
-    kv_cache = kv_cache.view(-1, ori_block_size, kv_cache.shape[-1])
+    runner_block_size = get_current_atom_config().kv_cache_block_size
+    kv_cache = kv_cache.view(-1, runner_block_size, kv_cache.shape[-1])
     indexer_k_quant_and_cache(
         k,
         kv_cache,
@@ -1104,7 +1104,7 @@ def sparse_attn_indexer(
             decode_metadata.context_lens,
             attn_metadata.block_tables,
             max_model_len,
-            KVBlockSize=kv_cache.shape[1],
+            KVBlockSize=runner_block_size,
             Preshuffle=True,
         )
         num_rows = logits.shape[0]
