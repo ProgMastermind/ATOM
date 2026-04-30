@@ -12,7 +12,7 @@ import numpy as np
 import torch
 import torch.profiler as torch_profiler
 import tqdm
-from aiter import destroy_dist_env, init_dist_env
+from aiter import destroy_dist_env, dtypes, init_dist_env
 from aiter.dist.parallel_state import (
     get_dp_group,
     get_pp_group,
@@ -1072,7 +1072,151 @@ class ModelRunner:
         math matches what's actually allocated. Per-request cache bytes
         are accounted for separately via `compute_per_req_cache_bytes()`.
         """
-        return self.attn_metadata_builder.compute_block_bytes()
+        config = self.config
+        hf_config = config.hf_config
+        num_kv_heads = self._get_num_kv_heads()
+        total_num_layers = self._get_total_num_layers()
+        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
+
+        if self.use_mla:
+            # MLA: shape [total_layers, blocks, block_size, 576]
+            # No kv_scale for MLA
+            block_bytes = total_num_layers * self.block_size * 576 * kv_dtype_size
+            if self.is_deepseek_v32:
+                index_dim = hf_config.index_head_dim + 4
+                aligned_index_dim = ((index_dim + 15) // 16) * 16
+                block_bytes += (
+                    total_num_layers
+                    * self.block_size
+                    * aligned_index_dim
+                    * dtypes.fp8.itemsize
+                )
+        elif self.is_qwen_next():
+            self.full_attention_interval = hf_config.full_attention_interval
+            self.num_full_attn = (
+                hf_config.num_hidden_layers // self.full_attention_interval
+            )
+            self.num_gdn_attn_state = hf_config.num_hidden_layers - self.num_full_attn
+            num_draft_layers = total_num_layers - hf_config.num_hidden_layers
+            full_attn_layers = self.num_full_attn + num_draft_layers
+
+            # full attention kv_cache bytes
+            block_bytes = (
+                2
+                * full_attn_layers
+                * self.physical_block_size
+                * num_kv_heads
+                * hf_config.head_dim
+                * kv_dtype_size
+            )
+
+            # kv_scale for full attention: [2, full_attn_layers, blocks, kv_heads, phys_block_size] float32
+            block_bytes += (
+                2
+                * full_attn_layers
+                * num_kv_heads
+                * self.physical_block_size
+                * 4  # float32
+            )
+
+            # GDN recurrent state is per-request (not per-block).
+            # It is accounted for separately via _compute_mamba_per_slot_bytes().
+            # Do NOT add it to block_bytes.
+        elif self.is_mimo_v2():
+            # MiMo-V2-Flash has mixed attention types (full + SWA) with
+            # different num_kv_heads per layer. Count each type separately
+            # for accurate memory estimation.
+            pattern = hf_config.hybrid_layer_pattern
+            num_swa_layers = sum(
+                1 for i in range(hf_config.num_hidden_layers) if pattern[i] == 1
+            )
+            num_full_layers = hf_config.num_hidden_layers - num_swa_layers
+            num_draft_layers = total_num_layers - hf_config.num_hidden_layers
+            num_swa_layers += num_draft_layers
+
+            _swa_raw = getattr(hf_config, "swa_num_key_value_heads", 0)
+            swa_kv_heads = (
+                _swa_raw // self.world_size
+                if _swa_raw >= self.world_size
+                else (1 if _swa_raw else 0)
+            )
+
+            block_bytes = (
+                2
+                * num_full_layers
+                * self.block_size
+                * num_kv_heads
+                * hf_config.head_dim
+                * kv_dtype_size
+            )
+            block_bytes += (
+                2
+                * num_swa_layers
+                * self.block_size
+                * swa_kv_heads
+                * hf_config.head_dim
+                * kv_dtype_size
+            )
+            block_bytes += (
+                2
+                * num_full_layers
+                * num_kv_heads
+                * self.physical_block_size
+                * 4  # float32
+            )
+            block_bytes += (
+                2
+                * num_swa_layers
+                * swa_kv_heads
+                * self.physical_block_size
+                * 4  # float32
+            )
+        else:
+            # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
+            # Note: allocate_kv_cache uses hf_config.num_hidden_layers for
+            # the standard path (draft layers use separate binding).
+            block_bytes = (
+                2
+                * hf_config.num_hidden_layers
+                * self.block_size
+                * num_kv_heads
+                * hf_config.head_dim
+                * kv_dtype_size
+            )
+            # kv_scale: [2, num_hidden_layers, blocks, kv_heads, phys_block_size]
+            block_bytes += (
+                2
+                * hf_config.num_hidden_layers
+                * num_kv_heads
+                * self.physical_block_size
+                * 4  # float32
+            )
+        return block_bytes
+
+    def _compute_mamba_per_slot_bytes(self) -> int:
+        """Compute per-slot recurrent state bytes (all GDN layers, one slot).
+
+        A slot holds one request's state (or one spec token's state).
+        Returns 0 for non-GDN models.
+        """
+        if not self.is_qwen_next():
+            return 0
+        hf_config = self.config.hf_config
+        mamba_shape = self.gated_delta_net_state_shape(
+            get_tp_group().world_size,
+            hf_config.linear_num_key_heads,
+            hf_config.linear_num_value_heads,
+            hf_config.linear_key_head_dim,
+            hf_config.linear_value_head_dim,
+            hf_config.linear_conv_kernel_dim,
+            self.num_spec_tokens,
+        )
+        mamba_dtypes = self.gated_delta_net_state_dtypes()
+        one_layer_byte = (
+            math.prod(mamba_shape[0]) * mamba_dtypes[0].itemsize
+            + math.prod(mamba_shape[1]) * mamba_dtypes[1].itemsize
+        )
+        return self.num_gdn_attn_state * one_layer_byte
 
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
@@ -1243,19 +1387,98 @@ class ModelRunner:
                 f"{num_draft_layers} draft (MTP) layers = {total_num_layers} total layers"
             )
 
-        # Primary KV cache allocation (model-agnostic, delegated to the
-        # attention builder). Each builder owns its tensor layout: MLA →
-        # single 576-dim per layer; GDN-hybrid → only num_full_attn rows;
-        # MiMo-V2 → defer per-module; standard MHA → split-K/V `[2, L, ...]`.
-        # Returned tensors are setattr'd on `self` under their conventional
-        # names (kv_cache, kv_scale, index_cache, aligned_index_dim,
-        # _kv_layer_cache_store) so binding code and downstream consumers
-        # find them where they expect.
-        main_kv = self.attn_metadata_builder.allocate_kv_cache_tensors(
-            num_kv_heads, num_draft_layers
-        )
-        for name, value in main_kv.items():
-            setattr(self, name, value)
+        if self.use_mla:
+            self.kv_cache = torch.zeros(
+                total_num_layers,
+                self.num_physical_kvcache_blocks,
+                self.physical_block_size,
+                576,
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            )
+            if self.is_deepseek_v32:
+                # Align last dimension to 16 bytes for fp8 (1 byte per element)
+                # to avoid unaligned memory access in torch inductor
+                index_dim = hf_config.index_head_dim + 4
+                aligned_index_dim = ((index_dim + 15) // 16) * 16
+                self.index_cache = torch.zeros(
+                    total_num_layers,
+                    self.num_physical_kvcache_blocks,
+                    self.physical_block_size,
+                    aligned_index_dim,
+                    dtype=dtypes.fp8,
+                    device="cuda",
+                )
+        elif self.is_qwen_next():
+
+            self.kv_cache = torch.zeros(
+                2,
+                self.num_full_attn + num_draft_layers,
+                self.num_physical_kvcache_blocks,
+                self.physical_block_size,
+                num_kv_heads,
+                hf_config.head_dim,
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            )
+
+            self.kv_scale = torch.zeros(
+                2,
+                self.num_full_attn + num_draft_layers,
+                self.num_physical_kvcache_blocks,
+                num_kv_heads,
+                self.physical_block_size,
+                dtype=dtypes.fp32,
+                device="cuda",
+            )
+
+            mamba_shape = self.gated_delta_net_state_shape(
+                get_tp_group().world_size,
+                hf_config.linear_num_key_heads,
+                hf_config.linear_num_value_heads,
+                hf_config.linear_key_head_dim,
+                hf_config.linear_value_head_dim,
+                hf_config.linear_conv_kernel_dim,
+                self.num_spec_tokens,  # self.num_spec,
+            )
+            mamba_dtypes = self.gated_delta_net_state_dtypes()
+            self.mamba_k_cache = torch.zeros(
+                (self.num_gdn_attn_state, self.max_mamba_slots) + mamba_shape[0],
+                dtype=mamba_dtypes[0],
+                device="cuda",
+            )
+            self.mamba_v_cache = torch.zeros(
+                (self.num_gdn_attn_state, self.max_mamba_slots) + mamba_shape[1],
+                dtype=mamba_dtypes[1],
+                device="cuda",
+            )
+        elif self.is_mimo_v2():
+            # MiMo-V2-Flash: per-layer allocation deferred to the binding
+            # loop, so each layer gets the exact num_kv_heads it needs.
+            self.kv_cache = None
+            self.kv_scale = None
+            self._kv_layer_cache_store = []
+        else:
+            self.kv_cache = torch.zeros(
+                2,
+                hf_config.num_hidden_layers,
+                self.num_physical_kvcache_blocks,
+                self.physical_block_size,
+                num_kv_heads,
+                hf_config.head_dim,
+                dtype=dtypes.d_dtypes[config.kv_cache_dtype],
+                device="cuda",
+            )
+
+            self.kv_scale = torch.zeros(
+                2,
+                hf_config.num_hidden_layers,
+                self.num_physical_kvcache_blocks,
+                num_kv_heads,
+                self.physical_block_size,
+                dtype=dtypes.fp32,
+                device="cuda",
+            )
 
         # Per-request cache allocation (model-agnostic, delegated to the
         # attention metadata builder). For GDN this returns
@@ -1825,6 +2048,8 @@ class ModelRunner:
         positions = self.forward_vars["positions"].gpu
         outputs = self.forward_vars["outputs"]
         self.forward_vars["kv_indptr"].gpu.zero_()
+        if self.is_deepseek_v32 and "sparse_kv_indptr" in self.forward_vars:
+            self.forward_vars["sparse_kv_indptr"].gpu.zero_()
 
         self.graphs: dict[tuple[int, int], torch.cuda.CUDAGraph] = dict()
         self.graph_logits: dict[tuple[int, int], torch.Tensor] = dict()
