@@ -57,6 +57,21 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT": lambda: (
         os.getenv("ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT", "1") == "1"
     ),
+    # --- Blockscale GEMM SplitK + zero-init fusion mode ---
+    # Selects how the FP8 a8w8 blockscale (per_1x128) GEMM is dispatched in
+    # LinearBase.forward. Three modes are supported:
+    #   - "none"          : baseline; splitK=0, no pre-allocated Y, no fusion.
+    #   - "splitk"        : enable SplitK (splitK read from the tuned CSV);
+    #                       the kernel itself performs Y.zero_() before the
+    #                       atomic-add launch (fill kernel visible in trace).
+    #   - "splitk_fused"  : same as "splitk" plus fold the Y zero-init into
+    #                       the immediately preceding producer kernel
+    #                       (per_group_quant_hip / fused rmsnorms) so the
+    #                       fill kernel disappears from the trace.
+    # Default "none" preserves existing behavior.
+    "ATOM_BLOCKSCALE_SPLITK_MODE": lambda: os.getenv(
+        "ATOM_BLOCKSCALE_SPLITK_MODE", "none"
+    ).lower(),
     # --- Profiling & Logging ---
     "ATOM_TORCH_PROFILER_DIR": lambda: os.getenv("ATOM_TORCH_PROFILER_DIR", None),
     "ATOM_PROFILER_MORE": lambda: os.getenv("ATOM_PROFILER_MORE", "0") == "1",

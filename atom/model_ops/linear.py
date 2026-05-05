@@ -2,6 +2,7 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import logging
+import os
 from functools import partial as functools_partial
 from typing import Callable, Optional
 
@@ -38,6 +39,50 @@ logger = logging.getLogger("atom")
 
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
+
+
+# Blockscale FP8 GEMM SplitK + zero-init fusion mode. See
+# atom/utils/envs.py for the semantics of each mode. Read once at module
+# import; flipping at runtime is intentionally not supported (mode is set
+# pre-launch via env).
+_BLOCKSCALE_SPLITK_MODES = ("none", "splitk", "splitk_fused")
+
+
+def _resolve_blockscale_splitk_mode() -> str:
+    mode = envs.ATOM_BLOCKSCALE_SPLITK_MODE
+    if mode not in _BLOCKSCALE_SPLITK_MODES:
+        logger.warning(
+            "Unknown ATOM_BLOCKSCALE_SPLITK_MODE=%s; falling back to 'none'. "
+            "Valid modes: %s",
+            mode,
+            _BLOCKSCALE_SPLITK_MODES,
+        )
+        return "none"
+    return mode
+
+
+BLOCKSCALE_SPLITK_MODE = _resolve_blockscale_splitk_mode()
+
+
+# Optional per-mode tuned-CSV overrides. When set, these supersede the
+# default AITER_CONFIG_GEMM_A8W8_BLOCKSCALE_BPRESHUFFLE for the
+# corresponding mode. Use these to ship a no-SplitK tune (config1) and a
+# with-SplitK tune (config2/3) side-by-side and flip via the mode flag.
+_BLOCKSCALE_NOSPLITK_TUNED_CSV = os.getenv(
+    "ATOM_BLOCKSCALE_BPRESHUFFLE_TUNED_NOSPLITK_CSV", ""
+).strip() or None
+_BLOCKSCALE_SPLITK_TUNED_CSV = os.getenv(
+    "ATOM_BLOCKSCALE_BPRESHUFFLE_TUNED_SPLITK_CSV", ""
+).strip() or None
+
+
+def _blockscale_tuned_csv_for_mode() -> Optional[str]:
+    if BLOCKSCALE_SPLITK_MODE == "none":
+        return _BLOCKSCALE_NOSPLITK_TUNED_CSV
+    return _BLOCKSCALE_SPLITK_TUNED_CSV
+
+
+_BLOCKSCALE_TUNED_CSV = _blockscale_tuned_csv_for_mode()
 
 
 if use_triton_gemm():
@@ -191,14 +236,47 @@ def gemm_a8w8_blockscale_preshuffle_impl(
     w_scale: torch.Tensor,
     dtype: torch.dtype = torch.bfloat16,
     prefix: str = "",
+    out: Optional[torch.Tensor] = None,
+    y_is_zeroed: bool = False,
 ) -> torch.Tensor:
-    if gemm_a8w8_blockscale_bpreshuffle_triton is not None:
+    """ATOM blockscale FP8 a8w8 (per_1x128) preshuffle GEMM dispatch.
+
+    Args:
+        x, weight, x_scale, w_scale: standard FP8 a8w8 blockscale operands.
+        dtype: output dtype (bf16/fp16).
+        prefix: layer prefix used for tracing.
+        out: optional pre-allocated output tensor of shape (M, N), dtype
+            ``dtype``. When provided the GEMM writes into this tensor instead
+            of allocating its own. Required for the SplitK-zero-init fused
+            mode where the producer kernel has already zeroed the buffer.
+        y_is_zeroed: when True, the caller has pre-zeroed ``out`` and the
+            GEMM may skip its own ``Y.zero_()`` before the SplitK
+            ``atomic_add`` accumulation. Only meaningful with splitK > 0.
+    """
+    # Triton fallback path: no SplitK / no zero-init contract today, so
+    # fall through to the AITER bpreshuffle path whenever the caller asks
+    # for any non-default behavior.
+    if (
+        gemm_a8w8_blockscale_bpreshuffle_triton is not None
+        and out is None
+        and not y_is_zeroed
+        and BLOCKSCALE_SPLITK_MODE == "none"
+    ):
         weight_shuffled = weight.reshape(weight.shape[0] // 16, weight.shape[1] * 16)
         y = gemm_a8w8_blockscale_bpreshuffle_triton(
             x, weight_shuffled, x_scale, w_scale, dtype
         )
     else:
-        y = gemm_a8w8_blockscale_bpreshuffle(x, weight, x_scale, w_scale, dtype)
+        y = gemm_a8w8_blockscale_bpreshuffle(
+            x,
+            weight,
+            x_scale,
+            w_scale,
+            dtype,
+            out=out,
+            y_is_zeroed=y_is_zeroed,
+            tuned_file=_BLOCKSCALE_TUNED_CSV,
+        )
     return y
 
 
@@ -402,6 +480,25 @@ class LinearBase(nn.Module):
                 otype=otype,
             )
         else:
+            # For per_1x128 + SplitK + fused-zero-init mode: pre-allocate the
+            # GEMM output Y here so we can hand it to the producer quant
+            # kernel as a zero-fill target. For "splitk" (non-fused) we still
+            # pre-allocate so the GEMM-side Y.zero_() writes into a buffer
+            # we own (otherwise gemm_a8w8_blockscale_bpreshuffle allocates
+            # its own and we lose the ability to compare configs trivially).
+            preallocated_y: Optional[torch.Tensor] = None
+            zero_init_target: Optional[torch.Tensor] = None
+            if (
+                self.quant_type.value == QuantType.per_1x128.value
+                and BLOCKSCALE_SPLITK_MODE != "none"
+            ):
+                m = x.shape[0] if x.dim() == 2 else int(x.numel() // x.shape[-1])
+                preallocated_y = torch.empty(
+                    m, self.output_size, dtype=otype, device=x.device
+                )
+                if BLOCKSCALE_SPLITK_MODE == "splitk_fused":
+                    zero_init_target = preallocated_y
+
             if x_scale is None:
                 quant_func = self.quant_func
                 if self.quant_type.value == QuantType.per_1x128.value:
@@ -409,11 +506,16 @@ class LinearBase(nn.Module):
                         self.quant_func, transpose_scale=True
                     )
                 if self.quant_type.value != QuantType.per_1x32.value:
-                    x, x_scale = quant_func(
-                        x,
-                        quant_dtype=self.params_dtype,
-                        scale=getattr(self, "input_scale", None),
-                    )
+                    quant_kwargs = {
+                        "quant_dtype": self.params_dtype,
+                        "scale": getattr(self, "input_scale", None),
+                    }
+                    if (
+                        zero_init_target is not None
+                        and self.quant_type.value == QuantType.per_1x128.value
+                    ):
+                        quant_kwargs["gemm_out_zero_init"] = zero_init_target
+                    x, x_scale = quant_func(x, **quant_kwargs)
             if self.quant_type.value == QuantType.per_Tensor.value:
                 y = tgemm.mm(
                     x,
@@ -451,6 +553,8 @@ class LinearBase(nn.Module):
                     self.weight_scale,
                     dtype=otype,
                     prefix=self.prefix,
+                    out=preallocated_y,
+                    y_is_zeroed=(BLOCKSCALE_SPLITK_MODE == "splitk_fused"),
                 )
                 if self.bias is not None:
                     y += self.bias
