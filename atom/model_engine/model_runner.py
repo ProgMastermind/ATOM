@@ -699,6 +699,34 @@ class ModelRunner:
             return True
         return False
 
+    def is_gemma4(self) -> bool:
+        """Whether this model uses Gemma 4-style hybrid attention.
+
+        Detected structurally rather than by `model_type` string match: a
+        model is Gemma 4-style when `hf_config` exposes `layer_types`,
+        `global_head_dim` and `num_global_key_value_heads`, and the per-type
+        `head_dim` differs (homogeneous models fall through to the standard
+        MHA path).
+        """
+        hf = self.config.hf_config
+        layer_types = getattr(hf, "layer_types", None)
+        global_head_dim = getattr(hf, "global_head_dim", None)
+        num_global_kv_heads = getattr(hf, "num_global_key_value_heads", None)
+        if layer_types is None or global_head_dim is None or num_global_kv_heads is None:
+            return False
+        return global_head_dim != hf.head_dim
+
+    def gemma4_layer_partition(self):
+        """Return `(sliding_indices, full_indices)` for Gemma 4-style models.
+
+        Both lists are ordered indices into `hf_config.layer_types`. Caller
+        must verify `is_gemma4()` first.
+        """
+        layer_types = self.config.hf_config.layer_types
+        sliding = [i for i, lt in enumerate(layer_types) if lt == "sliding_attention"]
+        full = [i for i, lt in enumerate(layer_types) if lt == "full_attention"]
+        return sliding, full
+
     def _make_buffer(
         self, *size: Union[int, torch.SymInt], dtype: torch.dtype, numpy: bool = True
     ) -> CpuGpuBuffer:
@@ -745,6 +773,8 @@ class ModelRunner:
         for attr in (
             "kv_cache",
             "kv_scale",
+            "kv_cache_full",
+            "kv_scale_full",
             "index_cache",
             "mamba_k_cache",
             "mamba_v_cache",
@@ -1063,34 +1093,6 @@ class ModelRunner:
             total += getattr(draft_hf, "num_nextn_predict_layers", 1)
         return total
 
-    def _get_per_layer_kv_dims(self):
-        """Return per-layer (num_kv_heads, head_dim) for heterogeneous models.
-
-        For models like Gemma 4 where sliding and global attention layers
-        have different num_kv_heads and head_dim, returns a list of
-        (num_kv_heads, head_dim) tuples, one per layer.
-        Returns None for homogeneous models.
-        """
-        hf_config = self.config.hf_config
-        layer_types = getattr(hf_config, "layer_types", None)
-        global_head_dim = getattr(hf_config, "global_head_dim", None)
-        num_global_kv_heads = getattr(hf_config, "num_global_key_value_heads", None)
-        if layer_types is None or global_head_dim is None or num_global_kv_heads is None:
-            return None
-        if global_head_dim == hf_config.head_dim:
-            return None
-
-        ws = self.world_size
-        swa_kv = max(hf_config.num_key_value_heads // ws, 1)
-        glo_kv = max(num_global_kv_heads // ws, 1)
-        dims = []
-        for lt in layer_types:
-            if lt == "full_attention":
-                dims.append((glo_kv, global_head_dim))
-            else:
-                dims.append((swa_kv, hf_config.head_dim))
-        return dims
-
     def _compute_block_bytes(self):
         """Per-block bytes for the unified KV pool budget.
 
@@ -1100,121 +1102,8 @@ class ModelRunner:
         `attn_metadata_builder.allocate_kv_cache_tensors()` so the budget
         math matches what's actually allocated. Per-request cache bytes
         are accounted for separately via `compute_per_req_cache_bytes()`.
-
-        TODO(rebase-0506): origin/main commit #659 moved compute_block_bytes
-        and the per-attention-type allocation/binding logic into the
-        attention builder (atom/model_ops/attentions/*.py). Gemma 4
-        heterogeneous attention (per_layer_kv_dims) was not yet ported to
-        that architecture, so this method retains the inline dispatch from
-        gemma4-dev's standalone work. Follow-up: migrate the
-        per_layer_kv_dims branch into aiter_attention.py and switch this
-        method back to a single delegation call.
         """
-        config = self.config
-        hf_config = config.hf_config
-        num_kv_heads = self._get_num_kv_heads()
-        total_num_layers = self._get_total_num_layers()
-        kv_dtype_size = dtypes.d_dtypes[config.kv_cache_dtype].itemsize
-
-        if self.use_mla:
-            # MLA: shape [total_layers, blocks, block_size, 576]
-            # No kv_scale for MLA
-            block_bytes = total_num_layers * self.block_size * 576 * kv_dtype_size
-            if self.is_deepseek_v32:
-                index_dim = hf_config.index_head_dim + 4
-                aligned_index_dim = ((index_dim + 15) // 16) * 16
-                block_bytes += (
-                    hf_config.num_hidden_layers
-                    * self.block_size
-                    * aligned_index_dim
-                    * dtypes.fp8.itemsize
-                )
-        elif self.is_qwen_next():
-            self.full_attention_interval = hf_config.full_attention_interval
-            self.num_full_attn = (
-                hf_config.num_hidden_layers // self.full_attention_interval
-            )
-            self.num_gdn_attn_state = hf_config.num_hidden_layers - self.num_full_attn
-            num_draft_layers = total_num_layers - hf_config.num_hidden_layers
-            full_attn_layers = self.num_full_attn + num_draft_layers
-
-            # full attention kv_cache bytes
-            block_bytes = (
-                2
-                * full_attn_layers
-                * self.physical_block_size
-                * num_kv_heads
-                * hf_config.head_dim
-                * kv_dtype_size
-            )
-
-            # kv_scale for full attention: [2, full_attn_layers, blocks, kv_heads, phys_block_size] float32
-            block_bytes += (
-                2
-                * full_attn_layers
-                * num_kv_heads
-                * self.physical_block_size
-                * 4  # float32
-            )
-
-            # GDN recurrent state is per-request (not per-block).
-            # It is accounted for separately via _compute_mamba_per_slot_bytes().
-            # Do NOT add it to block_bytes.
-        else:
-            per_layer_dims = self._get_per_layer_kv_dims()
-            if per_layer_dims is not None:
-                # Heterogeneous attention (e.g. Gemma 4): each layer may have
-                # different num_kv_heads / head_dim, so sum per-layer costs.
-                block_bytes = 0
-                for kv_h, hd in per_layer_dims:
-                    block_bytes += 2 * self.block_size * kv_h * hd * kv_dtype_size
-                    block_bytes += 2 * kv_h * self.physical_block_size * 4
-            else:
-                # Standard attention: kv_cache [2, num_hidden_layers, blocks, ...]
-                # Note: allocate_kv_cache uses hf_config.num_hidden_layers for
-                # the standard path (draft layers use separate binding).
-                block_bytes = (
-                    2
-                    * hf_config.num_hidden_layers
-                    * self.block_size
-                    * num_kv_heads
-                    * hf_config.head_dim
-                    * kv_dtype_size
-                )
-                # kv_scale: [2, num_hidden_layers, blocks, kv_heads, phys_block_size]
-                block_bytes += (
-                    2
-                    * hf_config.num_hidden_layers
-                    * num_kv_heads
-                    * self.physical_block_size
-                    * 4  # float32
-                )
-        return block_bytes
-
-    def _compute_mamba_per_slot_bytes(self) -> int:
-        """Compute per-slot recurrent state bytes (all GDN layers, one slot).
-
-        A slot holds one request's state (or one spec token's state).
-        Returns 0 for non-GDN models.
-        """
-        if not self.is_qwen_next():
-            return 0
-        hf_config = self.config.hf_config
-        mamba_shape = self.gated_delta_net_state_shape(
-            get_tp_group().world_size,
-            hf_config.linear_num_key_heads,
-            hf_config.linear_num_value_heads,
-            hf_config.linear_key_head_dim,
-            hf_config.linear_value_head_dim,
-            hf_config.linear_conv_kernel_dim,
-            self.num_spec_tokens,
-        )
-        mamba_dtypes = self.gated_delta_net_state_dtypes()
-        one_layer_byte = (
-            math.prod(mamba_shape[0]) * mamba_dtypes[0].itemsize
-            + math.prod(mamba_shape[1]) * mamba_dtypes[1].itemsize
-        )
-        return self.num_gdn_attn_state * one_layer_byte
+        return self.attn_metadata_builder.compute_block_bytes()
 
     def _estimate_cudagraph_overhead(self):
         """Estimate GPU memory consumed by CUDA graph capture.
@@ -1411,35 +1300,6 @@ class ModelRunner:
             for name, tensor in per_req_tensors.items():
                 setattr(self, name, tensor)
 
-        # Gemma 4 heterogeneous attention override.
-        # TODO(rebase-0506): origin/main's attention builder
-        # (atom/model_ops/attentions/aiter_attention.py) does not yet handle
-        # per-layer kv_dims, so for now we override the builder's uniform
-        # standard-MHA allocation with per-layer tensors here. Migrate this
-        # branch into the builder and drop this override in a follow-up.
-        self._per_layer_kv_cache = None
-        if not self.use_mla and not self.is_qwen_next():
-            per_layer_dims = self._get_per_layer_kv_dims()
-            if per_layer_dims is not None:
-                self._per_layer_kv_cache = []
-                self._per_layer_kv_scale = []
-                kv_dt = dtypes.d_dtypes[config.kv_cache_dtype]
-                for kv_h, hd in per_layer_dims:
-                    kc = torch.zeros(
-                        2, self.num_physical_kvcache_blocks,
-                        self.physical_block_size, kv_h, hd,
-                        dtype=kv_dt, device="cuda",
-                    )
-                    sc = torch.zeros(
-                        2, self.num_physical_kvcache_blocks,
-                        kv_h, self.physical_block_size,
-                        dtype=dtypes.fp32, device="cuda",
-                    )
-                    self._per_layer_kv_cache.append(kc)
-                    self._per_layer_kv_scale.append(sc)
-                self.kv_cache = self._per_layer_kv_cache[0]
-                self.kv_scale = None
-
         # Build KVCacheConfig
         # lirong TODO: This is a simple solution to build KVCacheConfig,
         # models with only one type of attention, but not support multi-type of attention models.
@@ -1452,15 +1312,6 @@ class ModelRunner:
 
         kv_cache_tensors = []
         layer_id = 0
-        # Gemma 4 uses heterogeneous per-layer KV cache (different head_dim
-        # per layer), so self.kv_cache may be a list instead of a single
-        # tensor; pick element_size() from whichever shape is in use.
-        _elem_size = (
-            self.kv_cache.element_size()
-            if not isinstance(self.kv_cache, list) and hasattr(self.kv_cache, "element_size")
-            else (self._per_layer_kv_cache[0].element_size() if self._per_layer_kv_cache else 2)
-        )
-        x = 16 // _elem_size
         # Promote to self so the attention builder's build_kv_cache_tensor()
         # can access it without recomputing from drafter state.
         self.mtp_start_layer_idx = (
@@ -1468,65 +1319,22 @@ class ModelRunner:
             if hasattr(self, "drafter")
             else hf_config.num_hidden_layers
         )
-        mtp_start_layer_idx = self.mtp_start_layer_idx
         for model_name, model in models_to_bind:
             logger.info(
                 f"Binding KV cache for {model_name} model starting at layer_id={layer_id}"
             )
 
             for module in model.modules():
-                # Gemma 4 heterogeneous override: the attention builder does
-                # not yet handle per-layer kv_dims, so build the
-                # KVCacheTensor inline when _per_layer_kv_cache is in use.
-                # TODO(rebase-0506): migrate this branch into
-                # aiter_attention.py and drop the inline override.
-                if (
-                    self._per_layer_kv_cache is not None
-                    and hasattr(module, "base_attention")
-                    and hasattr(module, "use_mla")
-                    and not module.use_mla
-                ):
-                    attn_idx = layer_id
-                    layer_kv = self._per_layer_kv_cache[attn_idx]
-                    layer_kv_h = layer_kv.shape[3]
-                    layer_hd = layer_kv.shape[4]
-                    k_cache = layer_kv[0].view(
-                        self.num_physical_kvcache_blocks,
-                        layer_kv_h,
-                        layer_hd // x,
-                        self.physical_block_size,
-                        x,
-                    )
-                    v_cache = layer_kv[1].view(
-                        self.num_physical_kvcache_blocks,
-                        layer_kv_h,
-                        layer_hd,
-                        self.physical_block_size,
-                    )
-                    if config.kv_cache_dtype == "fp8":
-                        module.k_scale = self._per_layer_kv_scale[attn_idx][0]
-                        module.v_scale = self._per_layer_kv_scale[attn_idx][1]
-                    module.max_model_len = self.config.max_model_len
-                    kv_cache_tensor = KVCacheTensor(
-                        layer_num=layer_id,
-                        k_cache=k_cache,
-                        v_cache=v_cache,
-                        k_scale=module.k_scale,
-                        v_scale=module.v_scale,
-                    )
-                    module.k_cache = k_cache
-                    module.v_cache = v_cache
-                else:
-                    # Per-attention-type binding is owned by the attention
-                    # metadata builder; ModelRunner only walks modules and
-                    # collects the resulting KVCacheTensor entries. The
-                    # builder returns None for modules it does not recognize
-                    # (so a sibling module like nn.LayerNorm is silently
-                    # skipped), and increments through MHA / MLA / GDN /
-                    # V3.2-indexer internally.
-                    kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
-                        layer_id, module
-                    )
+                # Per-attention-type binding is owned by the attention
+                # metadata builder; ModelRunner only walks modules and
+                # collects the resulting KVCacheTensor entries. The builder
+                # returns None for modules it does not recognize (so a
+                # sibling module like nn.LayerNorm is silently skipped),
+                # and increments through MHA / MLA / GDN / V3.2-indexer
+                # internally.
+                kv_cache_tensor = self.attn_metadata_builder.build_kv_cache_tensor(
+                    layer_id, module
+                )
                 if kv_cache_tensor is not None:
                     kv_cache_tensors.append(kv_cache_tensor)
                     layer_id += 1
