@@ -114,6 +114,9 @@ if [ "$TYPE" == "accuracy" ]; then
   echo ""
   echo "========== Running accuracy test =========="
   ATOM_CLIENT_LOG="${ATOM_CLIENT_LOG:-/tmp/atom_client.log}"
+
+  ACCURACY_TASK=${ACCURACY_TASK:-gsm8k}
+
   # Set umask so files created by lm_eval are world-readable (container runs as root,
   # host runner user needs to read results via the shared volume mount)
   umask 0022
@@ -121,10 +124,23 @@ if [ "$TYPE" == "accuracy" ]; then
   RUN_TAG=$(date +%Y%m%d%H%M%S)
   OUTPUT_PATH=accuracy_test_results/${RUN_TAG}
   FLAT_RESULT_FILE=accuracy_test_results/${RUN_TAG}.json
-  lm_eval --model local-completions \
-          --model_args model="$MODEL_PATH",base_url=http://localhost:8000/v1/completions,num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True \
-          --tasks gsm8k \
-          --num_fewshot 3 \
+
+  if [ "$ACCURACY_TASK" = "gsm8k_cot" ]; then
+    EVAL_MODEL="local-chat-completions"
+    EVAL_BASE_URL="http://localhost:8000/v1/chat/completions"
+    APPLY_CHAT_TEMPLATE="--apply_chat_template"
+    NUM_FEWSHOT_ARG=""
+  else
+    EVAL_MODEL="local-completions"
+    EVAL_BASE_URL="http://localhost:8000/v1/completions"
+    APPLY_CHAT_TEMPLATE=""
+    NUM_FEWSHOT_ARG="--num_fewshot 3"
+  fi
+  lm_eval --model "$EVAL_MODEL" \
+          --model_args "model=${MODEL_PATH},base_url=${EVAL_BASE_URL},num_concurrent=65,max_retries=3,tokenized_requests=False,trust_remote_code=True" \
+          --tasks "${ACCURACY_TASK}" \
+          $APPLY_CHAT_TEMPLATE \
+          $NUM_FEWSHOT_ARG \
           --output_path "${OUTPUT_PATH}" \
           2>&1 | tee "$ATOM_CLIENT_LOG"
 
