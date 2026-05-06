@@ -520,7 +520,16 @@ class LinearBase(nn.Module):
             # its own and we lose the ability to compare configs trivially).
             preallocated_y: Optional[torch.Tensor] = None
             zero_init_target: Optional[torch.Tensor] = None
-            shape_splitk: Optional[int] = None
+            # producer_zeroed flips True only when we actually pass
+            # gemm_out_zero_init=Y to a producer call below. y_is_zeroed
+            # must be driven off this -- *not* off our intent to fuse --
+            # because Qwen3-Next-style fused upstream RMSNorm-quant ops
+            # feed LinearBase with x_scale already set, in which case we
+            # skip the in-LinearBase quant call and never hand Y to any
+            # producer. Claiming y_is_zeroed=True without an actual
+            # zero-fill would make the SplitK atomic_add accumulate onto
+            # uninitialized memory.
+            producer_zeroed = False
             if (
                 self.quant_type.value == QuantType.per_1x128.value
                 and BLOCKSCALE_SPLITK_MODE != "none"
@@ -533,12 +542,13 @@ class LinearBase(nn.Module):
                     shape_splitk = _blockscale_splitk_for_shape(
                         m, self.output_size, self.input_size
                     )
-                    # Only stage the producer-side zero-init when the tuner
-                    # actually picked splitK > 0 for this shape. shape_splitk
-                    # is None when the helper is missing or the CSV has no
-                    # match; in that case fall back to staging it (current
-                    # behavior) so we never under-zero.
-                    if shape_splitk is None or shape_splitk > 0:
+                    # Only stage the producer-side zero-init when the
+                    # tuner actually picked splitK > 0 for this shape.
+                    # shape_splitk is 0 when no CSV match exists either;
+                    # in that case the GEMM falls back to splitK=0 too
+                    # (no atomic-add pass), so there is nothing to zero
+                    # and staging would just waste producer bandwidth.
+                    if shape_splitk is not None and shape_splitk > 0:
                         zero_init_target = preallocated_y
 
             if x_scale is None:
@@ -557,6 +567,7 @@ class LinearBase(nn.Module):
                         and self.quant_type.value == QuantType.per_1x128.value
                     ):
                         quant_kwargs["gemm_out_zero_init"] = zero_init_target
+                        producer_zeroed = True
                     x, x_scale = quant_func(x, **quant_kwargs)
             if self.quant_type.value == QuantType.per_Tensor.value:
                 y = tgemm.mm(
@@ -596,12 +607,14 @@ class LinearBase(nn.Module):
                     dtype=otype,
                     prefix=self.prefix,
                     out=preallocated_y,
-                    # y_is_zeroed must agree with what we actually staged
-                    # in the producer: True only when zero_init_target was
-                    # set AND we are in the fused mode. A False here when
-                    # splitK=0 is harmless (kernel skips its own zero
-                    # because k_batch=1).
-                    y_is_zeroed=(zero_init_target is not None),
+                    # y_is_zeroed must agree with what a producer
+                    # actually wrote: True only when we successfully
+                    # passed gemm_out_zero_init= to a producer call
+                    # this iteration. False here when splitK=0 is
+                    # harmless (kernel skips its own zero because
+                    # k_batch=1); False when splitK>0 falls back to
+                    # the kernel-side Y.zero_().
+                    y_is_zeroed=producer_zeroed,
                 )
                 if self.bias is not None:
                     y += self.bias
