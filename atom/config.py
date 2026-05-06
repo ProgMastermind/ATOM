@@ -502,6 +502,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     "kimi_k25": "text_config",
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
+    "gemma4": "text_config",
 }
 
 # multimodal models fully supported by plugin mode
@@ -510,6 +511,7 @@ _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
     "qwen3_5",
     "qwen3_5_moe",
 }
+
 
 
 def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConfig:
