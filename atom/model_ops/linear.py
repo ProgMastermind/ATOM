@@ -85,6 +85,38 @@ def _blockscale_tuned_csv_for_mode() -> Optional[str]:
 _BLOCKSCALE_TUNED_CSV = _blockscale_tuned_csv_for_mode()
 
 
+# CSV lookup so we only pay the producer-side zero-init when the tuned
+# config actually selected splitK > 0 for the running (M, N, K). For
+# shapes the tuner picked splitK = 0 the kernel performs no atomic-add
+# pass and there is nothing to skip, so pre-zeroing in the producer is
+# wasted memory traffic.
+try:
+    from aiter.ops.gemm_op_a8w8 import get_CKGEMM_config as _get_blockscale_config
+except ImportError:
+    _get_blockscale_config = None
+
+
+def _blockscale_splitk_for_shape(m: int, n: int, k: int) -> Optional[int]:
+    """Return the splitK column from the active tuned CSV, or None.
+
+    Returns None when the lookup helper is unavailable, when no CSV is
+    configured for the active mode, or when the tuner has no entry that
+    matches (m, n, k) (including its padded-M fallbacks).
+    """
+    if _get_blockscale_config is None or _BLOCKSCALE_TUNED_CSV is None:
+        return None
+    try:
+        cfg = _get_blockscale_config(m, n, k, tuned_file=_BLOCKSCALE_TUNED_CSV)
+    except Exception:  # noqa: BLE001
+        return None
+    if cfg is None:
+        return None
+    try:
+        return int(cfg.get("splitK", 0))
+    except (TypeError, ValueError):
+        return None
+
+
 if use_triton_gemm():
     try:
         # from aiter.ops.triton.gemm_a8w8_blockscale import gemm_a8w8_blockscale_preshuffle as gemm_a8w8_blockscale_bpreshuffle_triton
@@ -488,6 +520,7 @@ class LinearBase(nn.Module):
             # its own and we lose the ability to compare configs trivially).
             preallocated_y: Optional[torch.Tensor] = None
             zero_init_target: Optional[torch.Tensor] = None
+            shape_splitk: Optional[int] = None
             if (
                 self.quant_type.value == QuantType.per_1x128.value
                 and BLOCKSCALE_SPLITK_MODE != "none"
@@ -497,7 +530,16 @@ class LinearBase(nn.Module):
                     m, self.output_size, dtype=otype, device=x.device
                 )
                 if BLOCKSCALE_SPLITK_MODE == "splitk_fused":
-                    zero_init_target = preallocated_y
+                    shape_splitk = _blockscale_splitk_for_shape(
+                        m, self.output_size, self.input_size
+                    )
+                    # Only stage the producer-side zero-init when the tuner
+                    # actually picked splitK > 0 for this shape. shape_splitk
+                    # is None when the helper is missing or the CSV has no
+                    # match; in that case fall back to staging it (current
+                    # behavior) so we never under-zero.
+                    if shape_splitk is None or shape_splitk > 0:
+                        zero_init_target = preallocated_y
 
             if x_scale is None:
                 quant_func = self.quant_func
@@ -554,7 +596,12 @@ class LinearBase(nn.Module):
                     dtype=otype,
                     prefix=self.prefix,
                     out=preallocated_y,
-                    y_is_zeroed=(BLOCKSCALE_SPLITK_MODE == "splitk_fused"),
+                    # y_is_zeroed must agree with what we actually staged
+                    # in the producer: True only when zero_init_target was
+                    # set AND we are in the fused mode. A False here when
+                    # splitK=0 is harmless (kernel skips its own zero
+                    # because k_batch=1).
+                    y_is_zeroed=(zero_init_target is not None),
                 )
                 if self.bias is not None:
                     y += self.bias
