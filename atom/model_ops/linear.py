@@ -513,9 +513,51 @@ class LinearBase(nn.Module):
         if self.quant_type == QuantType.per_1x32:
             self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
 
+    def preallocate_y(
+        self,
+        m: int,
+        dtype: torch.dtype = dtypes.bf16,
+        device: Optional[torch.device] = None,
+    ) -> Optional[torch.Tensor]:
+        """Pre-allocate the per_1x128 SplitK GEMM output buffer for an
+        upstream producer to zero-init.
+
+        Returns ``None`` (i.e. fusion is a no-op) when:
+          * the active mode is not ``splitk_fused``;
+          * this LinearBase is not a per_1x128 quant_type;
+          * dtype/device cannot be resolved.
+
+        Otherwise returns a ``torch.empty(m, self.output_size, dtype, device)``
+        that the caller threads into both:
+          1. the upstream producer (as ``gemm_out_zero_init=Y``), and
+          2. the downstream ``forward(..., external_y=Y)``.
+
+        Doing the staging this way (instead of allocating inside
+        ``forward``) is the only way to coordinate the buffer between a
+        producer kernel that runs **before** ``LinearBase.forward`` and
+        the GEMM that runs inside it -- the call sites are in different
+        Python modules (input_layernorm vs LinearBase). For producers
+        that LinearBase calls itself (P1 path, x_scale=None branch in
+        ``forward``) we keep the existing internal allocation logic.
+        """
+        if BLOCKSCALE_SPLITK_MODE != "splitk_fused":
+            return None
+        if self.quant_type.value != QuantType.per_1x128.value:
+            return None
+        if device is None:
+            try:
+                device = self.weight.device
+            except AttributeError:
+                return None
+        return torch.empty(m, self.output_size, dtype=dtype, device=device)
+
     @mark_trace
     def forward(
-        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
+        self,
+        x: torch.Tensor,
+        x_scale: Optional[torch.Tensor] = None,
+        otype=dtypes.bf16,
+        external_y: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.quant_type.value == QuantType.No.value:
             y = tgemm.mm(
@@ -559,27 +601,43 @@ class LinearBase(nn.Module):
             preallocated_y: Optional[torch.Tensor] = None
             zero_init_target: Optional[torch.Tensor] = None
             # producer_zeroed flips True only when we actually pass
-            # gemm_out_zero_init=Y to a producer call below. y_is_zeroed
-            # must be driven off this -- *not* off our intent to fuse --
-            # because Qwen3-Next-style fused upstream RMSNorm-quant ops
-            # feed LinearBase with x_scale already set, in which case we
-            # skip the in-LinearBase quant call and never hand Y to any
-            # producer. Claiming y_is_zeroed=True without an actual
-            # zero-fill would make the SplitK atomic_add accumulate onto
-            # uninitialized memory.
+            # gemm_out_zero_init=Y to a producer call below, OR the
+            # caller hands us a Y that an upstream producer has already
+            # zero-init'd (P2/P3 path: external_y is not None and
+            # x_scale arrives non-None from input_layernorm /
+            # RMSNormGated). y_is_zeroed must be driven off this --
+            # *not* off our intent to fuse -- because claiming
+            # y_is_zeroed=True without an actual zero-fill would make
+            # the SplitK atomic_add accumulate onto uninitialized
+            # memory.
             producer_zeroed = False
             if (
                 self.quant_type.value == QuantType.per_1x128.value
                 and BLOCKSCALE_SPLITK_MODE != "none"
             ):
-                m = x.shape[0] if x.dim() == 2 else int(x.numel() // x.shape[-1])
-                preallocated_y = torch.empty(
-                    m, self.output_size, dtype=otype, device=x.device
-                )
-                if BLOCKSCALE_SPLITK_MODE == "splitk_fused":
-                    # Stage zero-init unconditionally; see KNOWN LIMITATION
-                    # block above for why this is not currently shape-aware.
-                    zero_init_target = preallocated_y
+                if external_y is not None:
+                    # Caller pre-allocated Y and (when paired with a
+                    # non-None x_scale) had an upstream producer
+                    # zero-init it via gemm_out_zero_init=. We trust
+                    # that pairing: the call site is responsible for
+                    # only routing external_y when the producer ran
+                    # the fused path. This keeps the invariant inside
+                    # LinearBase: producer_zeroed reflects what was
+                    # *actually* zeroed at runtime.
+                    preallocated_y = external_y
+                    if x_scale is not None:
+                        producer_zeroed = True
+                else:
+                    m = x.shape[0] if x.dim() == 2 else int(x.numel() // x.shape[-1])
+                    preallocated_y = torch.empty(
+                        m, self.output_size, dtype=otype, device=x.device
+                    )
+                    if BLOCKSCALE_SPLITK_MODE == "splitk_fused":
+                        # Stage zero-init for the in-LinearBase P1
+                        # path (x_scale will be None below); see KNOWN
+                        # LIMITATION block above for why this is not
+                        # currently shape-aware.
+                        zero_init_target = preallocated_y
 
             if x_scale is None:
                 quant_func = self.quant_func

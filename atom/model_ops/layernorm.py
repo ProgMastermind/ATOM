@@ -410,7 +410,10 @@ class RMSNormGated(nn.Module):
         return (out, None)
 
     def forward_fused_fp8(
-        self, x: torch.Tensor, z: torch.Tensor
+        self,
+        x: torch.Tensor,
+        z: torch.Tensor,
+        gemm_out_zero_init: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Fused FP8 group quantization implementation.
@@ -418,6 +421,11 @@ class RMSNormGated(nn.Module):
         Args:
             x: Input tensor [num_tokens, num_heads, head_dim]
             z: Gating tensor [num_tokens, num_heads, head_dim]
+            gemm_out_zero_init: Optional pre-allocated [M, N] tensor for the
+                downstream SplitK GEMM output. When provided, the kernel
+                fills it with zeros at the start of its launch grid so the
+                GEMM can skip its own ``Y.zero_()`` before SplitK
+                accumulation. Pass ``None`` to disable fusion.
 
         Returns:
             Tuple of (fp8_tensor, scale_tensor)
@@ -434,7 +442,11 @@ class RMSNormGated(nn.Module):
             or not self.norm_before_gate
             or head_dim != self.group_size_quant
         ):
-            # Grouped norm not supported by kernel, fallback
+            # Grouped norm not supported by kernel, fallback. The native
+            # path cannot fuse zero-init (no kernel involved), so we just
+            # ignore gemm_out_zero_init here -- caller has to fall back to
+            # the standalone Y.zero_() path. This is fine because the bf16
+            # fallback is only entered when fp8 fusion is unavailable.
             return self.forward_native(x, z)
 
         out_fp8 = torch.empty(
@@ -454,6 +466,7 @@ class RMSNormGated(nn.Module):
             self.eps,
             self.group_size_quant,
             self.transpose_scale,
+            gemm_out_zero_init=gemm_out_zero_init,
         )
         # Kernel already returns flattened outputs - no reshaping needed!
         # out_fp8: [num_tokens, num_heads*head_dim]
@@ -461,7 +474,10 @@ class RMSNormGated(nn.Module):
         return (out_fp8, out_scales)
 
     def forward(
-        self, x: torch.Tensor, z: torch.Tensor
+        self,
+        x: torch.Tensor,
+        z: torch.Tensor,
+        gemm_out_zero_init: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         """
         Forward pass with optional FP8 fusion.
@@ -469,6 +485,9 @@ class RMSNormGated(nn.Module):
         Args:
             x: Input tensor
             z: Gating tensor (required positional argument, can be None)
+            gemm_out_zero_init: Optional pre-allocated [M, N] tensor for
+                downstream SplitK GEMM zero-init fusion (per_1x128 path).
+                Caller passes ``None`` to disable.
 
         Returns:
             Tuple of (output, scale)
@@ -477,7 +496,7 @@ class RMSNormGated(nn.Module):
         """
         # Use fused FP8 kernel if enabled
         if self.use_fused_fp8_quant:
-            return self.forward_fused_fp8(x, z)
+            return self.forward_fused_fp8(x, z, gemm_out_zero_init=gemm_out_zero_init)
 
         return self.forward_native(x, z)
 
@@ -553,7 +572,7 @@ class GemmaRMSNorm(nn.Module):
             x, self.weight.data, self.variance_epsilon, residual
         )
 
-    def _forward_fused_fp8(self, x, residual=None):
+    def _forward_fused_fp8(self, x, residual=None, gemm_out_zero_init=None):
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
         from aiter.utility.dtypes import fp8
 
@@ -585,6 +604,7 @@ class GemmaRMSNorm(nn.Module):
             group_size=group_size,
             transpose_scale=True,
             gemma_norm=True,
+            gemm_out_zero_init=gemm_out_zero_init,
         )
         if residual is not None:
             return out_fp8, out_scale, out_bf16, res_out
@@ -594,9 +614,12 @@ class GemmaRMSNorm(nn.Module):
         self,
         x: torch.Tensor,
         residual: torch.Tensor | None = None,
+        gemm_out_zero_init: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if self.use_fused_quant:
-            return self._forward_fused_fp8(x, residual)
+            return self._forward_fused_fp8(
+                x, residual, gemm_out_zero_init=gemm_out_zero_init,
+            )
         return self.forward_cuda(x, residual)
 
 

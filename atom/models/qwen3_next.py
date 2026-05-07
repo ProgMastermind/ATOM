@@ -407,8 +407,12 @@ class Qwen3NextAttention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
         x_scale=None,
+        qkv_external_y: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        qkv = self.qkv_proj(hidden_states, x_scale=x_scale)
+        # qkv_external_y: pre-allocated Y for SplitK zero-init fusion (P2),
+        # produced by the upstream input_layernorm when in splitk_fused
+        # mode. Routed unchanged to qkv_proj; LinearBase ignores when None.
+        qkv = self.qkv_proj(hidden_states, x_scale=x_scale, external_y=qkv_external_y)
 
         if self.attn_output_gate:
             gate, qkv = torch.split(
@@ -715,12 +719,20 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         hidden_states: torch.Tensor,
         x_fp8=None,
         x_scale=None,
+        inproj_external_y: torch.Tensor | None = None,
     ):
         """
         Forward pass with three parts:
         1. Input projection
         2. Core attention (custom op)
         3. Output projection
+
+        ``inproj_external_y`` is the pre-allocated Y for the
+        ``in_proj_qkvz`` SplitK GEMM, supplied by the decoder layer when
+        the upstream input_layernorm has zero-init'd it via
+        ``gemm_out_zero_init=`` (P2 fusion path). Only consumed on the
+        FP8 ``in_proj_qkvz`` branch; ignored for ``in_proj_qkvzba``
+        (bf16-only, no SplitK) and for the bf16-input fallback.
         """
         num_tokens = hidden_states.size(0)
 
@@ -740,7 +752,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             )
         else:
             if x_fp8 is not None:
-                projected_states_qkvz = self.in_proj_qkvz(x_fp8, x_scale=x_scale)
+                projected_states_qkvz = self.in_proj_qkvz(
+                    x_fp8, x_scale=x_scale, external_y=inproj_external_y,
+                )
             else:
                 projected_states_qkvz = self.in_proj_qkvz(hidden_states)
             projected_states_ba = self.in_proj_ba(hidden_states)  # always BF16
@@ -768,8 +782,19 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         # Part 3: Output Projection
         # ============================================================
 
-        core_attn_out, maybe_scale = self.norm(core_attn_out, z)
-        output = self.out_proj(core_attn_out, x_scale=maybe_scale)
+        # SplitK zero-init fusion (P3): when splitk_fused is active and
+        # out_proj is a per_1x128 LinearBase, pre-allocate Y and route it
+        # through the gated RMSNorm so the producer kernel zeros it for
+        # the GEMM. preallocate_y returns None outside fused mode, which
+        # makes the whole path a no-op for "none" / "splitk".
+        out_proj_M = core_attn_out.shape[0]
+        out_proj_y = self.out_proj.preallocate_y(out_proj_M)
+        core_attn_out, maybe_scale = self.norm(
+            core_attn_out, z, gemm_out_zero_init=out_proj_y,
+        )
+        output = self.out_proj(
+            core_attn_out, x_scale=maybe_scale, external_y=out_proj_y,
+        )
         return output
 
 
@@ -944,15 +969,32 @@ class Qwen3NextDecoderLayer(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
 
+        # SplitK zero-init fusion (P2): when input_layernorm runs the
+        # fused fp8 quant path, pre-allocate Y for the immediately
+        # following SplitK GEMM (qkv_proj for full_attention,
+        # in_proj_qkvz for linear_attention) and route it through both
+        # the layernorm (so its kernel zeros Y as a prologue) and the
+        # downstream LinearBase (so it skips the standalone Y.zero_()).
+        # preallocate_y returns None outside splitk_fused or for
+        # non-per_1x128 LinearBase, making the whole path inert there.
+        next_proj_y: torch.Tensor | None = None
         if self.input_layernorm.use_fused_quant:
+            M = hidden_states.shape[0]
+            if self.layer_type == "full_attention":
+                next_proj_y = self.self_attn.qkv_proj.preallocate_y(M)
+            elif self.layer_type == "linear_attention" and hasattr(
+                self.linear_attn, "in_proj_qkvz"
+            ):
+                next_proj_y = self.linear_attn.in_proj_qkvz.preallocate_y(M)
+
             if residual is None:
                 residual = hidden_states
                 hidden_states, x_scale, hidden_bf16 = self.input_layernorm(
-                    hidden_states
+                    hidden_states, gemm_out_zero_init=next_proj_y,
                 )
             else:
                 hidden_states, x_scale, hidden_bf16, residual = self.input_layernorm(
-                    hidden_states, residual
+                    hidden_states, residual, gemm_out_zero_init=next_proj_y,
                 )
         else:
             x_scale = hidden_bf16 = None
@@ -969,12 +1011,14 @@ class Qwen3NextDecoderLayer(nn.Module):
                 ),
                 x_fp8=hidden_states if x_scale is not None else None,
                 x_scale=x_scale,
+                inproj_external_y=next_proj_y,
             )
         elif self.layer_type == "full_attention":
             hidden_states = self.self_attn(
                 hidden_states=hidden_states,
                 positions=positions,
                 x_scale=x_scale,
+                qkv_external_y=next_proj_y,
             )
         else:
             raise ValueError("Invalid layer_type")
