@@ -116,10 +116,17 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         max_model_len = vllm_scheduler_config.max_model_len
 
     max_num_batched_tokens = vllm_scheduler_config.max_num_batched_tokens
+    trust_remote_code = getattr(vllm_model_config, "trust_remote_code", False)
+    hf_config = getattr(vllm_model_config, "hf_config", None)
+    if getattr(hf_config, "model_type", None) == "kimi_k25":
+        # Keep ATOM on vLLM's built-in Kimi-K2.5 config. The model repo's
+        # remote vision config exposes mm_hidden_size but not the hidden_size
+        # expected by vLLM's MoonViT3dPretrainedModel.
+        trust_remote_code = False
 
     return Config(
         model=vllm_model_config.model,
-        trust_remote_code=getattr(vllm_model_config, "trust_remote_code", False),
+        trust_remote_code=trust_remote_code,
         max_num_batched_tokens=max_num_batched_tokens,
         max_num_seqs=vllm_scheduler_config.max_num_seqs,
         max_model_len=max_model_len,
