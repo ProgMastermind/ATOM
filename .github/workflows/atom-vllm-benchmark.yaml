@@ -27,8 +27,16 @@ on:
         description: "gpt-oss-120b TP1"
         type: boolean
         default: false
+      glm-4-7-fp8-tp8:
+        description: "GLM-4.7-FP8 TP8"
+        type: boolean
+        default: false
       glm-5-1-fp8-tp8:
         description: "GLM-5.1-FP8 TP8"
+        type: boolean
+        default: false
+      minimax-m2-5-tp2:
+        description: "MiniMax-M2.5 TP2"
         type: boolean
         default: false
       kimi-k2-thinking-mxfp4-tp4:
@@ -457,7 +465,9 @@ jobs:
           ENABLE_DEEPSEEK_R1_MXFP4: ${{ inputs.deepseek-r1-mxfp4 }}
           ENABLE_DEEPSEEK_V3_2_FP8: ${{ inputs.deepseek-v3-2-fp8 }}
           ENABLE_GPT_OSS_120B: ${{ inputs.gpt-oss-120b }}
+          ENABLE_GLM_4_7_FP8_TP8: ${{ inputs.glm-4-7-fp8-tp8 }}
           ENABLE_GLM_5_1_FP8_TP8: ${{ inputs.glm-5-1-fp8-tp8 }}
+          ENABLE_MINIMAX_M25_TP2: ${{ inputs.minimax-m2-5-tp2 }}
           ENABLE_KIMI_K2_TP4: ${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}
           ENABLE_KIMI_K2_TP8: ${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}
           ENABLE_KIMI_K25_TP2: ${{ inputs.kimi-k2-5-mxfp4-tp2 }}
@@ -492,7 +502,9 @@ jobs:
               "deepseek-r1-mxfp4": os.environ.get("ENABLE_DEEPSEEK_R1_MXFP4", "").lower() == "true",
               "deepseek-v3-2-fp8": os.environ.get("ENABLE_DEEPSEEK_V3_2_FP8", "").lower() == "true",
               "gpt-oss-120b": os.environ.get("ENABLE_GPT_OSS_120B", "").lower() == "true",
+              "glm-4-7-fp8-tp8": os.environ.get("ENABLE_GLM_4_7_FP8_TP8", "").lower() == "true",
               "glm-5-1-fp8-tp8": os.environ.get("ENABLE_GLM_5_1_FP8_TP8", "").lower() == "true",
+              "MiniMax-M2.5-tp2": os.environ.get("ENABLE_MINIMAX_M25_TP2", "").lower() == "true",
               "kimi-k2-thinking-mxfp4-tp4": os.environ.get("ENABLE_KIMI_K2_TP4", "").lower() == "true",
               "kimi-k2-thinking-mxfp4-tp8": os.environ.get("ENABLE_KIMI_K2_TP8", "").lower() == "true",
               "kimi-k25-mxfp4-tp2": os.environ.get("ENABLE_KIMI_K25_TP2", "").lower() == "true",
@@ -820,7 +832,9 @@ jobs:
             deepseek-r1-mxfp4) echo "enabled=${{ inputs.deepseek-r1-mxfp4 }}" >> "$GITHUB_OUTPUT" ;;
             deepseek-v3-2-fp8) echo "enabled=${{ inputs.deepseek-v3-2-fp8 }}" >> "$GITHUB_OUTPUT" ;;
             gpt-oss-120b) echo "enabled=${{ inputs.gpt-oss-120b }}" >> "$GITHUB_OUTPUT" ;;
+            glm-4-7-fp8-tp8) echo "enabled=${{ inputs.glm-4-7-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             glm-5-1-fp8-tp8) echo "enabled=${{ inputs.glm-5-1-fp8-tp8 }}" >> "$GITHUB_OUTPUT" ;;
+            MiniMax-M2.5-tp2) echo "enabled=${{ inputs.minimax-m2-5-tp2 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp4) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp4 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k2-thinking-mxfp4-tp8) echo "enabled=${{ inputs.kimi-k2-thinking-mxfp4-tp8 }}" >> "$GITHUB_OUTPUT" ;;
             kimi-k25-mxfp4-tp2) echo "enabled=${{ inputs.kimi-k2-5-mxfp4-tp2 }}" >> "$GITHUB_OUTPUT" ;;
@@ -1072,7 +1086,7 @@ jobs:
                   --num-prompts=\"$(( CONC * 10 ))\" \
                   --max-concurrency=\"${CONC}\" \
                   ${TRUST_REMOTE_CODE_ARG} \
-                  --num-warmups=\"$(( 2 * CONC ))\" \
+                  --num-warmups=\"$(( 4 * CONC ))\" \
                   --request-rate=inf \
                   --ignore-eos \
                   --save-result \
