@@ -1112,7 +1112,7 @@ jobs:
         if: steps.check.outputs.enabled == 'true'
         env:
           MAX_WAIT_RETRIES: "120"
-          STREAM_VLLM_LOGS: "1"
+          STREAM_VLLM_LOGS: "0"
         run: |
           set -euo pipefail
           $CONTAINER_ENGINE exec \
