@@ -1093,7 +1093,7 @@ jobs:
                   --num-prompts=\"$(( CONC * 10 ))\" \
                   --max-concurrency=\"${CONC}\" \
                   ${TRUST_REMOTE_CODE_ARG} \
-                  --num-warmups=\"$(( 4 * CONC ))\" \
+                  --num-warmups=\"$(( 2 * CONC ))\" \
                   --request-rate=inf \
                   --ignore-eos \
                   --save-result \
