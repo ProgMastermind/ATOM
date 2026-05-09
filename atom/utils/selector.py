@@ -66,4 +66,14 @@ def get_attn_backend_cls(
                 "atom.plugin.sglang.attention_backend.attention_gdn.GDNAttentionBackend"
             )
         return "atom.model_ops.attentions.gdn_attn.GDNAttentionBackend"
+    # gfx1201 (RDNA4) lacks gfx-specific code objects in the AITER prebuilt
+    # .so files shipped with rocm/atom-dev:latest, so fall back to the in-tree
+    # torch-native attention backend that does not load those modules.
+    # Also opt-in via ATOM_TORCH_NATIVE_ATTN=1 on any device for testing.
+    try:
+        from atom.model_ops.attentions.torch_native_attn import use_torch_native_attn
+        if use_torch_native_attn():
+            return "atom.model_ops.attentions.torch_native_attn.TorchNativeBackend"
+    except Exception:
+        pass
     return "atom.model_ops.attentions.aiter_attention.AiterBackend"  # noqa: E501
