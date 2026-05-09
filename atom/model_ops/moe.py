@@ -1,13 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
 from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
 
 import torch
-from aiter import ActivationType, QuantType, dtypes, get_hip_quant
+from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_softplus
 from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
@@ -685,9 +686,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             or self.quant_type == QuantType.per_1x32
         )
         gfx = get_gfx()
-        self.use_triton = gfx.startswith("gfx94") or (
-            gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
-        )
+        if envs.is_set("ATOM_USE_TRITON_MOE"):
+            self.use_triton = envs.ATOM_USE_TRITON_MOE
+        else:
+            self.use_triton = (
+                gfx.startswith("gfx94")
+                or gfx.startswith("gfx12")
+                or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
+            )
         if self.use_triton:
             from atom.model_ops.utils import has_triton_kernels
 
@@ -818,6 +824,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
+
+        if os.environ.get("ATOM_V4_TORCH_MOE"):
+            return
 
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
@@ -969,11 +978,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     num_fused_shared_experts=layer.num_fused_shared_experts,
                     routed_scaling_factor=layer.routed_scaling_factor,
                 )
+                n_expts_act = topk_weights.shape[1]
 
                 # Convert to triton routing data structures
                 n_expts_tot = router_logits.shape[-1]
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts
+                n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
                 routing_data, gather_idx, scatter_idx = routing_from_topk(
                     topk_weights, topk_ids, n_expts_tot
@@ -988,14 +999,15 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     routing_data,
                     gather_idx,
                     scatter_idx,
-                    topk=top_k,
+                    topk=n_expts_act,
                     activation=activation,
                     w13_precision_config=self.w13_precision_config,
                     w2_precision_config=self.w2_precision_config,
                     w1_bias=layer.w13_bias,
                     w2_bias=layer.w2_bias,
+                    swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
-                    global_num_experts=global_num_experts,
+                    global_num_experts=n_expts_tot,
                     expert_map=expert_map,
                 )
                 return _moe_result
@@ -1344,13 +1356,22 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
             # Update scale to single max scale per expert [E]
             layer.w13_weight_scale = atom_parameter(max_w13_scales)
 
-        # Shuffle weights for asm moe (moved from inference to load time for better performance)
-        if w13.dtype in [
-            torch.int8,
-            torch.uint8,
-            torch.float8_e4m3fnuz,
-            torch.float8_e4m3fn,
-        ]:
+        # Shuffle weights for asm moe (moved from inference to load time for better performance).
+        # For per_1x128 blockscale (block_quant), only shuffle when the preshuffle GEMM
+        # path is enabled — the non-preshuffle kernel expects the un-shuffled layout.
+        skip_shuffle_for_block = (
+            self.block_quant and not envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+        )
+        if (
+            w13.dtype
+            in [
+                torch.int8,
+                torch.uint8,
+                torch.float8_e4m3fnuz,
+                torch.float8_e4m3fn,
+            ]
+            and not skip_shuffle_for_block
+        ):
             from aiter.ops.shuffle import shuffle_weight
 
             w13.data = shuffle_weight(w13.data)
@@ -1660,7 +1681,11 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = atom_parameter(layer.w2_weight.data)
             layer.w2_weight_scale = atom_parameter(layer.w2_weight_scale.data)
 
-        shuffle_weights(layer.w13_weight, layer.w2_weight)
+        # per_1x128 blockscale MoE only needs weight bpreshuffle when the
+        # preshuffle GEMM path is enabled. Skip it to match the non-preshuffle
+        # kernel's expected weight layout.
+        if envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE:
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
 
     def _process_channel_quant(self, layer: nn.Module) -> None:
         """PTPTC"""
@@ -1932,7 +1957,9 @@ class FusedMoE(torch.nn.Module):
         super().__init__()
         self.prefix = prefix
         layer_quant_config = (
-            quant_config.get_layer_quant_config(prefix) if quant_config else None
+            quant_config.get_layer_quant_config(prefix, check_children=True)
+            if quant_config
+            else None
         )
         self.params_dtype = (
             layer_quant_config.quant_dtype
@@ -2226,6 +2253,15 @@ class FusedMoE(torch.nn.Module):
         if load_shard_size != expert_shard_size:
             expert_data = expert_data.narrow(shard_dim, 0, load_shard_size)
         if expert_data.dtype != dtypes.fp4x2:
+            # Dtype glue: V4 stores per-1x32 weight scales as float8_e8m0fnu but
+            # FusedMoE allocates them as uint8 (raw byte storage). PyTorch's
+            # copy_() between mismatched float8/uint8 dtypes silently writes
+            # zeros — must reinterpret the source as uint8 first.
+            if expert_data.dtype == torch.uint8 and loaded_weight.dtype in (
+                torch.float8_e8m0fnu,
+                torch.float8_e4m3fn,
+            ):
+                loaded_weight = loaded_weight.view(torch.uint8)
             expert_data.copy_(loaded_weight)
         else:
             expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
@@ -2256,6 +2292,12 @@ class FusedMoE(torch.nn.Module):
         if expert_data.dtype == dtypes.fp4x2:
             expert_data.view(torch.uint8).copy_(loaded_weight.view(torch.uint8))
         else:
+            # Dtype glue: see _load_w13 for the same uint8/float8 reinterpret.
+            if expert_data.dtype == torch.uint8 and loaded_weight.dtype in (
+                torch.float8_e8m0fnu,
+                torch.float8_e4m3fn,
+            ):
+                loaded_weight = loaded_weight.view(torch.uint8)
             expert_data.copy_(loaded_weight)
 
     def _load_single_value(
@@ -2556,6 +2598,18 @@ class FusedMoE(torch.nn.Module):
         routed_scaling_factor: float = 1.0,
     ):
 
+        # custom_routing_function takes precedence (e.g. DeepSeek-V4 hash routing
+        # in the first 3 layers, where topk_ids are looked up from a per-token
+        # hash table instead of computed from gate logits).
+        if custom_routing_function is not None:
+            topk_weights, topk_ids = custom_routing_function(
+                hidden_states=hidden_states,
+                gating_output=router_logits,
+                topk=top_k,
+                renormalize=renormalize,
+            )
+            return topk_weights, topk_ids
+
         # DeekSeekv2 uses grouped_top_k
         if use_grouped_topk:
             assert topk_group is not None
@@ -2600,6 +2654,24 @@ class FusedMoE(torch.nn.Module):
                     ).clamp_min(1e-20)
 
                 topk_ids = topk_ids.to(torch.int32)
+            elif scoring_func == "sqrtsoftplus":
+                # # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;
+                # # weights gathered from the unbiased sqrt(softplus(.)) values.
+                tokens_num = router_logits.shape[0]
+                topk_ids = torch.empty(
+                    tokens_num, top_k, dtype=torch.int32, device=router_logits.device
+                )
+                topk_weights = torch.empty(
+                    tokens_num, top_k, dtype=torch.float32, device=router_logits.device
+                )
+                topk_softplus(
+                    topk_weights,
+                    topk_ids,
+                    router_logits,
+                    e_score_correction_bias,
+                    renormalize,
+                    routed_scaling_factor,
+                )
             else:
                 raise ValueError(
                     f"Unsupported scoring function for non-grouped topk: {scoring_func}"
