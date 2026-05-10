@@ -3,67 +3,37 @@
 
 """Torch-native attention backend for ATOM.
 
-Purpose
--------
-Provide an attention backend that does not depend on AITER's prebuilt HIP
-.so files. The shipped AITER package in rocm/atom-dev:latest has prebuilt
-modules for gfx94x/95x only; on gfx1201 (RDNA4) the first paged-attention
-HIP load fails with 'No compatible code objects found for: gfx1201',
-SIGSEGV-ing the ModelRunner subprocess before any forward pass runs.
+Why this exists
+---------------
+The AITER package shipped in rocm/atom-dev:latest has prebuilt HIP .so files
+only for gfx94x/95x. On gfx1201 (RDNA4) the first paged-attention HIP load
+fails with 'No compatible code objects found for: gfx1201' and SIGSEGVs the
+ModelRunner subprocess. This backend is a torch-only path that does not
+load any of those prebuilt modules.
 
-Wiring
+Selection: atom/utils/selector.py:get_attn_backend_cls routes here when
+torch.cuda.get_device_properties(0).gcnArchName starts with 'gfx1201', or
+when ATOM_TORCH_NATIVE_ATTN=1 is set on any device.
+
+Dispatch: atom/model_ops/paged_attention.py:PagedAttention.forward checks
+self.attn_backend.get_name() == 'TORCH_NATIVE_ATTENTION' and routes through
+self.impl.forward() instead of torch.ops.aiter.unified_attention_with_output_base.
+
+Status
 ------
-Selected by atom/utils/selector.py:get_attn_backend_cls when running on a
-device whose gcnArchName is 'gfx1201', or when ATOM_TORCH_NATIVE_ATTN=1.
+- Prefill: implemented via torch.nn.functional.scaled_dot_product_attention
+  with per-sequence slicing using cu_seqlens_q (variable-length attention).
+  RoPE is applied if rotary_emb was passed in. Sliding window is honored.
+- Decode: NOT implemented (raises). Requires a working KV cache write +
+  block-table gather. Tracked as TODO-5.
+- KV cache: NOT allocated. The metadata builder's allocate_kv_cache_tensors
+  returns {} (default) so no paged KV pool exists. Prefill works without it
+  because the full sequence's K/V is in the current call. Tracked as TODO-7.
+- FP8 KV cache: NOT supported. Use --kv_cache_dtype bf16. (TODO-8)
+- CUDAGraph capture: NOT supported. Use --enforce-eager and --level 0.
 
-Status (scaffold — do not ship as a real backend yet)
------------------------------------------------------
-Today this file lays out the class structure, subclasses CommonAttentionBuilder
-to inherit the prefill metadata path (which is already pure torch + Triton),
-and stubs prepare_decode / build_for_cudagraph_capture / TorchNativeAttentionImpl
-with NotImplementedError messages that point to the next concrete sub-task.
-
-Remaining work, broken into commit-sized pieces (each its own session):
-
-  TODO-1  prepare_decode: build slot_mapping + context_lens + block_tables
-          for the decode batch (no aiter kv_indptr/kv_indices; we will gather
-          K/V per token in the impl). Mirror aiter_attention.py:529-620,
-          stripping all kv_indptr/kv_indices/persistent-worker buffers.
-
-  TODO-2  build_for_cudagraph_capture: return AttentionMetaData with
-          slot_mapping/context_lens/block_tables/cu_seqlens_q sliced to bs.
-          Mirror aiter_attention.py:793-822 stripped of aiter-specific fields.
-
-  TODO-3  TorchNativeAttentionImpl.__init__: accept the same kwargs as
-          PagedAttentionImpl (atom/model_ops/attention_mha.py:29-90), store
-          rotary_emb/q_norm/k_norm/scale/heads/sliding_window, allocate
-          kv-cache views the runner will fill in via reshape_and_cache.
-
-  TODO-4  TorchNativeAttentionImpl.forward: prefill path — apply RoPE,
-          write K/V into the paged cache via a torch scatter on slot_mapping,
-          run F.scaled_dot_product_attention with a block-diagonal causal
-          mask built from cu_seqlens_q (or call the variable-length SDPA
-          variant in pytorch 2.10).
-
-  TODO-5  TorchNativeAttentionImpl.forward: decode path — apply RoPE to the
-          new query, write current K/V into cache via slot_mapping, gather
-          historical K/V from block_tables for each request, then run SDPA
-          with a left-padding mask (no causal needed for decode).
-
-  TODO-6  Sliding-window support — mask out positions older than
-          self.sliding_window in both prefill and decode paths.
-
-  TODO-7  KV-cache reshape_and_cache helper — replace aiter.reshape_and_cache
-          with a torch index_put_ on the [num_blocks, block_size, num_heads,
-          head_dim] tensor using slot_mapping. Lives wherever the existing
-          aiter call site is (likely attention_mha.py:forward path).
-
-  TODO-8  FP8 KV cache — when kv_cache_dtype='fp8', dequant K/V from FP8
-          before SDPA (or quantize on write). For first usable version,
-          recommend kv_cache_dtype='bf16' and defer FP8 KV.
-
-Once TODO-1..5 land, a forward pass should complete on Llama-3.1 / Mistral-3
-on gfx1201 without invoking any precompiled aiter HIP kernel for attention.
+Goal of this iteration: get ModelRunner.warmup_model() to complete one
+prefill forward pass without any aiter HIP module load.
 """
 
 from __future__ import annotations
@@ -73,6 +43,7 @@ import os
 from typing import Optional, Type
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 from atom.model_engine.scheduler import ScheduledBatch
@@ -81,13 +52,13 @@ from atom.model_ops.attentions.backends import (
     AttentionImpl,
     CommonAttentionBuilder,
 )
-from atom.utils.forward_context import AttentionMetaData
+from atom.utils.forward_context import AttentionMetaData, get_forward_context
 
 logger = logging.getLogger("atom")
 
 
 def _is_gfx1201() -> bool:
-    """Return True if running on a gfx1201 (RDNA4) device."""
+    """Return True if the visible CUDA/HIP device is gfx1201 (RDNA4)."""
     if not torch.cuda.is_available():
         return False
     name = torch.cuda.get_device_properties(0).gcnArchName or ""
@@ -95,14 +66,14 @@ def _is_gfx1201() -> bool:
 
 
 def use_torch_native_attn() -> bool:
-    """Decide whether ATOM should route attention through this backend."""
+    """True when ATOM should route attention through the torch-native backend."""
     if os.environ.get("ATOM_TORCH_NATIVE_ATTN", "").lower() in ("1", "true"):
         return True
     return _is_gfx1201()
 
 
 class TorchNativeBackend(AttentionBackend):
-    """AITER-free attention backend. See module docstring for status."""
+    """AITER-free attention backend."""
 
     @staticmethod
     def get_name() -> str:
@@ -122,8 +93,12 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
     already uses only torch + a Triton helper for block-table conversion).
     The aiter-specific allocations done by AiterAttentionMetadataBuilder.__init__
     (get_pa_metadata_info_v1, work_meta_data, work_indptr, kv_indptr, ...) are
-    deliberately omitted — they target a paged-attention kernel that does not
+    deliberately omitted -- they target an aiter HIP kernel that does not
     have a gfx1201 build.
+
+    KV cache allocation is also omitted for now (defaults from base class
+    return empty dicts). Prefill works without it because the current
+    forward() call has the full sequence's K/V in hand. Decode is TODO.
     """
 
     def __init__(
@@ -134,8 +109,6 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
         device=None,
         model_runner=None,
     ):
-        # block_size matches the runner's block_size; we have no second-level
-        # 'aiter persistent' block size to negotiate.
         self.block_size = 16 if model_runner.block_size != 1024 else 1024
         CommonAttentionBuilder.__init__(self, model_runner)
         logger.info(
@@ -143,33 +116,28 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
         )
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
-        # TODO-1: build slot_mapping/context_lens/block_tables for decode without
+        # TODO: build slot_mapping/context_lens/block_tables for decode without
         # aiter's kv_indptr/kv_indices. Mirror aiter_attention.py:prepare_decode
-        # (lines ~529-620) stripped of:
-        #   - kv_indptr / kv_indices fields
-        #   - persistent-attention worker buffers (work_meta_data, ...)
-        #   - block-size 1024 special path
-        # Return (AttentionMetaData, positions_tensor).
+        # stripped of all kv_indptr/kv_indices/persistent-worker buffers.
         raise NotImplementedError(
-            "TorchNativeMetadataBuilder.prepare_decode is a TODO — see "
-            "module docstring 'TODO-1'."
+            "TorchNativeMetadataBuilder.prepare_decode is a TODO. The current "
+            "impl only supports prefill (sufficient for ModelRunner.warmup_model)."
         )
 
     def build_for_cudagraph_capture(self, bs: int):
-        # TODO-2: return (AttentionMetaData, Context) sliced to bs from
-        # self.model_runner.forward_vars.
         raise NotImplementedError(
-            "TorchNativeMetadataBuilder.build_for_cudagraph_capture is a "
-            "TODO — see module docstring 'TODO-2'. Workaround: run with "
-            "--enforce-eager and --level 0 to skip CUDAGraph capture."
+            "build_for_cudagraph_capture: run with --enforce-eager --level 0 "
+            "(CUDAGraph capture not yet supported)."
         )
 
 
 class TorchNativeAttentionImpl(AttentionImpl):
-    """Torch-native paged-attention forward.
+    """Torch-only paged-attention forward.
 
-    Same constructor signature as PagedAttentionImpl
-    (atom/model_ops/attention_mha.py:29). Forward pass is a TODO.
+    Constructor mirrors PagedAttentionImpl
+    (atom/model_ops/attention_mha.py:29-90); only the fields actually used by
+    the prefill path are stored. The rest are accepted-and-ignored to stay
+    signature-compatible with the existing PagedAttention dispatch site.
     """
 
     def __init__(
@@ -193,10 +161,9 @@ class TorchNativeAttentionImpl(AttentionImpl):
         **kwargs,
     ):
         nn.Module.__init__(self)
-        # TODO-3: store all these and allocate K/V cache tensor views the
-        # ModelRunner will populate via the build_kv_cache_tensor flow.
         self.num_heads = num_heads
         self.head_dim = head_dim
+        self.head_size = head_dim  # ATOM convention
         self.scale = scale
         self.num_kv_heads = num_kv_heads if num_kv_heads is not None else num_heads
         self.sliding_window = sliding_window if sliding_window is not None else -1
@@ -205,32 +172,124 @@ class TorchNativeAttentionImpl(AttentionImpl):
         self.rotary_emb = rotary_emb
         self.q_norm = q_norm
         self.k_norm = k_norm
-        # KV cache slabs are populated by ModelRunner after backend.build_kv_cache_tensor.
-        self.k_cache = torch.tensor([])
-        self.v_cache = torch.tensor([])
-        if kv_cache_dtype == "fp8":
+        # Sized by the q/kv split; accept-and-ignore the rest.
+        self.q_size = num_heads * head_dim
+        self.kv_size = self.num_kv_heads * head_dim
+        if kv_cache_dtype != "bf16":
             logger.warning(
-                "TorchNativeAttentionImpl: kv_cache_dtype=fp8 is a TODO; "
-                "use --kv_cache_dtype bf16 for now (TODO-8)."
+                f"TorchNativeAttentionImpl: kv_cache_dtype={kv_cache_dtype} "
+                "is a TODO; force --kv_cache_dtype bf16."
             )
+
+    # ------------------------------------------------------------------ #
+    # Forward                                                            #
+    # ------------------------------------------------------------------ #
 
     def forward(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
-        position: Optional[torch.Tensor] = None,
+        positions: Optional[torch.Tensor] = None,
+        kv_cache: Optional[torch.Tensor] = None,
+        layer_name: Optional[str] = None,
+        use_mla: bool = False,
+        **kwargs,
     ) -> torch.Tensor:
-        # TODO-4 (prefill) + TODO-5 (decode) + TODO-6 (sliding window):
-        # 1. Apply RoPE to query/key (or trust caller already did it; check
-        #    PagedAttentionImpl.forward for which side does RoPE).
-        # 2. Write current K/V into self.k_cache / self.v_cache via slot_mapping.
-        # 3. Gather historical K/V from block_tables.
-        # 4. F.scaled_dot_product_attention with the right mask
-        #    (block-diagonal causal for prefill; left-padding mask for decode).
-        # 5. Apply sliding-window mask if self.sliding_window > 0.
-        raise NotImplementedError(
-            "TorchNativeAttentionImpl.forward is a TODO — see module "
-            "docstring 'TODO-4 / TODO-5'. Currently the backend builds "
-            "successfully but the first attention call will trip this."
-        )
+        """Prefill-only torch-native attention.
+
+        Layout:
+          query : [total_tokens, num_heads * head_dim]
+          key   : [total_tokens, num_kv_heads * head_dim]
+          value : [total_tokens, num_kv_heads * head_dim]
+        Output : [total_tokens, num_heads * head_dim]
+
+        Steps:
+          1. Reshape into (total_tokens, num_heads_or_kv, head_dim).
+          2. Apply RoPE if rotary_emb is set.
+          3. Repeat-interleave KV heads to match Q heads (GQA).
+          4. For each sequence (per cu_seqlens_q), call SDPA with is_causal=True.
+          5. Reassemble into the flat token-major output layout.
+        """
+        if use_mla:
+            raise NotImplementedError(
+                "TorchNativeAttentionImpl: MLA path is not implemented; "
+                "this backend is for plain MHA (Llama / Mistral)."
+            )
+
+        ctx = get_forward_context()
+        attn_md: Optional[AttentionMetaData] = ctx.attn_metadata
+        fc = ctx.context
+
+        is_prefill = bool(getattr(fc, "is_prefill", True)) if fc is not None else True
+        if not is_prefill:
+            raise NotImplementedError(
+                "TorchNativeAttentionImpl: decode path is a TODO. "
+                "Only prefill works today (sufficient for warmup_model)."
+            )
+
+        if attn_md is None or getattr(attn_md, "cu_seqlens_q", None) is None:
+            raise RuntimeError(
+                "TorchNativeAttentionImpl: forward called without an "
+                "AttentionMetaData with cu_seqlens_q."
+            )
+
+        total_tokens = query.shape[0]
+        q = query.view(total_tokens, self.num_heads, self.head_dim)
+        k = key.view(total_tokens, self.num_kv_heads, self.head_dim)
+        v = value.view(total_tokens, self.num_kv_heads, self.head_dim)
+
+        # RoPE
+        if self.rotary_emb is not None and positions is not None:
+            # ATOM's rotary_emb expects (positions, q_flat, k_flat) in many
+            # implementations; use the same shape the model passes in.
+            q_flat = q.reshape(total_tokens, self.num_heads * self.head_dim)
+            k_flat = k.reshape(total_tokens, self.num_kv_heads * self.head_dim)
+            q_flat, k_flat = self.rotary_emb(positions, q_flat, k_flat)
+            q = q_flat.view(total_tokens, self.num_heads, self.head_dim)
+            k = k_flat.view(total_tokens, self.num_kv_heads, self.head_dim)
+
+        # GQA: tile K/V heads so they match Q heads
+        if self.num_kv_heads != self.num_heads:
+            assert self.num_heads % self.num_kv_heads == 0
+            n_rep = self.num_heads // self.num_kv_heads
+            k = k.repeat_interleave(n_rep, dim=1)
+            v = v.repeat_interleave(n_rep, dim=1)
+
+        cu_q = attn_md.cu_seqlens_q
+        if cu_q.dim() == 0:  # scalar slipped through
+            raise RuntimeError("cu_seqlens_q is a 0-dim tensor, expected 1-D")
+        cu_q_cpu = cu_q.detach().cpu().tolist()
+
+        # Per-sequence SDPA prefill. SDPA with is_causal=True takes
+        # [batch, heads, seq, head_dim] inputs.
+        out = torch.empty_like(q)
+        for i in range(len(cu_q_cpu) - 1):
+            s, e = int(cu_q_cpu[i]), int(cu_q_cpu[i + 1])
+            if s == e:
+                continue
+            q_i = q[s:e].transpose(0, 1).unsqueeze(0)  # [1, H, T, D]
+            k_i = k[s:e].transpose(0, 1).unsqueeze(0)
+            v_i = v[s:e].transpose(0, 1).unsqueeze(0)
+            attn_mask = None
+            if self.sliding_window is not None and self.sliding_window > 0:
+                t = e - s
+                idx = torch.arange(t, device=q.device)
+                # allow positions j where i-j < sliding_window AND j <= i
+                sw = self.sliding_window
+                mask = (idx[:, None] >= idx[None, :]) & (
+                    (idx[:, None] - idx[None, :]) < sw
+                )
+                attn_mask = mask  # [T, T] boolean
+            o_i = F.scaled_dot_product_attention(
+                q_i,
+                k_i,
+                v_i,
+                attn_mask=attn_mask,
+                dropout_p=0.0,
+                is_causal=(attn_mask is None),
+                scale=self.scale,
+            )
+            out[s:e] = o_i.squeeze(0).transpose(0, 1)  # [T, H, D]
+
+        return out.reshape(total_tokens, self.num_heads * self.head_dim)

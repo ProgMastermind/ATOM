@@ -218,6 +218,19 @@ class PagedAttention(BaseAttention):
             )
             return output
 
+        # Torch-native fallback: backends without aiter prebuilt HIP modules
+        # (e.g. gfx1201) route through self.impl.forward instead of the aiter op.
+        if self.attn_backend.get_name() == "TORCH_NATIVE_ATTENTION":
+            return self.impl.forward(
+                query=query,
+                key=key,
+                value=value,
+                positions=positions,
+                kv_cache=getattr(self, "kv_cache", None),
+                layer_name=self.layer_name,
+                use_mla=self.use_mla,
+            )
+
         # for atom server mode
         output = torch.ops.aiter.unified_attention_with_output_base(
             query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv

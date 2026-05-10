@@ -51,12 +51,36 @@ def silu(input: Tensor, inplace: bool = False) -> Tensor:
     return torch._C._nn.silu(input)
 
 
+def _is_gfx1201_layernorm() -> bool:
+    """Detect gfx1201 (RDNA4) where AITER's prebuilt rmsnorm HIP kernels are
+    missing a code object and crash with SIGSEGV. Cached after first call."""
+    if not hasattr(_is_gfx1201_layernorm, "_cached"):
+        try:
+            import torch as _t
+            name = _t.cuda.get_device_properties(0).gcnArchName or ""
+            _is_gfx1201_layernorm._cached = name.startswith("gfx1201")
+        except Exception:
+            _is_gfx1201_layernorm._cached = False
+    return _is_gfx1201_layernorm._cached
+
+
+def _rmsnorm_torch(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
+    """Pure-torch RMSNorm. x: [..., D]; weight: [D]."""
+    orig_dtype = x.dtype
+    x32 = x.to(torch.float32)
+    var = x32.pow(2).mean(-1, keepdim=True)
+    out = x32 * torch.rsqrt(var + eps)
+    return (out * weight.to(torch.float32)).to(orig_dtype)
+
+
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
 ) -> torch.Tensor:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
+    if _is_gfx1201_layernorm():
+        return _rmsnorm_torch(x, weight, eps).view(ori_shape)
     return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
 
 
@@ -66,6 +90,10 @@ def rmsnorm2d_fwd_with_add_(
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
+    if _is_gfx1201_layernorm():
+        residual_out = (x + residual.reshape(-1, dim)).to(residual.dtype)
+        out = _rmsnorm_torch(residual_out, weight, eps)
+        return out.view(ori_shape), residual_out.view(ori_shape)
     out = torch.empty_like(x)
     residual_out = torch.empty_like(x)
     rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
