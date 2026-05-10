@@ -1,47 +1,37 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Torch-native attention backend for ATOM (gfx1201 / RDNA4).
+"""Torch-native (with triton-fast paths) attention backend for ATOM (gfx1201).
 
 Why this exists
 ---------------
 The AITER package shipped in rocm/atom-dev:latest has prebuilt HIP .so files
-only for gfx94x/95x. On gfx1201 the AITER paged-attention HIP modules fail
-to load with 'No compatible code objects found for: gfx1201' and SIGSEGV
-the ModelRunner subprocess. This backend is an in-tree torch-only path that
-does not load any of those prebuilt modules.
+only for gfx94x/95x. On gfx1201 (RDNA4) the AITER paged-attention HIP modules
+fail to load with "No compatible code objects found for: gfx1201" and SIGSEGV
+the ModelRunner. This backend replaces that path with a mix of triton (fast)
+and torch (correctness fallback) kernels that work on gfx1201.
 
 Selection
 ---------
 atom/utils/selector.py:get_attn_backend_cls routes here when
 torch.cuda.get_device_properties(0).gcnArchName starts with 'gfx1201',
-or when ATOM_TORCH_NATIVE_ATTN=1 is set on any device.
+or when ATOM_TORCH_NATIVE_ATTN=1 is set.
 
-KV cache layout
----------------
-We use a single contiguous tensor per backend:
+KV cache layout (matches aiter's pa_decode triton kernel expectations)
+----------------------------------------------------------------------
+    runner.kv_cache : [2, num_layers, num_blocks, num_kv_heads, block_size, head_dim]
+                     |--K-and-V--||--per-layer--||---paged storage in aiter format---|
 
-    runner.kv_cache : [2, num_layers, num_blocks, block_size, num_kv_heads, head_dim]
-                     |--K-and-V--||--per-layer--||----flat slot index space----|
-
-`build_kv_cache_tensor` slices `runner.kv_cache[0, layer_id]` for K and
-`[1, layer_id]` for V, exposing them on each `PagedAttention` module as
-`module.k_cache` / `module.v_cache` with shape
-`[num_blocks, block_size, num_kv_heads, head_dim]`. The engine's
-`slot_mapping` is a flat token-index that views this as
-`(num_blocks * block_size, num_kv_heads, head_dim)`.
-
-Forward path
-------------
-* Prefill: apply RoPE -> write current K/V to cache at slot_mapping ->
-  per-sequence SDPA with `is_causal=True` over the in-batch K/V (no
-  history needed because prefill carries the full sequence).
-* Decode: apply RoPE -> write the new K/V at slot_mapping (one slot per
-  request) -> for each request, gather the historical K/V from
-  block_tables up to context_len, then SDPA with no causal mask
-  (length-1 query).
-
-Sliding window is honored via an explicit boolean mask in both paths.
+Forward
+-------
+* Prefill: write current K/V at slot_mapping into the cache, then run
+  per-sequence SDPA over the in-batch K/V (no history needed because
+  prefill carries the full sequence).
+* Decode: write the new K/V at slot_mapping (one slot per request),
+  then call aiter's `paged_attention_decode` triton kernel
+  (~1.8x faster than the torch gather + SDPA loop on gfx1201).
+  Falls back to the torch path if the triton kernel raises (e.g. unusual
+  shapes, sliding window, or a kernel-side AssertionError).
 """
 
 from __future__ import annotations
@@ -81,12 +71,37 @@ def use_torch_native_attn() -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Cached triton paged-attention decode kernel
+# ---------------------------------------------------------------------------
+_TRITON_PA_DECODE = None
+_TRITON_TL_BF16 = None
+
+
+def _get_triton_pa_decode():
+    global _TRITON_PA_DECODE, _TRITON_TL_BF16
+    if _TRITON_PA_DECODE is None:
+        try:
+            from aiter.ops.triton.attention.pa_decode import paged_attention_decode
+            import triton.language as tl
+            _TRITON_PA_DECODE = paged_attention_decode
+            _TRITON_TL_BF16 = tl.bfloat16
+        except Exception as e:
+            logger.warning("triton paged_attention_decode unavailable: %s", e)
+            _TRITON_PA_DECODE = False
+    return (
+        (_TRITON_PA_DECODE, _TRITON_TL_BF16)
+        if _TRITON_PA_DECODE is not False
+        else (None, None)
+    )
+
+
+# ---------------------------------------------------------------------------
 # Backend
 # ---------------------------------------------------------------------------
 
 
 class TorchNativeBackend(AttentionBackend):
-    """AITER-free attention backend."""
+    """AITER-free attention backend (torch + selectively triton)."""
 
     @staticmethod
     def get_name() -> str:
@@ -107,8 +122,9 @@ class TorchNativeBackend(AttentionBackend):
 
 
 class TorchNativeMetadataBuilder(CommonAttentionBuilder):
-    """Inherits prepare_prefill from CommonAttentionBuilder; provides
-    decode metadata + KV cache allocation."""
+    """Inherits prepare_prefill from CommonAttentionBuilder; provides decode
+    metadata + KV cache allocation in aiter's [blocks, heads, block_size, d]
+    layout."""
 
     def __init__(
         self,
@@ -139,13 +155,11 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
         return n_layers, num_kv_heads, head_dim
 
     def _kv_dtype(self):
-        # We only support BF16 KV today; FP8 KV is a TODO.
         return torch.bfloat16
 
     def compute_block_bytes(self) -> int:
         n_layers, num_kv_heads, head_dim = self._kv_layout_dims()
         elem = self._kv_dtype().itemsize
-        # 2 (K and V) * layers * block_size * heads * d * elem
         return 2 * n_layers * self.block_size * num_kv_heads * head_dim * elem
 
     def allocate_kv_cache_tensors(
@@ -153,13 +167,14 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
     ) -> dict:
         runner = self.model_runner
         n_layers, _, head_dim = self._kv_layout_dims()
+        # aiter pa_decode expects [num_blocks, num_kv_heads, block_size, head_dim].
         return {
             "kv_cache": torch.zeros(
                 2,
                 n_layers,
                 runner.num_physical_kvcache_blocks,
-                runner.physical_block_size,
                 num_kv_heads,
+                runner.physical_block_size,
                 head_dim,
                 dtype=self._kv_dtype(),
                 device="cuda",
@@ -167,8 +182,6 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
         }
 
     def build_kv_cache_tensor(self, layer_id: int, module):
-        """Bind one MHA module to its KV cache slice."""
-        # Same module-detection as aiter: must be a non-MLA paged attention.
         if not (
             hasattr(module, "base_attention")
             and hasattr(module, "use_mla")
@@ -177,22 +190,20 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
             return None
 
         runner = self.model_runner
-        # Mirror layout: [num_blocks, block_size, num_kv_heads, head_dim]
+        # [num_blocks, num_kv_heads, block_size, head_dim]
         k_cache = runner.kv_cache[0, layer_id]
         v_cache = runner.kv_cache[1, layer_id]
 
         module.max_model_len = runner.config.max_model_len
         module.k_cache = k_cache
         module.v_cache = v_cache
-        # Also expose to the inner impl since PagedAttention.forward delegates
-        # to self.impl.forward and our impl reads its own k_cache/v_cache.
-        if hasattr(module, "impl") and module.impl is not None:
-            module.impl.k_cache = k_cache
-            module.impl.v_cache = v_cache
-        # Scales unused for BF16 KV; keep attributes for compatibility.
         if not hasattr(module, "k_scale"):
             module.k_scale = None
             module.v_scale = None
+
+        if hasattr(module, "impl") and module.impl is not None:
+            module.impl.k_cache = k_cache
+            module.impl.v_cache = v_cache
 
         return KVCacheTensor(
             layer_num=layer_id,
@@ -208,26 +219,23 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
 
     def prepare_decode(self, batch: ScheduledBatch, bs: int):
         scheduled_bs = batch.total_seqs_num_decode
-        max_seqlen_q = 1  # no spec decode in this backend yet
+        max_seqlen_q = 1
         block_size = self.model_runner.block_size
 
         context_lens = np.asarray(batch.context_lens, dtype=np.int32)
         block_tables = batch.block_tables
 
-        # One slot per request: the last position in the last assigned block.
         slot_mapping = [
             block_table[-1] * block_size + last_block_num - 1
             for block_table, last_block_num in zip(
                 block_tables, batch.last_block_num_tokens
             )
         ]
-        # Decode positions = current context_len - 1 (zero-indexed) per request.
         positions = np.array(
             [cl - 1 for cl in context_lens[:scheduled_bs]], dtype=np.int32
         )
         max_seqlen_k = int(context_lens[:scheduled_bs].max()) if scheduled_bs > 0 else 0
 
-        # Pad block_tables into a fixed [bs, max_blocks_per_seq] grid.
         self.prepare_block_tables(batch)
 
         var = self.model_runner.forward_vars
@@ -240,9 +248,6 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
         var["positions"].np[:sum_scheduled_tokens] = positions[:sum_scheduled_tokens]
         var["context_lens"].np[:scheduled_bs] = context_lens[:scheduled_bs]
         var["context_lens"].np[scheduled_bs:bs] = 0
-
-        # cu_seqlens_q is already prefilled in CommonAttentionBuilder.__init__
-        # to [0, 1, 2, ...], which is exactly what decode needs.
 
         vars_used = [
             ("slot_mapping", bs * max_seqlen_q),
@@ -275,8 +280,6 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
 
 
 class TorchNativeAttentionImpl(AttentionImpl):
-    """Torch-only paged attention forward (prefill + decode + KV cache)."""
-
     def __init__(
         self,
         num_heads: int,
@@ -311,9 +314,13 @@ class TorchNativeAttentionImpl(AttentionImpl):
         self.k_norm = k_norm
         self.q_size = num_heads * head_dim
         self.kv_size = self.num_kv_heads * head_dim
-        # Placeholders; populated by build_kv_cache_tensor after engine_core.allocate_kv_cache.
+        # Set by build_kv_cache_tensor after engine_core.allocate_kv_cache.
         self.k_cache = torch.tensor([])
         self.v_cache = torch.tensor([])
+        # Reusable scale tensors for the triton paged-attention kernel
+        # (BF16 KV path -> identity scales).
+        self._pa_k_scale = None
+        self._pa_v_scale = None
         if kv_cache_dtype != "bf16":
             logger.warning(
                 f"TorchNativeAttentionImpl: kv_cache_dtype={kv_cache_dtype} "
@@ -326,13 +333,12 @@ class TorchNativeAttentionImpl(AttentionImpl):
 
     @staticmethod
     def _write_kv_cache(
-        k_cache: torch.Tensor,  # [B, S, H, D]
-        v_cache: torch.Tensor,  # [B, S, H, D]
-        slot_mapping: torch.Tensor,  # [N]
+        k_cache: torch.Tensor,  # [B, H, S, D] (aiter layout)
+        v_cache: torch.Tensor,  # [B, H, S, D]
+        slot_mapping: torch.Tensor,  # [N] flat slot indices = block * S + within
         k_new: torch.Tensor,  # [N, H, D]
         v_new: torch.Tensor,  # [N, H, D]
     ) -> None:
-        # Filter out -1 sentinels (dummy padding slots).
         valid = slot_mapping >= 0
         if not bool(valid.all()):
             slot_mapping = slot_mapping[valid]
@@ -340,26 +346,35 @@ class TorchNativeAttentionImpl(AttentionImpl):
             v_new = v_new[valid]
         if slot_mapping.numel() == 0:
             return
-        flat_k = k_cache.view(-1, k_cache.shape[-2], k_cache.shape[-1])
-        flat_v = v_cache.view(-1, v_cache.shape[-2], v_cache.shape[-1])
-        # index_copy_ requires a 1D index and same dtype/device.
-        flat_k.index_copy_(0, slot_mapping.long(), k_new.to(flat_k.dtype))
-        flat_v.index_copy_(0, slot_mapping.long(), v_new.to(flat_v.dtype))
+        S = k_cache.shape[2]
+        slot_mapping = slot_mapping.long()
+        block_idx = slot_mapping // S       # [N]
+        within = slot_mapping % S           # [N]
+        # Advanced indexing: cache[I, :, J, :] for parallel (I, J) of length N
+        # gives a (N, H, D) view; assignment from (N, H, D) writes back.
+        k_cache[block_idx, :, within, :] = k_new.to(k_cache.dtype)
+        v_cache[block_idx, :, within, :] = v_new.to(v_cache.dtype)
 
     def _gather_kv_for_request(
         self,
-        k_cache: torch.Tensor,  # [B, S, H, D]
-        v_cache: torch.Tensor,  # [B, S, H, D]
+        k_cache: torch.Tensor,  # [B, H, S, D]
+        v_cache: torch.Tensor,  # [B, H, S, D]
         block_table: torch.Tensor,  # [num_blocks_assigned], int
         context_len: int,
     ):
-        # Pick out the assigned blocks, flatten to (blocks*S, H, D), trim to ctx.
-        n_blocks_needed = (context_len + k_cache.shape[1] - 1) // k_cache.shape[1]
+        S = k_cache.shape[2]
+        n_blocks_needed = (context_len + S - 1) // S
         bt = block_table[:n_blocks_needed].long()
-        k_blocks = k_cache.index_select(0, bt)  # [n, S, H, D]
+        k_blocks = k_cache.index_select(0, bt)  # [n, H, S, D]
         v_blocks = v_cache.index_select(0, bt)
-        flat_k = k_blocks.reshape(-1, k_cache.shape[-2], k_cache.shape[-1])
-        flat_v = v_blocks.reshape(-1, v_cache.shape[-2], v_cache.shape[-1])
+        # (n, H, S, D) -> (n*S, H, D) via permute + reshape (forces contiguous copy
+        # — one-time per request, only used when the triton path falls back).
+        flat_k = k_blocks.permute(0, 2, 1, 3).reshape(
+            -1, k_cache.shape[1], k_cache.shape[3]
+        )
+        flat_v = v_blocks.permute(0, 2, 1, 3).reshape(
+            -1, v_cache.shape[1], v_cache.shape[3]
+        )
         return flat_k[:context_len], flat_v[:context_len]
 
     # ------------------------------------------------------------------ #
@@ -379,8 +394,7 @@ class TorchNativeAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         if use_mla:
             raise NotImplementedError(
-                "TorchNativeAttentionImpl: MLA path is not implemented; "
-                "this backend is for plain MHA."
+                "TorchNativeAttentionImpl: MLA path is not implemented."
             )
 
         ctx = get_forward_context()
@@ -397,7 +411,6 @@ class TorchNativeAttentionImpl(AttentionImpl):
         k = key.view(total_tokens, self.num_kv_heads, self.head_dim)
         v = value.view(total_tokens, self.num_kv_heads, self.head_dim)
 
-        # RoPE (model passes flat layouts to rotary_emb)
         if self.rotary_emb is not None and positions is not None:
             q_flat = q.reshape(total_tokens, self.num_heads * self.head_dim)
             k_flat = k.reshape(total_tokens, self.num_kv_heads * self.head_dim)
@@ -405,18 +418,15 @@ class TorchNativeAttentionImpl(AttentionImpl):
             q = q_flat.view(total_tokens, self.num_heads, self.head_dim)
             k = k_flat.view(total_tokens, self.num_kv_heads, self.head_dim)
 
-        # Write current K/V into the paged cache at slot_mapping
         slot_mapping = attn_md.slot_mapping
-        # KV caches may not be allocated yet during warmup_model (engine_core
-        # calls allocate_kv_cache after ModelRunner construction). Skip the
-        # write in that case; the prefill path does not need the cache because
-        # it has the full sequence in (k, v).
         if (
             slot_mapping is not None
             and getattr(self, "k_cache", torch.empty(0)).numel() > 0
             and getattr(self, "v_cache", torch.empty(0)).numel() > 0
         ):
-            self._write_kv_cache(self.k_cache, self.v_cache, slot_mapping[:total_tokens], k, v)
+            self._write_kv_cache(
+                self.k_cache, self.v_cache, slot_mapping[:total_tokens], k, v
+            )
 
         if is_prefill:
             return self._forward_prefill(q, k, v, attn_md, total_tokens)
@@ -432,7 +442,6 @@ class TorchNativeAttentionImpl(AttentionImpl):
         attn_md: AttentionMetaData,
         total_tokens: int,
     ) -> torch.Tensor:
-        # Optional GQA expansion
         if self.num_kv_heads != self.num_heads:
             n_rep = self.num_heads // self.num_kv_heads
             k = k.repeat_interleave(n_rep, dim=1)
@@ -444,7 +453,7 @@ class TorchNativeAttentionImpl(AttentionImpl):
             s, e = int(cu_q[i]), int(cu_q[i + 1])
             if s == e:
                 continue
-            q_i = q[s:e].transpose(0, 1).unsqueeze(0)  # [1, H, T, D]
+            q_i = q[s:e].transpose(0, 1).unsqueeze(0)
             k_i = k[s:e].transpose(0, 1).unsqueeze(0)
             v_i = v[s:e].transpose(0, 1).unsqueeze(0)
             attn_mask = None
@@ -468,37 +477,60 @@ class TorchNativeAttentionImpl(AttentionImpl):
 
     def _forward_decode(
         self,
-        q: torch.Tensor,  # [bs, num_heads, head_dim]  (one token per request)
+        q: torch.Tensor,  # [bs, num_q_heads, head_dim]
         attn_md: AttentionMetaData,
     ) -> torch.Tensor:
         bs = q.shape[0]
-        ctx_lens = attn_md.context_lens.detach().cpu().tolist()
-        block_tables = attn_md.block_tables  # [bs, max_blocks_per_seq]
-        sw = self.sliding_window
+        # Prefer triton paged-attention decode kernel; fall back to torch on any error.
+        pa_decode, tl_bf16 = _get_triton_pa_decode()
+        # Sliding window not supported by aiter pa_decode -> fall back if active.
+        sw_active = self.sliding_window is not None and self.sliding_window > 0
+        if pa_decode is not None and not sw_active and self.k_cache.numel() > 0:
+            try:
+                out = torch.empty_like(q)
+                if self._pa_k_scale is None or self._pa_k_scale.device != q.device:
+                    self._pa_k_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
+                    self._pa_v_scale = torch.tensor(1.0, dtype=torch.float32, device=q.device)
+                # block_tables to int32 (kernel expects int32)
+                block_tables = attn_md.block_tables[:bs].to(torch.int32)
+                seq_lens = attn_md.context_lens[:bs].to(torch.int32)
+                pa_decode(
+                    out, q.contiguous(),
+                    self.k_cache, self.v_cache,
+                    seq_lens, block_tables,
+                    float(self.scale), int(attn_md.max_seqlen_k),
+                    tl_bf16, self._pa_k_scale, self._pa_v_scale,
+                )
+                return out.reshape(bs, self.num_heads * self.head_dim)
+            except Exception as e:
+                logger.warning(
+                    "triton paged_attention_decode raised %s; falling back to torch", e
+                )
 
+        # Torch fallback: per-request gather + SDPA (correct, slower).
+        ctx_lens = attn_md.context_lens.detach().cpu().tolist()
+        block_tables = attn_md.block_tables
         outs = []
         for i in range(bs):
             ctx_len = int(ctx_lens[i])
             if ctx_len <= 0:
-                # padding row: produce zeros so the shape is consistent
-                outs.append(torch.zeros(self.num_heads, self.head_dim, dtype=q.dtype, device=q.device))
+                outs.append(
+                    torch.zeros(
+                        self.num_heads, self.head_dim, dtype=q.dtype, device=q.device
+                    )
+                )
                 continue
-            # Gather past K/V (which now includes the just-written current token)
             k_past, v_past = self._gather_kv_for_request(
                 self.k_cache, self.v_cache, block_tables[i], ctx_len
             )
-            # GQA expansion to num_heads
             if self.num_kv_heads != self.num_heads:
                 n_rep = self.num_heads // self.num_kv_heads
                 k_past = k_past.repeat_interleave(n_rep, dim=1)
                 v_past = v_past.repeat_interleave(n_rep, dim=1)
-            # Sliding window: keep only the last `sw` keys
-            if sw is not None and sw > 0 and ctx_len > sw:
-                k_past = k_past[-sw:]
-                v_past = v_past[-sw:]
-            # SDPA wants (B, H, T, D); for one request: q -> (1, H, 1, D);
-            # k/v -> (1, H, T_kv, D).
-            q_i = q[i : i + 1].unsqueeze(2)                       # (1, H, 1, D)
+            if self.sliding_window is not None and self.sliding_window > 0 and ctx_len > self.sliding_window:
+                k_past = k_past[-self.sliding_window:]
+                v_past = v_past[-self.sliding_window:]
+            q_i = q[i : i + 1].unsqueeze(2)                         # (1, H, 1, D)
             k_i = k_past.transpose(0, 1).unsqueeze(0).contiguous()  # (1, H, T, D)
             v_i = v_past.transpose(0, 1).unsqueeze(0).contiguous()
             o_i = F.scaled_dot_product_attention(
@@ -507,6 +539,6 @@ class TorchNativeAttentionImpl(AttentionImpl):
                 is_causal=False,
                 scale=self.scale,
             )
-            outs.append(o_i.view(self.num_heads, self.head_dim))   # (H, D)
-        out = torch.stack(outs, dim=0)  # [bs, H, D]
+            outs.append(o_i.view(self.num_heads, self.head_dim))
+        out = torch.stack(outs, dim=0)
         return out.reshape(bs, self.num_heads * self.head_dim)
