@@ -502,14 +502,27 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
         # Zero input_ids (token 0) for stable warmup.
         input_ids.zero_()
 
-        device = input_ids.device
-        warmup_stream = torch.cuda.Stream(device=device)
-        torch.cuda.current_stream(device).synchronize()
-        with torch.cuda.stream(warmup_stream):
+        # PER SGLANG / PYTORCH PATTERN:
+        # The warmup must run on the SAME stream that capture will use, NOT
+        # a freshly-allocated side stream. `with graph_capture()` (entered
+        # by ModelRunner.capture_cudagraph before calling us) has already
+        # `torch.cuda.stream(gc.stream)`-d into gc.stream — so the current
+        # stream IS gc.stream, and is NOT yet in capture mode (capture is
+        # entered later by `torch.cuda.graph(stream=gc.stream)`).
+        #
+        # Run the warmup forward TWICE on the current stream:
+        #   1st pass: triggers all triton JIT (hipModuleLoad) and any first-
+        #             time autotune sync. Does this BEFORE capture begins.
+        #   2nd pass: stabilizes allocator state in the graph mempool — by
+        #             the second call, every torch.empty/torch.empty_like
+        #             address is reused from the same pool slot the captured
+        #             graph will then reuse at replay.
+        # Skipping the second pass is the documented pitfall on AMD: HIP
+        # capture errors are silent; the captured graph appears to capture
+        # cleanly but reads/writes mismatched addresses at replay.
+        for _ in range(2):
             try:
                 outputs = runner.model(input_ids, positions)
-                # Also pre-warm lm_head if it's captured (happens when world_size==1
-                # and not TBO; see ModelRunner.capture_cudagraph "logits_in_graph").
                 if hasattr(runner.model, "compute_logits"):
                     runner.model.compute_logits(outputs)
             except Exception as e:
@@ -517,7 +530,8 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
                     "Full decode pre-warm bs=%d raised %s; cudagraph may still fail.",
                     bs, e,
                 )
-        warmup_stream.synchronize()
+                break
+        torch.cuda.current_stream().synchronize()
         TorchNativeMetadataBuilder._prewarm_done_bs.add(bs)
         logger.info("Full decode pre-warm complete for cudagraph bs=%d", bs)
 
