@@ -119,7 +119,7 @@ def _fp8_per_tensor_linear_triton(
     return triton_gemm(x_q, w_q, x_scale_full, w_scale_full, bias=bias, dtype=otype)
 
 
-def _fp8_per_tensor_linear_torch(
+def _fp8_per_tensor_linear_gfx1201(
     x: torch.Tensor,
     weight: torch.Tensor,
     weight_scale,
@@ -128,61 +128,18 @@ def _fp8_per_tensor_linear_torch(
     otype,
     output_partition_sizes=None,
 ) -> torch.Tensor:
-    """Per-tensor FP8 linear for gfx1201. Tries the aiter triton kernel first
-    (JIT-compiled, fast), then falls back to dequant + F.linear if unavailable.
+    """Per-tensor FP8 linear for gfx1201. Triton-only — no torch fallback.
+    Caller is responsible for ensuring aiter triton gemm_a8w8 is available.
     """
     triton_gemm = _get_triton_fp8_gemm()
-    if triton_gemm is not None and x.is_cuda and weight.dtype == torch.uint8:
-        try:
-            return _fp8_per_tensor_linear_triton(
-                triton_gemm, x, weight, weight_scale, bias, otype,
-                output_partition_sizes,
-            )
-        except Exception as e:
-            import logging as _logging
-            _logging.getLogger("atom").warning(
-                "triton FP8 GEMM raised %s; falling back to torch", e
-            )
-
-    import torch.nn.functional as _F
-
-    # AITER stores FP8 weights as raw torch.uint8 bytes. Reinterpret-cast
-    # to torch.float8_e4m3fn before fp32 conversion.
-    if weight.dtype == torch.uint8:
-        w = weight.view(torch.float8_e4m3fn).to(torch.float32)
-    else:
-        w = weight.to(torch.float32)
-
-    # Per-partition or per-tensor weight scale
-    if weight_scale is not None:
-        ws = weight_scale.to(torch.float32)
-        if ws.numel() == 1:
-            w = w * ws.reshape(()).item()
-        elif (
-            ws.dim() == 2
-            and ws.shape[1] == 1
-            and output_partition_sizes is not None
-            and ws.shape[0] == len(output_partition_sizes)
-        ):
-            offset = 0
-            for i, p_size in enumerate(output_partition_sizes):
-                w[offset : offset + p_size] = (
-                    w[offset : offset + p_size] * ws[i].item()
-                )
-                offset += p_size
-        else:
-            w = w * ws
-    w = w.to(otype)
-
-    if x.dtype in (torch.float8_e4m3fn, torch.float8_e4m3fnuz, torch.float8_e5m2):
-        xs = x.to(torch.float32)
-        if x_scale is not None:
-            xs = xs * x_scale.to(torch.float32)
-        x_in = xs.to(otype)
-    else:
-        x_in = x.to(otype)
-
-    return _F.linear(x_in, w, bias if bias is not None else None)
+    if triton_gemm is None:
+        raise RuntimeError(
+            "aiter triton gemm_a8w8 unavailable on gfx1201 — required for "
+            "per-tensor FP8 linear (no torch fallback in this build)."
+        )
+    return _fp8_per_tensor_linear_triton(
+        triton_gemm, x, weight, weight_scale, bias, otype, output_partition_sizes,
+    )
 
 
 def use_triton_gemm() -> bool:
@@ -584,7 +541,7 @@ class LinearBase(nn.Module):
                 if _is_gfx1201_linear():
                     # gfx1201: skip aiter tgemm.mm (no gfx1201 HIP code object),
                     # dequant FP8 weight + run F.linear in BF16.
-                    y = _fp8_per_tensor_linear_torch(
+                    y = _fp8_per_tensor_linear_gfx1201(
                         x, self.weight, self.weight_scale, self.bias, x_scale, otype,
                         output_partition_sizes=getattr(self, "output_partition_sizes", None),
                     )

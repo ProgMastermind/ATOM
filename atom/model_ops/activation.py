@@ -138,8 +138,7 @@ class SiluAndMul(nn.Module):
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         # gfx1201 (RDNA4): aiter prebuilt silu_and_mul HIP kernel has no gfx1201
-        # code object. Prefer the triton kernel; fall back to torch forward_native
-        # if the input HALF_D is not a power of two (triton kernel limitation).
+        # code object. Triton kernel is the only path (handles non-pow2 D).
         if _is_gfx1201_act():
             return _silu_mul_triton(x)
         # fp8 quantization

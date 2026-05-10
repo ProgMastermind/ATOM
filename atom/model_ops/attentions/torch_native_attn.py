@@ -601,28 +601,6 @@ class TorchNativeAttentionImpl(AttentionImpl):
             v_new = v_new.to(v_cache.dtype)
         _kv_cache_write_triton(k_cache, v_cache, slot_mapping, k_new, v_new)
 
-    def _gather_kv_for_request(
-        self,
-        k_cache: torch.Tensor,  # [B, H, S, D]
-        v_cache: torch.Tensor,  # [B, H, S, D]
-        block_table: torch.Tensor,  # [num_blocks_assigned], int
-        context_len: int,
-    ):
-        S = k_cache.shape[2]
-        n_blocks_needed = (context_len + S - 1) // S
-        bt = block_table[:n_blocks_needed].long()
-        k_blocks = k_cache.index_select(0, bt)  # [n, H, S, D]
-        v_blocks = v_cache.index_select(0, bt)
-        # (n, H, S, D) -> (n*S, H, D) via permute + reshape (forces contiguous copy
-        # — one-time per request, only used when the triton path falls back).
-        flat_k = k_blocks.permute(0, 2, 1, 3).reshape(
-            -1, k_cache.shape[1], k_cache.shape[3]
-        )
-        flat_v = v_blocks.permute(0, 2, 1, 3).reshape(
-            -1, v_cache.shape[1], v_cache.shape[3]
-        )
-        return flat_k[:context_len], flat_v[:context_len]
-
     # ------------------------------------------------------------------ #
     # Forward                                                            #
     # ------------------------------------------------------------------ #
@@ -690,63 +668,32 @@ class TorchNativeAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         # Prefer triton context_attention_fwd (handles GQA internally; ~2x
         # faster than the torch SDPA loop on gfx1201 at gsm8k context lengths).
-        # Falls back to per-sequence torch SDPA when sliding window is active
-        # (kernel doesn't support it) or on any kernel exception.
-        sw_active = self.sliding_window is not None and self.sliding_window > 0
-        prefill = _get_triton_prefill()
-        if prefill is not None and not sw_active:
-            try:
-                out = torch.empty_like(q)
-                cu_q_gpu = attn_md.cu_seqlens_q.to(torch.int32)
-                # b_start_loc = cu_seqlens_q[:-1]; b_seq_len = diffs.
-                b_start_loc = cu_q_gpu[:-1].contiguous()
-                b_seq_len = (cu_q_gpu[1:] - cu_q_gpu[:-1]).contiguous()
-                prefill(
-                    q.contiguous(),
-                    k.contiguous(),
-                    v.contiguous(),
-                    out,
-                    b_start_loc,
-                    b_seq_len,
-                    int(attn_md.max_seqlen_q),
-                    is_causal=True,
-                )
-                return out.reshape(total_tokens, self.num_heads * self.head_dim)
-            except Exception as e:
-                logger.warning(
-                    "triton context_attention_fwd raised %s; falling back to torch SDPA", e
-                )
-
-        # Torch fallback: per-sequence SDPA loop.
-        if self.num_kv_heads != self.num_heads:
-            n_rep = self.num_heads // self.num_kv_heads
-            k = k.repeat_interleave(n_rep, dim=1)
-            v = v.repeat_interleave(n_rep, dim=1)
-
-        cu_q = attn_md.cu_seqlens_q.detach().cpu().tolist()
-        out = torch.empty_like(q)
-        for i in range(len(cu_q) - 1):
-            s, e = int(cu_q[i]), int(cu_q[i + 1])
-            if s == e:
-                continue
-            q_i = q[s:e].transpose(0, 1).unsqueeze(0)
-            k_i = k[s:e].transpose(0, 1).unsqueeze(0)
-            v_i = v[s:e].transpose(0, 1).unsqueeze(0)
-            attn_mask = None
-            if self.sliding_window is not None and self.sliding_window > 0:
-                t = e - s
-                idx = torch.arange(t, device=q.device)
-                attn_mask = (idx[:, None] >= idx[None, :]) & (
-                    (idx[:, None] - idx[None, :]) < self.sliding_window
-                )
-            o_i = F.scaled_dot_product_attention(
-                q_i, k_i, v_i,
-                attn_mask=attn_mask,
-                dropout_p=0.0,
-                is_causal=(attn_mask is None),
-                scale=self.scale,
+        # Triton-only — no torch SDPA fallback.
+        if self.sliding_window is not None and self.sliding_window > 0:
+            raise RuntimeError(
+                "TorchNativeAttentionImpl: sliding_window prefill is not "
+                "supported (triton context_attention_fwd has no sliding window)."
             )
-            out[s:e] = o_i.squeeze(0).transpose(0, 1)
+        prefill = _get_triton_prefill()
+        if prefill is None:
+            raise RuntimeError(
+                "aiter triton context_attention_fwd unavailable — required "
+                "for prefill on gfx1201 (no torch fallback in this build)."
+            )
+        out = torch.empty_like(q)
+        cu_q_gpu = attn_md.cu_seqlens_q.to(torch.int32)
+        b_start_loc = cu_q_gpu[:-1].contiguous()
+        b_seq_len = (cu_q_gpu[1:] - cu_q_gpu[:-1]).contiguous()
+        prefill(
+            q.contiguous(),
+            k.contiguous(),
+            v.contiguous(),
+            out,
+            b_start_loc,
+            b_seq_len,
+            int(attn_md.max_seqlen_q),
+            is_causal=True,
+        )
         return out.reshape(total_tokens, self.num_heads * self.head_dim)
 
     # ---------------- decode ---------------- #
@@ -757,62 +704,33 @@ class TorchNativeAttentionImpl(AttentionImpl):
         attn_md: AttentionMetaData,
     ) -> torch.Tensor:
         bs = q.shape[0]
-        # Prefer triton paged-attention decode kernel; fall back to torch on any error.
+        # Triton-only — no torch decode fallback.
+        if self.sliding_window is not None and self.sliding_window > 0:
+            raise RuntimeError(
+                "TorchNativeAttentionImpl: sliding_window decode is not "
+                "supported (aiter pa_decode has no sliding window)."
+            )
         pa_decode, tl_bf16 = _get_triton_pa_decode()
-        # Sliding window not supported by aiter pa_decode -> fall back if active.
-        sw_active = self.sliding_window is not None and self.sliding_window > 0
-        if pa_decode is not None and not sw_active and self.k_cache.numel() > 0:
-            try:
-                out = torch.empty_like(q)
-                block_tables = attn_md.block_tables[:bs]
-                seq_lens = attn_md.context_lens[:bs]
-                pa_decode(
-                    out, q,
-                    self.k_cache, self.v_cache,
-                    block_tables, seq_lens,
-                    int(attn_md.max_seqlen_k),
-                    tl_bf16,
-                    self.num_kv_heads,
-                    float(self.scale),
-                )
-                return out.reshape(bs, self.num_heads * self.head_dim)
-            except Exception as e:
-                logger.warning(
-                    "triton paged_attn_decode raised %s; falling back to torch", e
-                )
-
-        # Torch fallback: per-request gather + SDPA (correct, slower).
-        ctx_lens = attn_md.context_lens.detach().cpu().tolist()
-        block_tables = attn_md.block_tables
-        outs = []
-        for i in range(bs):
-            ctx_len = int(ctx_lens[i])
-            if ctx_len <= 0:
-                outs.append(
-                    torch.zeros(
-                        self.num_heads, self.head_dim, dtype=q.dtype, device=q.device
-                    )
-                )
-                continue
-            k_past, v_past = self._gather_kv_for_request(
-                self.k_cache, self.v_cache, block_tables[i], ctx_len
+        if pa_decode is None:
+            raise RuntimeError(
+                "aiter triton paged_attn_decode unavailable — required for "
+                "decode on gfx1201 (no torch fallback in this build)."
             )
-            if self.num_kv_heads != self.num_heads:
-                n_rep = self.num_heads // self.num_kv_heads
-                k_past = k_past.repeat_interleave(n_rep, dim=1)
-                v_past = v_past.repeat_interleave(n_rep, dim=1)
-            if self.sliding_window is not None and self.sliding_window > 0 and ctx_len > self.sliding_window:
-                k_past = k_past[-self.sliding_window:]
-                v_past = v_past[-self.sliding_window:]
-            q_i = q[i : i + 1].unsqueeze(2)                         # (1, H, 1, D)
-            k_i = k_past.transpose(0, 1).unsqueeze(0).contiguous()  # (1, H, T, D)
-            v_i = v_past.transpose(0, 1).unsqueeze(0).contiguous()
-            o_i = F.scaled_dot_product_attention(
-                q_i, k_i, v_i,
-                dropout_p=0.0,
-                is_causal=False,
-                scale=self.scale,
+        if self.k_cache.numel() == 0:
+            raise RuntimeError(
+                "TorchNativeAttentionImpl: KV cache is empty at decode time "
+                "(build_kv_cache_tensor was not called?)."
             )
-            outs.append(o_i.view(self.num_heads, self.head_dim))
-        out = torch.stack(outs, dim=0)
+        out = torch.empty_like(q)
+        block_tables = attn_md.block_tables[:bs]
+        seq_lens = attn_md.context_lens[:bs]
+        pa_decode(
+            out, q,
+            self.k_cache, self.v_cache,
+            block_tables, seq_lens,
+            int(attn_md.max_seqlen_k),
+            tl_bf16,
+            self.num_kv_heads,
+            float(self.scale),
+        )
         return out.reshape(bs, self.num_heads * self.head_dim)

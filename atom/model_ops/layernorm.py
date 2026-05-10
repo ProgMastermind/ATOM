@@ -135,14 +135,12 @@ def _rmsnorm_add_triton(
     return out, res_out
 
 
-def _rmsnorm_torch(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Pure-torch RMSNorm fallback. Used only if D is not a power of two,
-    which is not a case we hit for Mistral-3 (hidden=4096)."""
-    orig_dtype = x.dtype
-    x32 = x.to(torch.float32)
-    var = x32.pow(2).mean(-1, keepdim=True)
-    out = x32 * torch.rsqrt(var + eps)
-    return (out * weight.to(torch.float32)).to(orig_dtype)
+def _check_triton_rmsnorm_dim(dim: int) -> None:
+    if (dim & (dim - 1)) != 0 or dim > 16384:
+        raise RuntimeError(
+            f"gfx1201 triton RMSNorm requires power-of-two trailing dim "
+            f"<= 16384; got dim={dim}. No torch fallback in this build."
+        )
 
 
 @torch_compile_guard()
@@ -152,10 +150,8 @@ def rmsnorm2d_fwd_(
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     if _is_gfx1201_layernorm():
-        # Triton path requires power-of-two trailing dim; Mistral-3 has D=4096.
-        if (dim & (dim - 1)) == 0 and dim <= 16384:
-            return _rmsnorm_triton(x, weight, eps).view(ori_shape)
-        return _rmsnorm_torch(x, weight, eps).view(ori_shape)
+        _check_triton_rmsnorm_dim(dim)
+        return _rmsnorm_triton(x, weight, eps).view(ori_shape)
     return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
 
 
@@ -166,13 +162,10 @@ def rmsnorm2d_fwd_with_add_(
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     if _is_gfx1201_layernorm():
-        if (dim & (dim - 1)) == 0 and dim <= 16384:
-            res_in = residual.reshape(-1, dim)
-            out, res_out = _rmsnorm_add_triton(x, weight, res_in, eps)
-            return out.view(ori_shape), res_out.view(ori_shape)
-        residual_out = (x + residual.reshape(-1, dim)).to(residual.dtype)
-        out = _rmsnorm_torch(residual_out, weight, eps)
-        return out.view(ori_shape), residual_out.view(ori_shape)
+        _check_triton_rmsnorm_dim(dim)
+        res_in = residual.reshape(-1, dim)
+        out, res_out = _rmsnorm_add_triton(x, weight, res_in, eps)
+        return out.view(ori_shape), res_out.view(ori_shape)
     out = torch.empty_like(x)
     residual_out = torch.empty_like(x)
     rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
