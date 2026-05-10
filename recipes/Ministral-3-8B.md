@@ -15,8 +15,9 @@ The torch-native backend bypasses the prebuilt path:
 | Op | Backend on gfx1201 |
 |---|---|
 | Per-tensor FP8 GEMM (qkv/o/gate_up/down proj) | **aiter triton `gemm_a8w8`** (JIT-compiled, ~360× faster than torch dequant) |
-| Paged attention prefill + decode | `F.scaled_dot_product_attention` per-seq (TODO: triton paged attention) |
-| KV cache write | torch `index_copy_` on a `[num_blocks, block_size, kv_heads, d]` slab |
+| Paged attention **decode** | **aiter triton `paged_attention_decode`** (JIT-compiled; ~20% e2e speedup; falls back to torch when sliding window active) |
+| Paged attention prefill | `F.scaled_dot_product_attention` per-seq (TODO: triton flash prefill) |
+| KV cache write | torch advanced indexing into `[num_blocks, kv_heads, block_size, d]` (aiter layout) |
 | RMSNorm (with/without residual) | torch RMSNorm fallback |
 | SiLU + Mul (SwiGLU) | `forward_native` (existing torch path) |
 | Mixed Gumbel sampler | torch Gumbel-max + argmax |
@@ -83,27 +84,34 @@ OPENAI_API_KEY=dummy lm_eval \
   --tasks gsm8k --num_fewshot 5 --batch_size 1
 ```
 
-### Verified results on RX 9070 XT (gfx1201, 16 GB), with triton FP8 GEMM
+### Verified results on RX 9070 XT (gfx1201, 16 GB)
+
+Best end-to-end with **aiter triton FP8 GEMM + triton paged_attention_decode**:
 
 | Setup | n | strict-match | flexible-extract |
 |---|---:|---:|---:|
-| gsm8k 5-shot, smoke | 5 | 0.80 | 0.80 |
-| gsm8k 5-shot, n=20 | 20 | 0.60 | 0.60 |
-| gsm8k 5-shot, n=50 | 50 | 0.72 | 0.72 |
 | gsm8k 5-shot, n=200 | 200 | **0.765** | **0.770** |
 
-The 200-sample number lands in Mistral's published Ministral-3-8B range
-(~75–80% on gsm8k 5-shot), confirming end-to-end correctness on this
-arch + backend.
+Within Mistral's published Ministral-3-8B range (~75–80% on gsm8k 5-shot).
 
-**Decode throughput**: TPOT ~0.038 s/token (~26 tok/s) after wiring the
-triton FP8 GEMM. Pre-triton was 0.28 s/token (~3.5 tok/s) — 7.4× speedup.
-Time per gsm8k problem ~2.1 s with `num_concurrent=4`. Full gsm8k (1319
-problems) extrapolates to ~46 minutes single-stream.
+**Throughput evolution** (gsm8k 5-shot, num_concurrent=4):
 
-The next biggest perf hit is the per-request decode SDPA loop in pure
-torch. Wiring `aiter.ops.triton.attention.pa_decode` would push TPOT
-toward ~0.015 s/token (~70 tok/s) — TODO.
+| Backend | TPOT (5-tok prompt) | sec/problem |
+|---|---:|---:|
+| Torch fallback | 0.28 s/tok | ~21 |
+| + triton FP8 GEMM | 0.038 s/tok | ~2.1 |
+| + triton pa_decode | 0.042 s/tok* | ~1.7 |
+
+\* TPOT measurement is dominated by Python overhead at very short ctx;
+the 20% per-problem speedup at gsm8k context lengths (500–1500 tokens)
+reflects the actual decode-attention win.
+
+Full gsm8k (1319 problems) extrapolates to ~37 min wall time at
+`num_concurrent=4`.
+
+The remaining perf headroom is the **prefill SDPA loop** (still pure
+torch, per-sequence). Aiter has `pa_prefill` and `unified_attention`
+triton kernels that would help — TODO.
 
 ## Known caveats
 
