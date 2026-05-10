@@ -1,89 +1,113 @@
 # Next-session pickup notes — ATOM gfx1201 / Ministral-3
 
-## What runs today (commit 4f848a9 on branch `carhuang/support_gfx1201_mistral3`)
+## What runs today (commit `c983d98` on branch `carhuang/support_gfx1201_mistral3`)
 
 ```bash
 ssh -i /home/carhuang/id_rsa_carhuang carhuang@agent-tr9980x-01
-docker exec -it atom_gfx1201 bash -lc 'cd /tmp && \
+docker exec -it atom_gfx1201 bash -lc '
+  cd /tmp && \
   ATOM_USE_TRITON_GEMM=1 AITER_LOG_LEVEL=WARNING \
+  ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT=0 \
+  ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT=0 \
+  ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=0 \
   python3 -m atom.examples.simple_inference \
     --model /mnt/sda1/carhuang/models/Ministral-3-8B-Instruct-2512 \
     --enforce-eager --level 0 -tp 1 --kv_cache_dtype bf16 \
-    --max-model-len 1024 --max-tokens 4 \
+    --max-model-len 256 --max-tokens 4 \
     --gpu-memory-utilization 0.85'
 ```
 
-Reaches: `Model load done` → `TorchNativeMetadataBuilder: initialized` → SIGSEGV in
-`ModelRunner.warmup_model()` (model_runner.py:666). The first forward pass
-exercises every aiter HIP kernel in the attention + KV-cache + RMSNorm path; one
-of them lacks a gfx1201 code object.
+How far it gets right now (with probes removed, you'll just see SIGSEGV):
 
-## Key paths / context
-
-* Repo: `/mnt/sda1/carhuang/repo/ATOM` (editable installed in container)
-* Branch: `carhuang/support_gfx1201_mistral3`
-* Model: `/mnt/sda1/carhuang/models/Ministral-3-8B-Instruct-2512`
-* Container: `atom_gfx1201` (always-running on `agent-tr9980x-01`)
-* Aiter source: `/app/aiter-test/aiter/` (matches commit 247e9b1 of ATOM)
-* Plan doc: `/home/carhuang/.claude/plans/glittery-dazzling-crayon.md`
-* Scaffold: `atom/model_ops/attentions/torch_native_attn.py` (TODOs in module docstring)
-
-## Find which aiter HIP load fails next
-
-```bash
-docker exec atom_gfx1201 bash -lc '
-  cd /tmp && rm -rf /root/.cache/atom/* && \
-  ATOM_USE_TRITON_GEMM=1 AITER_LOG_LEVEL=WARNING \
-  AMD_LOG_LEVEL=4 \
-  python3 -m atom.examples.simple_inference \
-    --model /mnt/sda1/carhuang/models/Ministral-3-8B-Instruct-2512 \
-    --enforce-eager --level 0 -tp 1 --kv_cache_dtype bf16 \
-    --max-model-len 1024 --max-tokens 4 \
-    --gpu-memory-utilization 0.85 > /tmp/atom_run.log 2>&1
-  # find what loaded right before the crash:
-  grep -nB 5 "No compatible code" /tmp/atom_run.log | tail -40
-  # or trace which python frame:
-  awk "NR<=NR_OF_FAILURE && !/^:[0-9]:/" /tmp/atom_run.log | tail -30'
+```
+Model load done
+TorchNativeMetadataBuilder: initialized
+ModelRunner.forward → prepare_model → run_model
+  embed → ✓
+  layer 0 → input_layernorm (RMSNorm via torch fallback ✓)
+          → self_attn → qkv_proj → SIGSEGV  ← next blocker
 ```
 
-## TODO order (smallest blast radius first)
+## Next blocker: FP8 GEMM in `qkv_proj` / `gate_up_proj` / `down_proj` / `o_proj`
 
-1. **TODO-3 / TODO-4 (impl):** the warmup forward goes through PagedAttentionImpl
-   today (selector returns TorchNativeBackend, so `get_impl_cls` returns
-   TorchNativeAttentionImpl). But maybe ops.Attention is still PagedAttention.
-   Confirm by adding a `print(f"impl class: {type(self.attn)}")` in
-   LlamaAttention.__init__. If it's still PagedAttentionImpl, that's why we
-   hit aiter — the impl swap isn't happening yet.
-2. **Implement `TorchNativeAttentionImpl.__init__` for real (TODO-3)** — copy
-   the field set from `attention_mha.py:PagedAttentionImpl.__init__` (lines
-   29–90) minus aiter-specific stuff; just store fields and let kv cache get
-   set later via attribute assignment (model_runner does `module.k_cache = ...`).
-3. **Implement `TorchNativeAttentionImpl.forward` minimally** —
-   prefill: `F.scaled_dot_product_attention(q, k, v, is_causal=True)` per-seq.
-   For first usable version, accept that this is slow and not paged — just
-   correctness. Decode: gather K/V from cache by slot_mapping → SDPA.
-4. **TODO-7 KV cache write** — replace any `aiter.reshape_and_cache` call with
-   `cache.view(num_blocks, block_size, ...).index_put_(slot_mapping, kv)`.
-5. **TODO-1/2 metadata** — only matters once impl actually consumes them
-   (currently both raise NotImplementedError).
-6. RMSNorm fallback — likely needed if ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT=0
-   doesn't already route through torch.
+Mistral-3 weights are FP8 per-tensor (`weight_block_size: null`). When ATOM's
+`linear.py` runs the GEMM, it picks one of the prebuilt aiter HIP kernels:
+`aiter.gemm_a8w8`, `aiter.gemm_a8w8_bpreshuffle`, or `aiter.gemm_a8w8_blockscale`.
+None of these have a gfx1201 code object.
 
-## Watch out
+`ATOM_USE_TRITON_GEMM=1` only swaps in the **blockscale** Triton kernel
+(`aiter.ops.triton.gemm.basic.gemm_a8w8_blockscale`), which doesn't help
+per-tensor FP8.
 
-* `--enforce-eager --level 0` are required until CUDAGraph capture works
-  through the new backend.
-* `kv_cache_dtype=bf16` only — FP8 KV path is TODO-8.
-* The `238 activation_scale tensors silently dropped` warning is a separate
-  small bug (Mistral's per-q/k/v static activation scale doesn't merge into
-  ATOM's fused `qkv_proj.input_scale`). Likely degrades FP8 accuracy but
-  not the blocker.
+Two reasonable directions for next session:
 
-## Memory entries to consider saving
+### Option A — torch fallback (mirrors the RMSNorm fix done this session)
 
-* That ATOM at commit 247e9b1 is what's compatible with the aiter shipped
-  in `rocm/atom-dev:latest` (newer ATOM HEAD requires `aiter.ops.shuffle.shuffle_scale`
-  which the baked aiter doesn't have).
-* That aiter's source officially supports gfx1201 (in GPU_ARCHS allowlist) —
-  rebuild path is `cd /app/aiter-test && GPU_ARCHS=gfx1201 pip install -e .`
-  (~30–60 min). Kept in reserve as plan B.
+Patch `atom/model_ops/linear.py` to detect gfx1201 and dequantize FP8 → BF16
+inside the linear forward, then `torch.matmul(input_bf16, weight_bf16.T)`.
+Slow but correct. Pattern to copy from the RMSNorm fallback:
+
+```python
+# atom/model_ops/layernorm.py:_is_gfx1201_layernorm + _rmsnorm_torch
+```
+
+The relevant linear-layer call sites are inside `linear.py`'s
+`weight_loader_process` / forward methods — the FP8 GEMM dispatch is around
+the `gemm_a8w8*` calls. Dequant approach: `weight_bf16 = (weight_fp8.to(torch.float32) * weight_scale).to(torch.bfloat16)`.
+
+### Option B — dequantize the model at load time (simpler globally)
+
+Find where ATOM stores FP8 weights post-load and add a one-time dequant
+sweep when on gfx1201 so the rest of ATOM thinks it's a BF16 model.
+HF's transformers has `FineGrainedFP8Config(dequantize=True)` doing
+exactly this; mirror the idea inside ATOM. Trades VRAM (12GB → ~17GB
+weights) for a one-shot fix that bypasses the FP8-kernel ecosystem
+entirely. Won't fit on 16 GB without offload.
+
+**Recommendation:** Option A — tighter scope, reuses the RMSNorm pattern,
+keeps weights in FP8 (preserves the user's FP8 goal).
+
+## After FP8 GEMM works, more aiter HIP loads will surface
+
+In rough order of likelihood (each will SIGSEGV the same way):
+
+1. **`silu_and_mul`** in `atom/model_ops/activation.py` — used by SwiGLU MLP.
+   Trivial torch fallback: `F.silu(x[..., :n//2]) * x[..., n//2:]`.
+2. **`reshape_and_cache`** for KV writes when our impl tries to fill the
+   paged cache. We're skipping the paged cache today, so this only matters
+   once we add decode (TODO-7).
+3. **Anything else in the model_ops/ files that imports aiter's prebuilt
+   modules.** Strategy: each one gets a `_is_gfx1201()`-gated torch
+   fallback at the call site. Don't try to refactor — just bisect by
+   re-running and patching the next thing that crashes.
+
+## Useful test loop
+
+Re-add probes any time by running `/tmp/probe_llama.py` (kept on the box)
+before a run; revert with `git checkout -- atom/models/llama.py atom/model_engine/model_runner.py`
+after.
+
+## Critical paths reminder
+
+| Purpose | File |
+|---|---|
+| Branch | `carhuang/support_gfx1201_mistral3` (local on remote, not pushed) |
+| Working RMSNorm fallback (template for next ones) | `atom/model_ops/layernorm.py:_is_gfx1201_layernorm` |
+| Backend selector | `atom/utils/selector.py:get_attn_backend_cls` |
+| Torch-native impl (prefill done, decode TODO) | `atom/model_ops/attentions/torch_native_attn.py` |
+| Dispatch hook | `atom/model_ops/paged_attention.py` (TORCH_NATIVE_ATTENTION branch) |
+| Mistral3 model port | `atom/models/mistral3.py` |
+| Plan doc | `~/.claude/plans/glittery-dazzling-crayon.md` (host-side) |
+
+## Required env vars to repro current furthest progress
+
+```
+ATOM_USE_TRITON_GEMM=1                                  # blockscale Triton GEMM (best-effort)
+AITER_LOG_LEVEL=WARNING                                 # quiet
+ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_RMSNORM_QUANT=0    # don't try the FP8-fused RMSNorm path
+ATOM_LLAMA_ENABLE_AITER_TRITON_FUSED_SILU_MUL_QUANT=0
+ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION=0
+```
+
+CLI required: `--enforce-eager --level 0 --kv_cache_dtype bf16` (CUDAGraph
+capture and FP8 KV are both still TODO).
