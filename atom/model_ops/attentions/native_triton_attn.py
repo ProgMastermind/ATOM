@@ -47,7 +47,8 @@ from typing import Optional, Type
 
 import numpy as np
 import torch
-import torch.nn.functional as F
+import triton
+import triton.language as tl
 from torch import nn
 
 from atom.config import KVCacheTensor
@@ -95,7 +96,10 @@ def _get_triton_prefill():
     global _TRITON_PREFILL
     if _TRITON_PREFILL is None:
         try:
-            from aiter.ops.triton.attention.prefill_attention import context_attention_fwd
+            from aiter.ops.triton.attention.prefill_attention import (
+                context_attention_fwd,
+            )
+
             _TRITON_PREFILL = context_attention_fwd
         except Exception as e:
             logger.warning("triton context_attention_fwd unavailable: %s", e)
@@ -124,9 +128,16 @@ def _get_triton_pa_decode():
             import triton.language as tl
 
             def _dispatch(
-                out, q, k_cache, v_cache,
-                block_tables, seq_lens,
-                max_seq_len, compute_type, num_kv_heads, scale,
+                out,
+                q,
+                k_cache,
+                v_cache,
+                block_tables,
+                seq_lens,
+                max_seq_len,
+                compute_type,
+                num_kv_heads,
+                scale,
             ):
                 num_seqs = q.shape[0]
                 num_q_heads = q.shape[1]
@@ -138,17 +149,36 @@ def _get_triton_pa_decode():
                 )
                 if use_v1:
                     paged_attn_decode_v1(
-                        out, q, k_cache, v_cache,
-                        block_tables, seq_lens,
-                        max_seq_len, compute_type, num_kv_heads,
-                        scale, None, 1.0, 1.0,
+                        out,
+                        q,
+                        k_cache,
+                        v_cache,
+                        block_tables,
+                        seq_lens,
+                        max_seq_len,
+                        compute_type,
+                        num_kv_heads,
+                        scale,
+                        None,
+                        1.0,
+                        1.0,
                     )
                 else:
                     paged_attn_decode_v2(
-                        out, q, k_cache, v_cache,
-                        block_tables, seq_lens,
-                        max_seq_len, compute_type, num_kv_heads,
-                        scale, None, 1.0, 1.0, max_num_partitions,
+                        out,
+                        q,
+                        k_cache,
+                        v_cache,
+                        block_tables,
+                        seq_lens,
+                        max_seq_len,
+                        compute_type,
+                        num_kv_heads,
+                        scale,
+                        None,
+                        1.0,
+                        1.0,
+                        max_num_partitions,
                     )
 
             _TRITON_PA_DECODE = _dispatch
@@ -168,21 +198,23 @@ def _get_triton_pa_decode():
 # ---------------------------------------------------------------------------
 
 
-
 # ---------------------------------------------------------------------------
 # Triton KV-cache write kernel (skips -1 sentinels in-kernel; no Python sync)
 # ---------------------------------------------------------------------------
-import triton
-import triton.language as tl
 
 
 @triton.jit
 def _kv_cache_write_kernel(
-    K_NEW_PTR, V_NEW_PTR,                # [N, H, D] BF16 (or compatible)
-    SLOT_PTR,                            # [N] int64
-    K_CACHE_PTR, V_CACHE_PTR,            # [B, H, S, D] BF16
-    new_stride_token, new_stride_head,
-    cache_stride_block, cache_stride_head, cache_stride_within,
+    K_NEW_PTR,
+    V_NEW_PTR,  # [N, H, D] BF16 (or compatible)
+    SLOT_PTR,  # [N] int64
+    K_CACHE_PTR,
+    V_CACHE_PTR,  # [B, H, S, D] BF16
+    new_stride_token,
+    new_stride_head,
+    cache_stride_block,
+    cache_stride_head,
+    cache_stride_within,
     N: tl.constexpr,
     H: tl.constexpr,
     D: tl.constexpr,
@@ -221,11 +253,11 @@ def _kv_cache_write_kernel(
 
 
 def _kv_cache_write_triton(
-    k_cache: torch.Tensor,   # [B, H, S, D]
-    v_cache: torch.Tensor,   # [B, H, S, D]
+    k_cache: torch.Tensor,  # [B, H, S, D]
+    v_cache: torch.Tensor,  # [B, H, S, D]
     slot_mapping: torch.Tensor,  # [N]
-    k_new: torch.Tensor,     # [N, H, D]
-    v_new: torch.Tensor,     # [N, H, D]
+    k_new: torch.Tensor,  # [N, H, D]
+    v_new: torch.Tensor,  # [N, H, D]
 ):
     N = slot_mapping.shape[0]
     if N == 0:
@@ -235,19 +267,32 @@ def _kv_cache_write_triton(
     # k_new strides assume contiguous [N, H, D].
     k_new_c = k_new.contiguous() if not k_new.is_contiguous() else k_new
     v_new_c = v_new.contiguous() if not v_new.is_contiguous() else v_new
-    slot_i64 = slot_mapping.to(torch.int64) if slot_mapping.dtype != torch.int64 else slot_mapping
+    slot_i64 = (
+        slot_mapping.to(torch.int64)
+        if slot_mapping.dtype != torch.int64
+        else slot_mapping
+    )
 
     new_stride = k_new_c.stride()
     cache_stride = k_cache.stride()
     grid = (N,)
     _kv_cache_write_kernel[grid](
-        k_new_c, v_new_c,
+        k_new_c,
+        v_new_c,
         slot_i64,
-        k_cache, v_cache,
-        new_stride[0], new_stride[1],
-        cache_stride[0], cache_stride[1], cache_stride[2],
-        N=N, H=H, D=D, S=S,
+        k_cache,
+        v_cache,
+        new_stride[0],
+        new_stride[1],
+        cache_stride[0],
+        cache_stride[1],
+        cache_stride[2],
+        N=N,
+        H=H,
+        D=D,
+        S=S,
     )
+
 
 class NativeTritonBackend(AttentionBackend):
     """AITER-free attention backend (torch + selectively triton)."""
@@ -291,6 +336,7 @@ class NativeTritonMetadataBuilder(CommonAttentionBuilder):
         # capture does not KeyError on our backend (we don't actually use it
         # because pa_decode is paged-block-table-based).
         from atom.utils import CpuGpuBuffer
+
         if "kv_indptr" not in self.model_runner.forward_vars:
             self.model_runner.forward_vars["kv_indptr"] = CpuGpuBuffer(
                 self.max_bs + 1, dtype=torch.int32, device=self.device
@@ -561,7 +607,8 @@ class NativeTritonMetadataBuilder(CommonAttentionBuilder):
             except Exception as e:
                 logger.warning(
                     "Full decode pre-warm bs=%d raised %s; cudagraph may still fail.",
-                    bs, e,
+                    bs,
+                    e,
                 )
                 break
         torch.cuda.current_stream().synchronize()
@@ -772,9 +819,12 @@ class NativeTritonAttentionImpl(AttentionImpl):
         block_tables = attn_md.block_tables[:bs]
         seq_lens = attn_md.context_lens[:bs]
         pa_decode(
-            out, q,
-            self.k_cache, self.v_cache,
-            block_tables, seq_lens,
+            out,
+            q,
+            self.k_cache,
+            self.v_cache,
+            block_tables,
+            seq_lens,
             int(attn_md.max_seqlen_k),
             tl_bf16,
             self.num_kv_heads,

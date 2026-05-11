@@ -5,6 +5,8 @@ from typing import Optional, Tuple
 
 import aiter
 import torch
+import triton as _triton
+import triton.language as _tl
 from aiter import (
     QuantType,
     layernorm2d_fwd,
@@ -57,6 +59,7 @@ def _is_gfx1201_layernorm() -> bool:
     if not hasattr(_is_gfx1201_layernorm, "_cached"):
         try:
             import torch as _t
+
             name = _t.cuda.get_device_properties(0).gcnArchName or ""
             _is_gfx1201_layernorm._cached = name.startswith("gfx1201")
         except Exception:
@@ -64,14 +67,13 @@ def _is_gfx1201_layernorm() -> bool:
     return _is_gfx1201_layernorm._cached
 
 
-import triton as _triton
-import triton.language as _tl
-
-
 @_triton.jit
 def _rmsnorm_kernel(
-    X_PTR, W_PTR, OUT_PTR,
-    stride_x_row, stride_out_row,
+    X_PTR,
+    W_PTR,
+    OUT_PTR,
+    stride_x_row,
+    stride_out_row,
     EPS: _tl.constexpr,
     D: _tl.constexpr,
 ):
@@ -88,8 +90,15 @@ def _rmsnorm_kernel(
 
 @_triton.jit
 def _rmsnorm_add_kernel(
-    X_PTR, RES_PTR, W_PTR, OUT_PTR, RES_OUT_PTR,
-    stride_x_row, stride_res_row, stride_out_row, stride_res_out_row,
+    X_PTR,
+    RES_PTR,
+    W_PTR,
+    OUT_PTR,
+    RES_OUT_PTR,
+    stride_x_row,
+    stride_res_row,
+    stride_out_row,
+    stride_res_out_row,
     EPS: _tl.constexpr,
     D: _tl.constexpr,
 ):
@@ -103,7 +112,10 @@ def _rmsnorm_add_kernel(
     rstd = 1.0 / _tl.sqrt(var + EPS)
     w = _tl.load(W_PTR + cols).to(_tl.float32)
     y = (s * rstd) * w
-    _tl.store(RES_OUT_PTR + row * stride_res_out_row + cols, s.to(RES_OUT_PTR.dtype.element_ty))
+    _tl.store(
+        RES_OUT_PTR + row * stride_res_out_row + cols,
+        s.to(RES_OUT_PTR.dtype.element_ty),
+    )
     _tl.store(OUT_PTR + row * stride_out_row + cols, y.to(OUT_PTR.dtype.element_ty))
 
 
@@ -113,9 +125,13 @@ def _rmsnorm_triton(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.
     out = torch.empty_like(x)
     N, D = x.shape
     _rmsnorm_kernel[(N,)](
-        x, weight, out,
-        x.stride(0), out.stride(0),
-        EPS=eps, D=D,
+        x,
+        weight,
+        out,
+        x.stride(0),
+        out.stride(0),
+        EPS=eps,
+        D=D,
     )
     return out
 
@@ -128,9 +144,17 @@ def _rmsnorm_add_triton(
     res_out = torch.empty_like(residual)
     N, D = x.shape
     _rmsnorm_add_kernel[(N,)](
-        x, residual, weight, out, res_out,
-        x.stride(0), residual.stride(0), out.stride(0), res_out.stride(0),
-        EPS=eps, D=D,
+        x,
+        residual,
+        weight,
+        out,
+        res_out,
+        x.stride(0),
+        residual.stride(0),
+        out.stride(0),
+        res_out.stride(0),
+        EPS=eps,
+        D=D,
     )
     return out, res_out
 

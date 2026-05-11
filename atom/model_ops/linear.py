@@ -37,7 +37,6 @@ from torch import nn
 logger = logging.getLogger("atom")
 
 
-
 # --- gfx1201 (RDNA4) FP8 GEMM fallback --------------------------------------
 # AITER prebuilts (gemm_a8w8*, tgemm.mm dispatched to aiter HIP) do not have
 # gfx1201 code objects in the rocm/atom-dev:latest image, causing SIGSEGV on
@@ -47,6 +46,7 @@ def _is_gfx1201_linear() -> bool:
     if not hasattr(_is_gfx1201_linear, "_cached"):
         try:
             import torch as _t
+
             name = _t.cuda.get_device_properties(0).gcnArchName or ""
             _is_gfx1201_linear._cached = name.startswith("gfx1201")
         except Exception:
@@ -55,12 +55,15 @@ def _is_gfx1201_linear() -> bool:
 
 
 _TRITON_FP8_GEMM = None
+
+
 def _get_triton_fp8_gemm():
     """Lazily import aiter triton gemm_a8w8 (JIT-compiled per arch)."""
     global _TRITON_FP8_GEMM
     if _TRITON_FP8_GEMM is None:
         try:
             from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8
+
             _TRITON_FP8_GEMM = gemm_a8w8
         except Exception:
             _TRITON_FP8_GEMM = False
@@ -103,6 +106,7 @@ def _get_aiter_dynamic_per_tensor_quant():
     if fn is None:
         try:
             from aiter.ops.triton.quant.quant import dynamic_per_tensor_quant_fp8_i8
+
             fn = dynamic_per_tensor_quant_fp8_i8
         except Exception:
             fn = False
@@ -123,6 +127,7 @@ def _get_aiter_dynamic_per_token_quant():
     if fn is None:
         try:
             from aiter.ops.triton.quant.quant import dynamic_per_token_quant_fp8_i8
+
             fn = dynamic_per_token_quant_fp8_i8
         except Exception:
             fn = False
@@ -150,29 +155,50 @@ def _gfx1201_gemm_a8w8_config(M: int, N: int, K: int) -> dict:
     and `num_warps` choices add a few more us each.
     """
     # Pick by N (the output dim). The per-N optimum is stable across our M.
-    if N >= 16384:           # gate_up (28672) — large N, full M-tile pays
+    if N >= 16384:  # gate_up (28672) — large N, full M-tile pays
         return {
-            "BLOCK_SIZE_M": 64,  "BLOCK_SIZE_N": 64,  "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 1,   "NUM_KSPLIT": 1,
-            "num_warps": 8, "num_stages": 2,
-            "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 1,
-            "cache_modifier": None, "SPLITK_BLOCK_SIZE": 4096,
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "NUM_KSPLIT": 1,
+            "num_warps": 8,
+            "num_stages": 2,
+            "waves_per_eu": 2,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+            "cache_modifier": None,
+            "SPLITK_BLOCK_SIZE": 4096,
         }
-    if K >= 8192:            # down (K=14336) — narrow N, deep K
+    if K >= 8192:  # down (K=14336) — narrow N, deep K
         return {
-            "BLOCK_SIZE_M": 16,  "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-            "GROUP_SIZE_M": 1,   "NUM_KSPLIT": 1,
-            "num_warps": 8, "num_stages": 2,
-            "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 1,
-            "cache_modifier": None, "SPLITK_BLOCK_SIZE": K,
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 128,
+            "BLOCK_SIZE_K": 128,
+            "GROUP_SIZE_M": 1,
+            "NUM_KSPLIT": 1,
+            "num_warps": 8,
+            "num_stages": 2,
+            "waves_per_eu": 2,
+            "matrix_instr_nonkdim": 16,
+            "kpack": 1,
+            "cache_modifier": None,
+            "SPLITK_BLOCK_SIZE": K,
         }
     # qkv (N=6144) and o (N=4096): default-ish tile, GROUP_SIZE_M=1
     return {
-        "BLOCK_SIZE_M": 16,  "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 128,
-        "GROUP_SIZE_M": 1,   "NUM_KSPLIT": 1,
-        "num_warps": 8, "num_stages": 2,
-        "waves_per_eu": 2, "matrix_instr_nonkdim": 16, "kpack": 1,
-        "cache_modifier": None, "SPLITK_BLOCK_SIZE": 4096,
+        "BLOCK_SIZE_M": 16,
+        "BLOCK_SIZE_N": 128,
+        "BLOCK_SIZE_K": 128,
+        "GROUP_SIZE_M": 1,
+        "NUM_KSPLIT": 1,
+        "num_warps": 8,
+        "num_stages": 2,
+        "waves_per_eu": 2,
+        "matrix_instr_nonkdim": 16,
+        "kpack": 1,
+        "cache_modifier": None,
+        "SPLITK_BLOCK_SIZE": 4096,
     }
 
 
@@ -219,8 +245,13 @@ def _fp8_per_tensor_linear_triton(
 
     cfg = _gfx1201_gemm_a8w8_config(M, N, K)
     return triton_gemm(
-        x_q, w_q, x_scale_full, w_scale_full,
-        bias=bias, dtype=otype, config=cfg,
+        x_q,
+        w_q,
+        x_scale_full,
+        w_scale_full,
+        bias=bias,
+        dtype=otype,
+        config=cfg,
     )
 
 
@@ -243,7 +274,13 @@ def _fp8_per_tensor_linear_gfx1201(
             "per-tensor FP8 linear (no torch fallback in this build)."
         )
     return _fp8_per_tensor_linear_triton(
-        triton_gemm, x, weight, weight_scale, bias, otype, output_partition_sizes,
+        triton_gemm,
+        x,
+        weight,
+        weight_scale,
+        bias,
+        otype,
+        output_partition_sizes,
     )
 
 
@@ -622,6 +659,7 @@ class LinearBase(nn.Module):
                 # gfx1201: skip aiter tgemm.mm (no gfx1201 HIP code object).
                 # Plain BF16 F.linear; weight is already in the right dtype.
                 import torch.nn.functional as _F
+
                 y = _F.linear(x.to(otype), self.weight.to(otype), self.bias)
             else:
                 y = tgemm.mm(
@@ -655,8 +693,15 @@ class LinearBase(nn.Module):
                     # gfx1201: skip aiter tgemm.mm (no gfx1201 HIP code object),
                     # dequant FP8 weight + run F.linear in BF16.
                     y = _fp8_per_tensor_linear_gfx1201(
-                        x, self.weight, self.weight_scale, self.bias, x_scale, otype,
-                        output_partition_sizes=getattr(self, "output_partition_sizes", None),
+                        x,
+                        self.weight,
+                        self.weight_scale,
+                        self.bias,
+                        x_scale,
+                        otype,
+                        output_partition_sizes=getattr(
+                            self, "output_partition_sizes", None
+                        ),
                     )
                 else:
                     y = tgemm.mm(

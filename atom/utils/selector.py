@@ -69,6 +69,7 @@ def get_attn_backend_cls(
     # Also opt-in via ATOM_NATIVE_TRITON_ATTN=1 on any device for testing.
     try:
         from atom.model_ops.attentions.native_triton_attn import use_native_triton_attn
+
         if use_native_triton_attn():
             return "atom.model_ops.attentions.native_triton_attn.NativeTritonBackend"
     except Exception:

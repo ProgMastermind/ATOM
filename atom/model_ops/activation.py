@@ -2,23 +2,28 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import torch
-from typing import Optional
-from torch import nn
 import torch.nn.functional as F
-from aiter import silu_and_mul
-from atom.config import QuantizationConfig
-from atom.quant_spec import LayerQuantConfig
-from aiter.jit.utils.torch_guard import torch_compile_guard
-
-# --- gfx1201 fallback: triton SiLU + Mul (replaces forward_native) ---------
 import triton as _triton
 import triton.language as _tl
+from aiter import (
+    QuantType,
+    silu_and_mul,
+)
+from aiter.jit.utils.torch_guard import torch_compile_guard
+from atom.config import QuantizationConfig
+from atom.quant_spec import LayerQuantConfig
+from torch import nn
+from typing import Optional
+
+# --- gfx1201 fallback: triton SiLU + Mul (replaces forward_native) ---------
 
 
 @_triton.jit
 def _silu_mul_kernel(
-    X_PTR, OUT_PTR,
-    stride_x_row, stride_out_row,
+    X_PTR,
+    OUT_PTR,
+    stride_x_row,
+    stride_out_row,
     HALF_D: _tl.int32,
     BLOCK_D: _tl.constexpr,
 ):
@@ -28,8 +33,12 @@ def _silu_mul_kernel(
     block_start = _tl.program_id(1) * BLOCK_D
     cols = block_start + _tl.arange(0, BLOCK_D)
     mask = cols < HALF_D
-    a = _tl.load(X_PTR + row * stride_x_row + cols, mask=mask, other=0.0).to(_tl.float32)
-    b = _tl.load(X_PTR + row * stride_x_row + HALF_D + cols, mask=mask, other=0.0).to(_tl.float32)
+    a = _tl.load(X_PTR + row * stride_x_row + cols, mask=mask, other=0.0).to(
+        _tl.float32
+    )
+    b = _tl.load(X_PTR + row * stride_x_row + HALF_D + cols, mask=mask, other=0.0).to(
+        _tl.float32
+    )
     silu_a = a * (1.0 / (1.0 + _tl.exp(-a)))
     out = (silu_a * b).to(OUT_PTR.dtype.element_ty)
     _tl.store(OUT_PTR + row * stride_out_row + cols, out, mask=mask)
@@ -44,8 +53,10 @@ def _silu_mul_triton(x: torch.Tensor) -> torch.Tensor:
     BLOCK_D = 1024
     grid = (N, _triton.cdiv(half, BLOCK_D))
     _silu_mul_kernel[grid](
-        x, out,
-        x.stride(0), out.stride(0),
+        x,
+        out,
+        x.stride(0),
+        out.stride(0),
         HALF_D=half,
         BLOCK_D=BLOCK_D,
     )
@@ -61,11 +72,6 @@ def _is_gfx1201_act() -> bool:
         except Exception:
             _is_gfx1201_act._cached = False
     return _is_gfx1201_act._cached
-
-
-from aiter import (
-    QuantType,
-)
 
 
 def mxfp4_act_mul_quant_fuse_fake(

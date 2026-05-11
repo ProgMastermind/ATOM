@@ -301,9 +301,12 @@ class GenericParser(QuantConfigParser):
                 return QuantType.per_Tensor
             if isinstance(wbs, (list, tuple)) and len(wbs) >= 2:
                 m, n = int(wbs[0]), int(wbs[1])
-                if (m, n) == (1, 128): return QuantType.per_1x128
-                if (m, n) == (128, 128): return QuantType.per_128x128
-                if (m, n) == (1, 32): return QuantType.per_1x32
+                if (m, n) == (1, 128):
+                    return QuantType.per_1x128
+                if (m, n) == (128, 128):
+                    return QuantType.per_128x128
+                if (m, n) == (1, 32):
+                    return QuantType.per_1x32
                 return QuantType.per_1x128
         # Fall back to regex heuristics on full config string
         for pattern, qtype in self._QTYPE_PATTERNS.items():
