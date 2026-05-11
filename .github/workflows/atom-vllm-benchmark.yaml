@@ -454,6 +454,8 @@ jobs:
           model_prefixes = [model["prefix"] for model in models]
           model_by_prefix = {model["prefix"]: model for model in models}
           model_presets = {
+              # Keep smoke as a lightweight sanity set. If these prefixes change in
+              # oot_benchmark_models.json, unknown_prefixes validation will fail fast.
               "smoke": [
                   "deepseek-r1-fp8-met",
                   "gpt-oss-120b-met",
@@ -500,6 +502,7 @@ jobs:
               return datetime.fromisoformat(created_at.replace("Z", "+00:00"))
 
           selected_group = ""
+          selected = []
           if event == "schedule":
               beijing_tz = timezone(timedelta(hours=8))
               beijing_dt = fetch_run_created_at().astimezone(beijing_tz)
@@ -579,7 +582,7 @@ jobs:
               ]
               for model in selected:
                   tp_match = re.search(
-                      r"--tensor-parallel-size\\s+(\\d+)",
+                      r"--tensor-parallel-size\s+(\d+)",
                       model.get("extra_args", ""),
                   )
                   tensor_parallel_size = tp_match.group(1) if tp_match else "-"
@@ -866,6 +869,8 @@ jobs:
       - name: Check if model is enabled
         id: check
         run: |
+          # Model filtering happens in load-models/build-benchmark-matrix; every
+          # matrix entry that reaches this job is already selected for execution.
           echo "enabled=true" >> "$GITHUB_OUTPUT"
 
       - name: Clean up containers and workspace
