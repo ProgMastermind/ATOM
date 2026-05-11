@@ -1,21 +1,27 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2026, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Torch-native (with triton-fast paths) attention backend for ATOM (gfx1201).
+"""Triton-only attention backend for ATOM on gfx1201 (RDNA4 / RX 9070 XT).
 
 Why this exists
 ---------------
 The AITER package shipped in rocm/atom-dev:latest has prebuilt HIP .so files
-only for gfx94x/95x. On gfx1201 (RDNA4) the AITER paged-attention HIP modules
-fail to load with "No compatible code objects found for: gfx1201" and SIGSEGV
-the ModelRunner. This backend replaces that path with a mix of triton (fast)
-and torch (correctness fallback) kernels that work on gfx1201.
+only for gfx94x/95x. On gfx1201 the AITER paged-attention HIP modules fail
+to load with "No compatible code objects found for: gfx1201" and SIGSEGV
+the ModelRunner. This backend replaces them with JIT-compiled triton kernels
+(aiter's triton paged-attention + an in-tree triton kv-cache write) that
+build for gfx1201 at first call.
+
+There is NO torch fallback in this build: the path raises a clear
+RuntimeError if any required triton kernel is unavailable, instead of
+silently falling back to a slow path that would also reintroduce
+GPU->CPU syncs that break CUDAGraph capture.
 
 Selection
 ---------
 atom/utils/selector.py:get_attn_backend_cls routes here when
 torch.cuda.get_device_properties(0).gcnArchName starts with 'gfx1201',
-or when ATOM_TORCH_NATIVE_ATTN=1 is set.
+or when ATOM_GFX1201_TRITON_ATTN=1 is set explicitly.
 
 KV cache layout (matches aiter's pa_decode triton kernel expectations)
 ----------------------------------------------------------------------
@@ -24,14 +30,13 @@ KV cache layout (matches aiter's pa_decode triton kernel expectations)
 
 Forward
 -------
-* Prefill: write current K/V at slot_mapping into the cache, then run
-  per-sequence SDPA over the in-batch K/V (no history needed because
-  prefill carries the full sequence).
-* Decode: write the new K/V at slot_mapping (one slot per request),
-  then call aiter's `paged_attention_decode` triton kernel
-  (~1.8x faster than the torch gather + SDPA loop on gfx1201).
-  Falls back to the torch path if the triton kernel raises (e.g. unusual
-  shapes, sliding window, or a kernel-side AssertionError).
+* Prefill: in-tree triton kv-cache write, then aiter triton
+  context_attention_fwd (handles GQA internally).
+* Decode: same triton kv-cache write, then a thin v1/v2 dispatcher
+  around aiter's paged_attn_decode_v1 / paged_attn_decode_v2 that
+  takes Python-float scales (the higher-level paged_attention_decode
+  wrapper does .item() on every call -- a GPU->CPU sync that breaks
+  CUDAGraph capture).
 """
 
 from __future__ import annotations
@@ -69,8 +74,8 @@ def _is_gfx1201() -> bool:
     return name.startswith("gfx1201")
 
 
-def use_torch_native_attn() -> bool:
-    if os.environ.get("ATOM_TORCH_NATIVE_ATTN", "").lower() in ("1", "true"):
+def use_gfx1201_triton_attn() -> bool:
+    if os.environ.get("ATOM_GFX1201_TRITON_ATTN", "").lower() in ("1", "true"):
         return True
     return _is_gfx1201()
 
@@ -241,20 +246,20 @@ def _kv_cache_write_triton(
         N=N, H=H, D=D, S=S,
     )
 
-class TorchNativeBackend(AttentionBackend):
+class Gfx1201TritonBackend(AttentionBackend):
     """AITER-free attention backend (torch + selectively triton)."""
 
     @staticmethod
     def get_name() -> str:
-        return "TORCH_NATIVE_ATTENTION"
+        return "GFX1201_TRITON_ATTENTION"
 
     @staticmethod
-    def get_builder_cls() -> Type["TorchNativeMetadataBuilder"]:
-        return TorchNativeMetadataBuilder
+    def get_builder_cls() -> Type["Gfx1201TritonMetadataBuilder"]:
+        return Gfx1201TritonMetadataBuilder
 
     @staticmethod
-    def get_impl_cls() -> Type["TorchNativeAttentionImpl"]:
-        return TorchNativeAttentionImpl
+    def get_impl_cls() -> Type["Gfx1201TritonAttentionImpl"]:
+        return Gfx1201TritonAttentionImpl
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +267,7 @@ class TorchNativeBackend(AttentionBackend):
 # ---------------------------------------------------------------------------
 
 
-class TorchNativeMetadataBuilder(CommonAttentionBuilder):
+class Gfx1201TritonMetadataBuilder(CommonAttentionBuilder):
     """Inherits prepare_prefill from CommonAttentionBuilder; provides decode
     metadata + KV cache allocation in aiter's [blocks, heads, block_size, d]
     layout."""
@@ -288,7 +293,7 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
                 self.max_bs + 1, dtype=torch.int32, device=self.device
             )
         logger.info(
-            "TorchNativeMetadataBuilder: initialized (no aiter HIP allocations)"
+            "Gfx1201TritonMetadataBuilder: initialized (no aiter HIP allocations)"
         )
 
     # ------------------------------------------------------------------ #
@@ -468,9 +473,9 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
         at the exact (shape, dtype, stride) combo the engine will use,
         so the engine's subsequent warmup just replays cached kernels.
         """
-        if TorchNativeMetadataBuilder._prewarm_done_bs is None:
-            TorchNativeMetadataBuilder._prewarm_done_bs = set()
-        if bs in TorchNativeMetadataBuilder._prewarm_done_bs:
+        if Gfx1201TritonMetadataBuilder._prewarm_done_bs is None:
+            Gfx1201TritonMetadataBuilder._prewarm_done_bs = set()
+        if bs in Gfx1201TritonMetadataBuilder._prewarm_done_bs:
             return
 
         runner = self.model_runner
@@ -532,7 +537,7 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
                 )
                 break
         torch.cuda.current_stream().synchronize()
-        TorchNativeMetadataBuilder._prewarm_done_bs.add(bs)
+        Gfx1201TritonMetadataBuilder._prewarm_done_bs.add(bs)
         logger.info("Full decode pre-warm complete for cudagraph bs=%d", bs)
 
 
@@ -541,7 +546,7 @@ class TorchNativeMetadataBuilder(CommonAttentionBuilder):
 # ---------------------------------------------------------------------------
 
 
-class TorchNativeAttentionImpl(AttentionImpl):
+class Gfx1201TritonAttentionImpl(AttentionImpl):
     def __init__(
         self,
         num_heads: int,
@@ -587,7 +592,7 @@ class TorchNativeAttentionImpl(AttentionImpl):
         self._pa_v_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
         if kv_cache_dtype != "bf16":
             logger.warning(
-                f"TorchNativeAttentionImpl: kv_cache_dtype={kv_cache_dtype} "
+                f"Gfx1201TritonAttentionImpl: kv_cache_dtype={kv_cache_dtype} "
                 "is a TODO; force --kv_cache_dtype bf16."
             )
 
@@ -632,7 +637,7 @@ class TorchNativeAttentionImpl(AttentionImpl):
     ) -> torch.Tensor:
         if use_mla:
             raise NotImplementedError(
-                "TorchNativeAttentionImpl: MLA path is not implemented."
+                "Gfx1201TritonAttentionImpl: MLA path is not implemented."
             )
 
         ctx = get_forward_context()
@@ -641,7 +646,7 @@ class TorchNativeAttentionImpl(AttentionImpl):
         is_prefill = bool(getattr(fc, "is_prefill", True)) if fc is not None else True
         if attn_md is None:
             raise RuntimeError(
-                "TorchNativeAttentionImpl: forward called without AttentionMetaData."
+                "Gfx1201TritonAttentionImpl: forward called without AttentionMetaData."
             )
 
         total_tokens = query.shape[0]
@@ -685,7 +690,7 @@ class TorchNativeAttentionImpl(AttentionImpl):
         # Triton-only — no torch SDPA fallback.
         if self.sliding_window is not None and self.sliding_window > 0:
             raise RuntimeError(
-                "TorchNativeAttentionImpl: sliding_window prefill is not "
+                "Gfx1201TritonAttentionImpl: sliding_window prefill is not "
                 "supported (triton context_attention_fwd has no sliding window)."
             )
         prefill = _get_triton_prefill()
@@ -721,7 +726,7 @@ class TorchNativeAttentionImpl(AttentionImpl):
         # Triton-only — no torch decode fallback.
         if self.sliding_window is not None and self.sliding_window > 0:
             raise RuntimeError(
-                "TorchNativeAttentionImpl: sliding_window decode is not "
+                "Gfx1201TritonAttentionImpl: sliding_window decode is not "
                 "supported (aiter pa_decode has no sliding window)."
             )
         pa_decode, tl_bf16 = _get_triton_pa_decode()
@@ -732,7 +737,7 @@ class TorchNativeAttentionImpl(AttentionImpl):
             )
         if self.k_cache.numel() == 0:
             raise RuntimeError(
-                "TorchNativeAttentionImpl: KV cache is empty at decode time "
+                "Gfx1201TritonAttentionImpl: KV cache is empty at decode time "
                 "(build_kv_cache_tensor was not called?)."
             )
         out = torch.empty_like(q)

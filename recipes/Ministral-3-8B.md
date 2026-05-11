@@ -2,7 +2,7 @@
 
 This recipe describes running `mistralai/Ministral-3-8B-Instruct-2512`
 (natively FP8 trained) on a single RDNA4 GPU using ATOM's
-`TORCH_NATIVE_ATTENTION` backend. The backend is selected automatically
+`GFX1201_TRITON_ATTENTION` backend. The backend is selected automatically
 when ATOM detects gfx1201; on other archs it does nothing.
 
 ## Why not the default AITER path?
@@ -10,7 +10,7 @@ when ATOM detects gfx1201; on other archs it does nothing.
 The AITER package shipped in `rocm/atom-dev:latest` ships prebuilt HIP
 `.so` files only for gfx94x/95x. Loading any of those modules on
 gfx1201 segfaults with `No compatible code objects found for: gfx1201`.
-The torch-native backend bypasses the prebuilt path:
+The gfx1201 triton backend bypasses the prebuilt path:
 
 | Op | Backend on gfx1201 |
 |---|---|
