@@ -14,18 +14,23 @@ The gfx1201 triton backend bypasses the prebuilt path:
 
 | Op | Backend on gfx1201 |
 |---|---|
-| Per-tensor FP8 GEMM (qkv/o/gate_up/down proj) | **aiter triton `gemm_a8w8`** (JIT-compiled, ~360× faster than torch dequant) |
-| Paged attention **prefill** | **aiter triton `context_attention_fwd`** (JIT-compiled; 2.2× faster per-call than torch SDPA; handles GQA internally) |
-| Paged attention **decode** | **aiter triton `paged_attention_decode`** (JIT-compiled; ~20% e2e speedup) |
-| **KV cache write** | **in-tree triton kernel** (handles -1 sentinels in-kernel; ~12× faster than torch advanced indexing; no GPU→CPU sync — CUDAGraph-capturable) |
-| **RMSNorm** (with/without residual) | **in-tree triton kernel** (~6.6× faster than torch fallback) |
-| **SiLU+Mul** (SwiGLU) | **in-tree triton kernel** (chunked, handles non-pow2 D=14336; ~3.1× faster than torch `forward_native`) |
-| Unquantized BF16 linear (Reasoning checkpoints) | torch `F.linear` (gfx1201 fallback) |
-| Mixed-Gumbel sampler | torch (called once per token, not on hot path) |
-| RMSNorm (with/without residual) | torch RMSNorm fallback |
-| SiLU + Mul (SwiGLU) | `forward_native` (existing torch path) |
-| Mixed Gumbel sampler | torch Gumbel-max + argmax |
-| YaRN-scaled RoPE | `forward_native` via `AITER_ROPE_NATIVE_BACKEND=1` |
+| Per-tensor FP8 GEMM (qkv/o/gate_up/down proj) | **aiter triton `gemm_a8w8`** (JIT-compiled) |
+| Dynamic per-tensor FP8 quant of x | **aiter triton `dynamic_per_tensor_quant_fp8_i8`** (single-launch, atomic_max scale) |
+| Paged attention **prefill** | **aiter triton `context_attention_fwd`** (JIT; handles GQA) |
+| Paged attention **decode** | **aiter triton `paged_attn_decode_v1` / `paged_attn_decode_v2`** (in-tree dispatcher with Python-float scales — wrapper's `.item()` would break cudagraph capture) |
+| **KV cache write** | **in-tree triton kernel** (handles -1 sentinels in-kernel; CUDAGraph-capturable) |
+| **RMSNorm** (with / with-add-residual) | **in-tree triton kernel** (pow2 D ≤ 16384) |
+| **SiLU+Mul** (SwiGLU) | **in-tree triton kernel** (chunked, non-pow2 D OK) |
+| YaRN-scaled RoPE | aiter `rope_cached_positions_2c_fwd_inplace` (JIT HIP via `@compile_ops`) |
+| lm_head BF16 linear | rocBLAS `F.linear` (vocab=131072, BF16) |
+| Sampler | torch greedy / Gumbel-max + argmax (one call per step, off hot path) |
+
+There is no torch fallback for any kernel above — the path raises a
+clear `RuntimeError` if a triton kernel is unavailable. Reason: every
+historical fallback contained either `.item()` or `.cpu().tolist()`
+syncs, which silently corrupt cudagraph capture on ROCm (HIP graph
+capture does not raise on illegal-during-capture ops the way CUDA
+does — see pytorch#155684).
 
 ## One-shot image setup (per fresh container)
 
@@ -255,3 +260,75 @@ Remaining perf headroom worth pursuing:
   Once that's in, TP=2 should work and lets the BF16 Ministral-3-8B-
   Reasoning model (16.6 GB) split across 2 × 16 GB gfx1201s. Without
   it, only single-GPU FP8 / 3B-BF16 models fit.
+
+## Performance roofline analysis
+
+### Where the time goes (cudagraph bs=1, single-token decode)
+
+torch.profiler trace of 48 decode steps at TPOT 0.022 s/tok = **45 tok/s**:
+
+| Component | Per-step time | Notes |
+|---|---:|---|
+| `gemm_a8w8` (qkv + o + gate_up + down, ×34 layers) | **14.7 ms** | Dominant; 4 specializations (one per shape bucket) |
+| Dynamic per-tensor FP8 quant (`dynamic_per_tensor_quant_fp8_i8` + `static_per_tensor_quant_fp8_i8`) | 1.4 ms | Two-kernel pair, called once per linear (×136 / step) |
+| `lm_head` rocBLAS BF16 GEMM (vocab=131072) | 1.9 ms | Necessary; ~bandwidth-bound |
+| `paged_attn_decode_v2` + reduce | 0.27 ms | Already very fast |
+| `_rmsnorm_add_kernel` + `_rmsnorm_kernel` | 0.15 ms | Already very fast |
+| `_kv_cache_write_kernel` | 0.07 ms | Already very fast |
+| `_silu_mul_kernel` | 0.06 ms | Already very fast |
+| Other elementwise (aten reshape / contiguous / etc.) | ~3.5 ms | residual python-side ops baked into the captured graph |
+| **Total** | **~22 ms** | matches measured TPOT |
+
+### Roofline projection (RX 9070 XT, 16 GB GDDR6, 640 GB/s)
+
+For an 8B FP8 model at decode bs=1, weight read per step = ~8 GB:
+
+- **Memory-bound roofline**: 8 GB ÷ 640 GB/s = **12.5 ms / step = 80 tok/s**
+- **Realistic ceiling** (matches what comparable consumer GPUs achieve at bs=1 in practice — see cross-GPU table below): ~50-65 tok/s = 16-20 ms/step
+- **Our measured**: 22 ms/step = **45 tok/s = 56% of memory roofline, 90% of realistic ceiling**
+
+### Cross-GPU comparison (8B FP8 / Q4 LLM, decode bs=1)
+
+| GPU | HBM/VRAM BW | FP8 8B roofline | Observed bs=1 | Quant / runtime | % of FP8 roofline |
+|---|---:|---:|---:|---|---:|
+| **MI300X** (gfx942) | 5.3 TB/s | ~670 tok/s | ~150-250 tok/s | FP8, vLLM+AITER | ~25-35% |
+| **H100 SXM** | 3.35 TB/s | ~415 tok/s | ~180-250 tok/s | FP8, TRT-LLM | ~45-60% |
+| **RTX 4090** | 1.0 TB/s | ~125 tok/s | ~131-150 tok/s | Q4 GGUF, llama.cpp | ~100% (Q4 reads less) |
+| **RX 7900 XTX** (gfx1100) | 0.96 TB/s | ~120 tok/s | ~60-70 tok/s | Q4, llama.cpp ROCm | ~50% |
+| **RX 9070 XT** (gfx1201) — published | 0.64 TB/s | ~80 tok/s | ~30-50 tok/s | Q4, llama.cpp ROCm 6.4.1+ | ~38-63% |
+| **RX 9070 XT — this build (FP8, ATOM)** | 0.64 TB/s | ~80 tok/s | **45 tok/s** | FP8, ATOM | **56%** |
+
+ATOM-on-RDNA4 with this triton stack matches or beats the published
+llama.cpp Q4 numbers for the same GPU **despite reading 2× as much
+weight data per step** (FP8 = 8 GB vs Q4 = 4 GB). That is, our
+per-byte efficiency is roughly 2× llama.cpp's on this hardware.
+
+### Remaining gap to roofline (~10 ms / step)
+
+- **gemm_a8w8 itself is ~2 ms/step above its memory-bound floor**
+  (~14.7 ms actual vs ~8.5 ms ideal aggregate). Aiter's triton kernel
+  uses a fixed BLOCK_SIZE_M=64 even at M=1, wasting most of the row
+  tile — but a bs=1-specialized kernel didn't exist in aiter at the
+  time of writing. Closing this is ~6 ms (= 27% TPOT reduction).
+- **Two-kernel dynamic per-tensor quant** (1.4 ms/step). Could be
+  fused with gemm_a8w8 via `gemm_a8w8_with_dynamic_quant`, eliminating
+  the launch-pair per linear. Mistral-3 ships
+  `activation_scheme: "static"` but **no actual `input_scale` tensors
+  in the safetensors checkpoint** — so the static-quant fast path is
+  not usable for this model.
+- **~3.5 ms/step in scattered elementwise ops** (aten reshape /
+  contiguous / vectorized_elementwise around the linear path). These
+  add up across 34 layers × 4 linears × small ops. Trimming via a
+  single fused triton "rmsnorm + dynamic_quant + gemm_a8w8" kernel
+  would be the cleanest win, requiring an aiter contribution.
+
+### Sources for the cross-GPU table
+
+- vLLM on MI300X: https://blog.vllm.ai/2024/10/23/vllm-serving-amd.html
+- TRT-LLM Llama-3.1-8B FP8 on H100: https://github.com/NVIDIA/TensorRT-LLM/issues/6294
+- Modal latency-optimized TRT-LLM on H100: https://modal.com/docs/examples/trtllm_latency
+- llama.cpp on RTX 4090 / RDNA: https://developer.nvidia.com/blog/accelerating-llms-with-llama-cpp-on-nvidia-rtx-systems/
+- llama.cpp ROCm gfx1201 / gfx1100 community: https://github.com/ggml-org/llama.cpp/discussions/15021
+- LLM-Inference-Bench (MI250 vs A100/H100/MI300X): https://arxiv.org/html/2411.00136v1
+- TechReviewer: RX 9070 XT for LLMs: https://www.techreviewer.com/tech-specs/amd-rx-9070-xt-gpu-for-llms/
+- GPU Hunter: 7900 XTX ~66 tok/s Llama-3-8B Q4: https://www.gpuhunter.io/blog/amd-vs-nvidia-local-ai-2026
