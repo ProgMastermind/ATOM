@@ -158,20 +158,29 @@ Cumulative vs the original eager baseline: **35% TPOT reduction** and
 Remaining perf headroom worth pursuing:
 
 - **CUDAGraph at bs ≥ 3**: captured graphs at decode bs ≥ 3 corrupt
-  the first decode-step logits (see Known caveats). Root cause is
-  unidentified; investigation ruled out v1/v2 dispatch, prewarm,
-  capture-stream alignment, JIT-during-capture, FP8 GEMM split-K
-  configs, and lm_head capture. Eager-mode multi-seq decode is fine
-  (gsm8k 0.785 at concurrent=4) — only the captured-graph replay at
-  bs ≥ 3 corrupts. Symptom is consistent with sglang#1558 / sglang#19799
-  (triton + cudagraph + ROCm). Concurrency above 2 still works via the
-  engine's eager fallback path; just no graph speedup.
-- **TP=2**: blocked at host kernel level — RCCL needs `iommu=pt` (and
-  `amd_iommu=on`) on the GRUB cmdline for cross-GPU P2P. Without that
-  every multi-rank `nccl_init` fails with `HIP failure: invalid device
-  ordinal`. Fix is host-side: edit `/etc/default/grub`, regen, reboot.
-  Once unblocked, TP=2 lets the BF16 8B Reasoning variant fit (16.6 GB
-  weights → 8.3 GB / GPU); see "TP=2 (Reasoning-8B)" caveat.
+  the first decode-step logits (see Known caveats). Bisected as far as
+  possible from outside the engine: every individual triton kernel
+  (RMSNorm, SiluMul, kv-write, gemm_a8w8, pa_decode_v1, pa_decode_v2)
+  passes a standalone capture-then-replay test at bs=4 with bitwise-
+  identical output, AND a 36-layer chained version of those kernels in
+  a single graph also passes at bs=4 — so the bug is not in any kernel
+  or in their composition under cudagraph. Bypassing RoPE entirely
+  does not fix it either (eager-no-rope → 0.633, cg-no-rope → 0.067 on
+  gsm8k n=30 nc=4; cudagraph still degrades the model far below the
+  RoPE-less baseline). The bug must therefore be in some interaction
+  between ATOM's engine flow and the captured replay that doesn't
+  reproduce in standalone — finding it would need engine-level
+  intermediate-state diffing per layer, which is out of scope here.
+- **TP=2**: blocked at host kernel level — both RCCL and aiter's
+  CustomAllreduce fall over on the same root cause: HIP IPC requires
+  `iommu=pt` (and `amd_iommu=on`) on the GRUB cmdline. PyNcclCommunicator
+  init fails with `HIP error: invalid kernel file`; CustomAllreduce
+  init then fails one step later with
+  `hipIpcOpenMemHandle ... HIP error (invalid device pointer)`.
+  `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1` does NOT help (failure is
+  before transport choice). Fix is host-side: edit `/etc/default/grub`,
+  regen, reboot. Once unblocked, TP=2 lets the BF16 8B Reasoning
+  variant fit (16.6 GB weights → 8.3 GB / GPU).
 - **FP8 KV cache**: BF16 KV today; would halve KV memory and shave
   some bandwidth on long-context decode.
 
@@ -190,24 +199,54 @@ Remaining perf headroom worth pursuing:
   all emit a wrong logit at the first decode step after prefill, almost
   always sampling EOS or a stop token. bs=1 and bs=2 captured graphs
   are correct. Eager mode at the same bs is correct (gsm8k 5-shot 0.785
-  at concurrent=4). Investigated and ruled out as causes: v1 vs v2
-  pa_decode dispatch (v1-only forced is also broken at bs ≥ 3); the
-  prewarm helper (engine reaches capture without it; bs ≥ 3 still
-  breaks); JIT during capture (capture itself succeeds, eager works);
-  capture-stream alignment (warmup now on `gc.stream`, twice, per the
-  SGLang/PyTorch idiom); FP8 GEMM split-K configs (`_get_config`
-  returns NUM_KSPLIT=1 across all our (M, N, K) so no per-bs binary
-  divergence); lm_head being captured (`logits_in_graph=False` also
-  broken). Symptom is consistent with sglang#1558 / sglang#19799 and
+  at concurrent=4).
+
+  Investigated and ruled out as causes:
+  - **v1 vs v2 pa_decode dispatch**: v1-only forced is also broken at
+    bs ≥ 3; bs ≥ 3 captured graphs replay incorrectly under both.
+  - **The prewarm helper**: engine reaches capture without it; bs ≥ 3
+    still breaks. (We keep the prewarm anyway since it follows the
+    SGLang / PyTorch idiom and is a robustness belt-and-suspenders.)
+  - **JIT-during-capture**: capture itself succeeds and the eager path
+    works fine at the same bs and same shapes.
+  - **Capture-stream alignment**: warmup now runs on `gc.stream`, twice,
+    per the SGLang / PyTorch CUDA-graphs idiom; bug persists.
+  - **FP8 GEMM split-K configs**: `_get_config` returns `NUM_KSPLIT=1`
+    across all our (M, N, K) so there's no per-bs binary divergence in
+    `gemm_a8w8`.
+  - **lm_head being captured**: `logits_in_graph=False` also broken at
+    bs ≥ 3.
+  - **Standalone capture-replay of every triton kernel** (RMSNorm,
+    SiluMul, kv-write, gemm_a8w8, pa_decode_v1, pa_decode_v2) at
+    bs=1..8: every kernel passes bitwise-identically.
+  - **Standalone 36-layer chained kernels** (full Mistral decoder
+    depth) at bs=4 captured + replayed: passes bitwise-identically.
+  - **RoPE bypass**: turning off RoPE entirely in ATOM still leaves
+    the cudagraph bs ≥ 3 path broken (eager-no-rope = 0.633 vs
+    cg-no-rope = 0.067 on gsm8k n=30 nc=4) — RoPE isn't the cause.
+
+  Conclusion: the bug is in some interaction between ATOM's full
+  engine flow at runtime and the captured-graph replay that doesn't
+  reproduce in standalone tests. Running it down would need
+  intermediate-state diffing per layer in the live engine — out of
+  scope here. Symptom is consistent with sglang#1558 / sglang#19799 and
   pytorch#155684 (HIP graph capture is silent on illegal-during-capture
   ops). Workaround: `--cudagraph-capture-sizes "[1,2]"`. Concurrency
   > 2 still works via eager fallback.
-* **TP=2 not yet usable on this host**: `nccl_init` for world_size > 1
-  fails with `HIP failure: invalid device ordinal` and a warning that
-  `iommu=pt` is missing from the kernel command line. RCCL needs
-  `iommu=pt amd_iommu=on` on the host GRUB cmdline to set up cross-GPU
-  P2P. `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1` does not help — RCCL
-  fails before it gets to the transport choice. Fix is host-side:
+* **TP=2 not yet usable on this host**: tried both transport paths;
+  both fail on the same root cause — HIP IPC needs `iommu=pt` on the
+  host kernel cmdline.
+
+  - **RCCL / PyNcclCommunicator**: fails with `HIP failure: invalid
+    device ordinal` and a `Missing "iommu=pt" from kernel command line`
+    warning. `NCCL_P2P_DISABLE=1 NCCL_SHM_DISABLE=1` does NOT help
+    (the failure is before RCCL chooses a transport).
+  - **aiter CustomAllreduce** (the IPC-handle-based fast path that
+    bypasses RCCL): also fails, one step later, with
+    `hipIpcOpenMemHandle ... HIP error (invalid device pointer)`. It
+    needs the same iommu=pt that RCCL does.
+
+  Fix is host-side (requires reboot):
   ```
   # /etc/default/grub
   GRUB_CMDLINE_LINUX_DEFAULT="... iommu=pt amd_iommu=on"
