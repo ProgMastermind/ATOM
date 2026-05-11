@@ -13,14 +13,32 @@ from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
-from aiter.ops.shuffle import shuffle_weight, shuffle_scale
+from aiter.ops.shuffle import shuffle_weight
+try:
+    from aiter.ops.shuffle import shuffle_scale  # noqa: F401
+except ImportError:
+    # Older aiter (rocm/atom-dev:latest) does not export shuffle_scale.
+    # MoE paths that need it will raise on call; non-MoE models load fine.
+    def shuffle_scale(*args, **kwargs):
+        raise RuntimeError(
+            'aiter.ops.shuffle.shuffle_scale is not available in this aiter '
+            'build; MoE blockscale path is unsupported here'
+        )
 from aiter.utility import fp4_utils
 from atom.config import (
     Config,
     QuantizationConfig,
     get_current_atom_config,
 )
-from aiter.ops.flydsl.moe_common import GateMode
+try:
+    from aiter.ops.flydsl.moe_common import GateMode
+except (ImportError, ModuleNotFoundError):
+    # Older aiter (rocm/atom-dev:latest) does not ship the flydsl.moe_common
+    # module. MoE flydsl path is unsupported here; provide a stub so non-MoE
+    # models still import cleanly.
+    class GateMode:
+        class INTERLEAVE: value = 0
+        class SEPARATED:  value = 1
 from atom.quant_spec import LayerQuantConfig
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops.base_config import QuantizeMethodBase
