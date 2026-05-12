@@ -5,8 +5,6 @@ from typing import Optional, Tuple
 
 import aiter
 import torch
-import triton as _triton
-import triton.language as _tl
 from aiter import (
     QuantType,
     layernorm2d_fwd,
@@ -19,6 +17,17 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
+from aiter.ops.triton.normalization.rmsnorm import (
+    # rmsnorm_forward_inference: lean variant that skips the autograd Function
+    # wrapper used by rms_norm(). Saves ~125 us/call which is significant for
+    # Qwen3 q_norm/k_norm (dim=128) called per layer per token.
+    rmsnorm_forward_inference as _aiter_triton_rms_norm,
+    # _rmsnorm_forward_with_add is the lean variant matching
+    # rmsnorm2d_fwd_with_add but without the autograd Function wrapper.
+    # Underscore-prefixed but exposed at the module level alongside the public
+    # API; we use it for the same Python-overhead reason as above.
+    _rmsnorm_forward_with_add as _aiter_triton_rmsnorm_with_add,
+)
 from atom.config import QuantizationConfig
 from atom.model_ops.utils import atom_parameter
 from atom.quant_spec import LayerQuantConfig
@@ -67,106 +76,6 @@ def _is_gfx1201_layernorm() -> bool:
     return _is_gfx1201_layernorm._cached
 
 
-@_triton.jit
-def _rmsnorm_kernel(
-    X_PTR,
-    W_PTR,
-    OUT_PTR,
-    stride_x_row,
-    stride_out_row,
-    EPS: _tl.constexpr,
-    D: _tl.constexpr,
-):
-    """One program per row. Computes y = (x / sqrt(mean(x^2) + eps)) * weight."""
-    row = _tl.program_id(0)
-    cols = _tl.arange(0, D)
-    x = _tl.load(X_PTR + row * stride_x_row + cols).to(_tl.float32)
-    var = _tl.sum(x * x, axis=0) / D
-    rstd = 1.0 / _tl.sqrt(var + EPS)
-    w = _tl.load(W_PTR + cols).to(_tl.float32)
-    y = (x * rstd) * w
-    _tl.store(OUT_PTR + row * stride_out_row + cols, y.to(OUT_PTR.dtype.element_ty))
-
-
-@_triton.jit
-def _rmsnorm_add_kernel(
-    X_PTR,
-    RES_PTR,
-    W_PTR,
-    OUT_PTR,
-    RES_OUT_PTR,
-    stride_x_row,
-    stride_res_row,
-    stride_out_row,
-    stride_res_out_row,
-    EPS: _tl.constexpr,
-    D: _tl.constexpr,
-):
-    """One program per row. residual_out = x + residual; y = rmsnorm(residual_out) * weight."""
-    row = _tl.program_id(0)
-    cols = _tl.arange(0, D)
-    x = _tl.load(X_PTR + row * stride_x_row + cols).to(_tl.float32)
-    r = _tl.load(RES_PTR + row * stride_res_row + cols).to(_tl.float32)
-    s = x + r
-    var = _tl.sum(s * s, axis=0) / D
-    rstd = 1.0 / _tl.sqrt(var + EPS)
-    w = _tl.load(W_PTR + cols).to(_tl.float32)
-    y = (s * rstd) * w
-    _tl.store(
-        RES_OUT_PTR + row * stride_res_out_row + cols,
-        s.to(RES_OUT_PTR.dtype.element_ty),
-    )
-    _tl.store(OUT_PTR + row * stride_out_row + cols, y.to(OUT_PTR.dtype.element_ty))
-
-
-def _rmsnorm_triton(x: torch.Tensor, weight: torch.Tensor, eps: float) -> torch.Tensor:
-    """Triton RMSNorm. x: [N, D]; weight: [D]. D must be a power of two for now
-    (Mistral-3 hidden=4096 satisfies)."""
-    out = torch.empty_like(x)
-    N, D = x.shape
-    _rmsnorm_kernel[(N,)](
-        x,
-        weight,
-        out,
-        x.stride(0),
-        out.stride(0),
-        EPS=eps,
-        D=D,
-    )
-    return out
-
-
-def _rmsnorm_add_triton(
-    x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, eps: float
-):
-    """Triton fused (x + residual) -> RMSNorm. Returns (out, residual_out)."""
-    out = torch.empty_like(x)
-    res_out = torch.empty_like(residual)
-    N, D = x.shape
-    _rmsnorm_add_kernel[(N,)](
-        x,
-        residual,
-        weight,
-        out,
-        res_out,
-        x.stride(0),
-        residual.stride(0),
-        out.stride(0),
-        res_out.stride(0),
-        EPS=eps,
-        D=D,
-    )
-    return out, res_out
-
-
-def _check_triton_rmsnorm_dim(dim: int) -> None:
-    if (dim & (dim - 1)) != 0 or dim > 16384:
-        raise RuntimeError(
-            f"gfx1201 triton RMSNorm requires power-of-two trailing dim "
-            f"<= 16384; got dim={dim}. No torch fallback in this build."
-        )
-
-
 @torch_compile_guard()
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
@@ -174,8 +83,9 @@ def rmsnorm2d_fwd_(
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     if _is_gfx1201_layernorm():
-        _check_triton_rmsnorm_dim(dim)
-        return _rmsnorm_triton(x, weight, eps).view(ori_shape)
+        # gfx1201: aiter's HIP rmsnorm has no gfx1201 code object. Use aiter's
+        # triton rms_norm (handles arbitrary trailing dims) instead.
+        return _aiter_triton_rms_norm(x, weight, eps).view(ori_shape)
     return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
 
 
@@ -186,9 +96,14 @@ def rmsnorm2d_fwd_with_add_(
     ori_shape = x.shape
     x = x.reshape(-1, dim)
     if _is_gfx1201_layernorm():
-        _check_triton_rmsnorm_dim(dim)
+        # gfx1201: see comment in rmsnorm2d_fwd_. Same dispatch reason; use
+        # the lean inference variant (skips autograd Function).
         res_in = residual.reshape(-1, dim)
-        out, res_out = _rmsnorm_add_triton(x, weight, res_in, eps)
+        out = torch.empty_like(x)
+        res_out = torch.empty_like(res_in)
+        # rsigma is required by the kernel API but unused in inference
+        rsigma = torch.empty(x.shape[0], dtype=torch.float32, device=x.device)
+        _aiter_triton_rmsnorm_with_add(out, x, res_in, res_out, weight, rsigma, eps)
         return out.view(ori_shape), res_out.view(ori_shape)
     out = torch.empty_like(x)
     residual_out = torch.empty_like(x)
