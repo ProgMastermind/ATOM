@@ -304,7 +304,10 @@ class GenericParser(QuantConfigParser):
                 if (m, n) == (1, 128):
                     return QuantType.per_1x128
                 if (m, n) == (128, 128):
-                    return QuantType.per_128x128
+                    # per_128x128 enum has no consumers in linear.py / GEMM dispatch yet;
+                    # the per_1x128 path already allocates a (out//128, in//128)
+                    # scale grid which is exactly the (128, 128) block layout.
+                    return QuantType.per_1x128
                 if (m, n) == (1, 32):
                     return QuantType.per_1x32
                 return QuantType.per_1x128
