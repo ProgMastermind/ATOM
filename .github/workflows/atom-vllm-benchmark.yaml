@@ -1090,6 +1090,30 @@ jobs:
           if [[ "${OOT_EXTRA_ARGS}" == *"--trust-remote-code"* ]]; then
             TRUST_REMOTE_CODE_ARG="--trust-remote-code"
           fi
+          SANITIZED_BENCH_EXTRA_ARGS="$(
+            BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS:-}" python3 - <<'PY'
+          import os
+          import shlex
+
+          tokens = shlex.split(os.environ.get("BENCH_EXTRA_ARGS", ""))
+          sanitized = []
+          idx = 0
+          while idx < len(tokens):
+              token = tokens[idx]
+              if token == "--random-range-ratio":
+                  idx += 2
+                  continue
+              if token.startswith("--random-range-ratio="):
+                  idx += 1
+                  continue
+              sanitized.append(token)
+              idx += 1
+          print(" ".join(shlex.quote(token) for token in sanitized))
+          PY
+          )"
+          if [[ "${SANITIZED_BENCH_EXTRA_ARGS}" != "${BENCH_EXTRA_ARGS:-}" ]]; then
+            echo "Sanitized BENCH_EXTRA_ARGS by removing duplicate --random-range-ratio override."
+          fi
 
           {
             echo "=== Benchmark config: ${MODEL_NAME} ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RANDOM_RANGE_RATIO} CLIENT=${BENCH_CLIENT} ==="
@@ -1100,7 +1124,7 @@ jobs:
                 -e CONC="${CONC}" \
                 -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
                 -e RESULT_FILENAME="${RESULT_FILENAME}" \
-                -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+                -e BENCH_EXTRA_ARGS="${SANITIZED_BENCH_EXTRA_ARGS}" \
                 "$CONTAINER_NAME" bash -lc "
                   set -euo pipefail
                   rm -rf \"${CONTAINER_RESULT_DIR}\"
@@ -1125,7 +1149,7 @@ jobs:
                     --save-result \
                     --result-dir \"${CONTAINER_RESULT_DIR}\" \
                     --result-filename \"${RESULT_FILENAME}.json\" \
-                    ${BENCH_EXTRA_ARGS:-}
+                    ${SANITIZED_BENCH_EXTRA_ARGS:-}
                 "
             else
               $CONTAINER_ENGINE exec \
@@ -1134,7 +1158,7 @@ jobs:
                 -e CONC="${CONC}" \
                 -e RANDOM_RANGE_RATIO="${RANDOM_RANGE_RATIO}" \
                 -e RESULT_FILENAME="${RESULT_FILENAME}" \
-                -e BENCH_EXTRA_ARGS="${BENCH_EXTRA_ARGS}" \
+                -e BENCH_EXTRA_ARGS="${SANITIZED_BENCH_EXTRA_ARGS}" \
                 "$CONTAINER_NAME" bash -lc "
                   set -euo pipefail
                   rm -rf \"${CONTAINER_RESULT_DIR}\"
@@ -1157,7 +1181,7 @@ jobs:
                     --percentile-metrics=\"ttft,tpot,itl,e2el\" \
                     --result-dir=\"${CONTAINER_RESULT_DIR}\" \
                     --result-filename=\"${RESULT_FILENAME}.json\" \
-                    ${BENCH_EXTRA_ARGS:-}
+                    ${SANITIZED_BENCH_EXTRA_ARGS:-}
                 "
             fi
           } > "./${RESULT_FILENAME}.client.log" 2>&1
