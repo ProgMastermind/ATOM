@@ -1839,10 +1839,32 @@ class DeepseekV4Attention(nn.Module):
         # contribution carried in by the value-side RoPE of the KV entries.
         self.rotary_emb.inverse(positions, o[..., -rd:])
         # ----- Grouped output LoRA (batched on the full flat tensor) -----
+        # Pre-allocate wo_b's input as `(num_tokens, n_local_groups * o_lora_rank)`
+        # row-major contiguous, then view it as `(g, s, r)` and pass that view as
+        # `out=` to `torch.bmm`. hipBLAS strided-batched GEMM writes via the given
+        # strides directly into the underlying flat `(s, g·r)` buffer — no copy.
+        #
+        # The previous `torch.einsum("sgd,grd->sgr", ...).flatten(1)` path
+        # produced a non-contig `(s, g, r)` (lazy permute after bmm), and the
+        # `flatten(1)` then forced a `.contiguous()` — launching one extra
+        # `direct_copy_kernel_cuda<BFloat16>` per layer per forward. Same
+        # underlying hipBLAS Tensile BMM kernel runs in both paths; we just
+        # eliminate the post-copy.
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
-        o = torch.einsum("sgd,grd->sgr", o, wo_a)
-        x = self.wo_b(o.flatten(1))
+        wo_b_in = torch.empty(
+            num_tokens,
+            self.n_local_groups * self.o_lora_rank,
+            dtype=o.dtype,
+            device=o.device,
+        )
+        wo_b_in_view = wo_b_in.view(
+            num_tokens, self.n_local_groups, self.o_lora_rank
+        ).transpose(0, 1)
+        # bmm wants (B, M, K) @ (B, K, N) → (B, M, N). Both inputs as non-contig
+        # views are fine (hipBLAS uses our strides); no .contiguous() forced.
+        torch.bmm(o.transpose(0, 1), wo_a.transpose(1, 2), out=wo_b_in_view)
+        x = self.wo_b(wo_b_in)
         return x
 
     def _fill_csa_paged_compress(
