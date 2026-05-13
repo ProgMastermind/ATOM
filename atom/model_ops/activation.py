@@ -3,8 +3,6 @@
 
 import torch
 import torch.nn.functional as F
-import triton as _triton
-import triton.language as _tl
 from aiter import (
     QuantType,
     silu_and_mul,
@@ -14,53 +12,6 @@ from atom.config import QuantizationConfig
 from atom.quant_spec import LayerQuantConfig
 from torch import nn
 from typing import Optional
-
-# --- gfx1201 fallback: triton SiLU + Mul (replaces forward_native) ---------
-
-
-@_triton.jit
-def _silu_mul_kernel(
-    X_PTR,
-    OUT_PTR,
-    stride_x_row,
-    stride_out_row,
-    HALF_D: _tl.int32,
-    BLOCK_D: _tl.constexpr,
-):
-    """For each row: out = silu(x[..., :HALF_D]) * x[..., HALF_D:]. Iterates
-    over D in BLOCK_D chunks so HALF_D need not be a power of two."""
-    row = _tl.program_id(0)
-    block_start = _tl.program_id(1) * BLOCK_D
-    cols = block_start + _tl.arange(0, BLOCK_D)
-    mask = cols < HALF_D
-    a = _tl.load(X_PTR + row * stride_x_row + cols, mask=mask, other=0.0).to(
-        _tl.float32
-    )
-    b = _tl.load(X_PTR + row * stride_x_row + HALF_D + cols, mask=mask, other=0.0).to(
-        _tl.float32
-    )
-    silu_a = a * (1.0 / (1.0 + _tl.exp(-a)))
-    out = (silu_a * b).to(OUT_PTR.dtype.element_ty)
-    _tl.store(OUT_PTR + row * stride_out_row + cols, out, mask=mask)
-
-
-def _silu_mul_triton(x: torch.Tensor) -> torch.Tensor:
-    """Triton SiLU+Mul. x: [N, 2*HALF_D]; output: [N, HALF_D]. HALF_D can be
-    arbitrary (kernel uses masked block iteration)."""
-    N, full_d = x.shape
-    half = full_d // 2
-    out = torch.empty((N, half), dtype=x.dtype, device=x.device)
-    BLOCK_D = 1024
-    grid = (N, _triton.cdiv(half, BLOCK_D))
-    _silu_mul_kernel[grid](
-        x,
-        out,
-        x.stride(0),
-        out.stride(0),
-        HALF_D=half,
-        BLOCK_D=BLOCK_D,
-    )
-    return out
 
 
 def _is_gfx1201_act() -> bool:
@@ -143,10 +94,19 @@ class SiluAndMul(nn.Module):
     def forward(
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        # gfx1201 (RDNA4): aiter prebuilt silu_and_mul HIP kernel has no gfx1201
-        # code object. Triton kernel is the only path (handles non-pow2 D).
+        # gfx1201 (RDNA4): aiter prebuilt silu_and_mul HIP kernel has no
+        # gfx1201 code object (CDNA-only v_pk_mul_f32). Use the portable
+        # triton silu_and_mul added in aiter PR #3168 (which mirrors the
+        # HIP signature out=fn(x)).
         if _is_gfx1201_act():
-            return _silu_mul_triton(x)
+            from aiter.ops.triton.activation import (
+                silu_and_mul as _aiter_silu_mul_triton,
+            )
+
+            half = x.shape[-1] // 2
+            out = torch.empty((*x.shape[:-1], half), dtype=x.dtype, device=x.device)
+            _aiter_silu_mul_triton(out, x)
+            return out
         # fp8 quantization
         if x_scale is not None and self.fused_quant:
             from aiter.ops.triton.fused_fp8_quant import (
