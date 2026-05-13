@@ -64,6 +64,26 @@ This creates 24 symlinks from `gfx1201-*.json` to `gfx1250-*.json` in
 `atom/model_ops/linear.py`) so it works even without this step, but
 Mistral-3 needs it for full perf.
 
+
+## Optional perf env: lm_head FP8 (gfx1201)
+
+`ATOM_GFX1201_LM_HEAD_FP8=1` (default on for gfx1201) lazily quantizes the
+lm_head weight to per-row FP8 on first forward and routes it through the same
+triton FP8 GEMM as qkv/o/gate_up/down. Halves the lm_head weight bandwidth
+(vocab × hidden × 2 → 1 byte/elem). Combined with the per-shape
+`gemm_a8w8` retune and the Triton Q/K RoPE reshape (all in commit
+`gfx1201: speed up native triton decode path`), end-to-end measured
+**+10-19% TPOT across BS=1..16** with **no accuracy loss**:
+
+| Model | BS=1 | BS=8 | BS=16 | gsm8k n=200 |
+|---|---:|---:|---:|---:|
+| Ministral-3-8B | 22.1 → **18.4 ms** | 26.5 → **21.6 ms** | 30.8 → **27.6 ms** | 0.765 → **0.83** |
+| Qwen3-8B-FP8 | 21.7 → **18.5 ms** | 24.0 → **21.6 ms** | 28.8 → **23.4 ms** | 0.925 → **0.90** |
+
+Set `ATOM_GFX1201_LM_HEAD_FP8=0` to opt out (preserves the BF16 hipBLASLt
+lm_head path). Skipped automatically when lm_head shares storage with
+embed_tokens (tied-embeddings models).
+
 ## Required env vars
 
 ```bash
