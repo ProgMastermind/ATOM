@@ -579,6 +579,7 @@ def sparse_attn_indexer_plugin_mode(
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
     weights_scale: float,
+    is_neox_style: bool,
 ) -> torch.Tensor:
     try:
         from vllm.forward_context import (
@@ -641,7 +642,7 @@ def sparse_attn_indexer_plugin_mode(
             scale_fmt,
             weights_scale,
             preshuffle=preshuffle_cache,
-            is_neox=True,
+            is_neox=is_neox_style,
         )
         weights = weights_out
     elif fuse_k_norm_rope_cache:
@@ -658,7 +659,7 @@ def sparse_attn_indexer_plugin_mode(
             quant_block_size,
             scale_fmt,
             preshuffle=preshuffle_cache,
-            is_neox=True,
+            is_neox=is_neox_style,
         )
     else:
         indexer_k_quant_and_cache(
@@ -816,6 +817,7 @@ def sparse_attn_indexer_fake(
     cos_cache: torch.Tensor,
     sin_cache: torch.Tensor,
     weights_scale: float,
+    is_neox_style: bool,
 ) -> torch.Tensor:
     # profile run
     # NOTE(Chen): create the max possible flattened_kv. So that
