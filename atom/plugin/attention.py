@@ -175,6 +175,10 @@ class vllmAiterAttentionBackendMethods:
     def is_mla(cls) -> bool:
         return False
 
+    @classmethod
+    def is_ssm(cls) -> bool:
+        return False
+
     @staticmethod
     def get_required_kv_cache_layout():
         return None
@@ -1418,6 +1422,10 @@ class vllmAiterMLABackendMethods:
     def is_mla(cls) -> bool:
         return True
 
+    @classmethod
+    def is_ssm(cls) -> bool:
+        return False
+
     @staticmethod
     def get_required_kv_cache_layout():
         return None
@@ -2089,6 +2097,10 @@ class vllmAiterMLASparseBackendMethods:
     @classmethod
     def is_sparse(cls) -> bool:
         return True
+
+    @classmethod
+    def is_ssm(cls) -> bool:
+        return False
 
     @staticmethod
     def get_required_kv_cache_layout():
