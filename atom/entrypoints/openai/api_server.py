@@ -47,7 +47,6 @@ from .serving_chat import (
 from .serving_anthropic import (
     AnthropicMessagesRequest,
     anthropic_to_openai_messages,
-    anthropic_to_openai_tools,
     build_anthropic_response,
     stream_content_block_delta,
     stream_content_block_start,
@@ -55,6 +54,7 @@ from .serving_anthropic import (
     stream_message_delta,
     stream_message_start,
     stream_message_stop,
+    stream_signature_delta,
 )
 from .serving_completion import (
     build_completion_response,
@@ -804,14 +804,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
         messages = [ChatMessage(**m) for m in openai_messages]
 
-        openai_tools = anthropic_to_openai_tools(request.tools)
-
         merged_kwargs = dict(default_chat_template_kwargs)
         prompt = apply_chat_template(
             tokenizer,
             custom_message_encoder,
             [msg.to_template_dict() for msg in messages],
-            tools=openai_tools,
+            tools=None,
             **merged_kwargs,
         )
 
@@ -833,7 +831,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                 max_ctx = engine.config.max_model_len
             except AttributeError:
                 max_ctx = 16384
-        headroom = min(request.max_tokens, max_ctx // 2)
+        headroom = min(request.max_tokens, max_ctx // 4)
         max_input = max_ctx - headroom
         if input_tokens > max_input:
             logger.warning(
@@ -883,23 +881,15 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                                 continue
 
                             if field == "reasoning_content":
-                                if not started_thinking:
-                                    yield stream_content_block_start(
-                                        block_index, "thinking"
-                                    )
-                                    started_thinking = True
-                                yield stream_content_block_delta(
-                                    block_index, text, "thinking"
-                                )
+                                pass
                             else:
                                 # Phase 2: Tool call detection on content
                                 events = tool_parser.process(text)
                                 for etype, edata in events:
                                     if etype == "content":
                                         if started_thinking and not started_text:
-                                            yield stream_content_block_stop(
-                                                block_index
-                                            )
+                                            yield stream_signature_delta(block_index)
+                                            yield stream_content_block_stop(block_index)
                                             block_index += 1
                                         if not started_text:
                                             yield stream_content_block_start(
@@ -913,15 +903,12 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                                         has_tool_calls = True
                                         stop_reason = "tool_use"
                                         if started_text:
-                                            yield stream_content_block_stop(
-                                                block_index
-                                            )
+                                            yield stream_content_block_stop(block_index)
                                             block_index += 1
                                             started_text = False
                                         elif started_thinking:
-                                            yield stream_content_block_stop(
-                                                block_index
-                                            )
+                                            yield stream_signature_delta(block_index)
+                                            yield stream_content_block_stop(block_index)
                                             block_index += 1
                                             started_thinking = False
                                         fn = edata.get("function", {})
@@ -948,9 +935,8 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                                 if etype == "content":
                                     if not started_text:
                                         if started_thinking:
-                                            yield stream_content_block_stop(
-                                                block_index
-                                            )
+                                            yield stream_signature_delta(block_index)
+                                            yield stream_content_block_stop(block_index)
                                             block_index += 1
                                             started_thinking = False
                                         yield stream_content_block_start(
@@ -964,9 +950,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
                                     has_tool_calls = True
                                     stop_reason = "tool_use"
                                     if started_text:
-                                        yield stream_content_block_stop(
-                                            block_index
-                                        )
+                                        yield stream_content_block_stop(block_index)
                                         block_index += 1
                                         started_text = False
                                     fn = edata.get("function", {})
@@ -989,6 +973,7 @@ async def anthropic_messages(request: AnthropicMessagesRequest, raw_request: Req
 
                             if not started_text and not has_tool_calls:
                                 if started_thinking:
+                                    yield stream_signature_delta(block_index)
                                     yield stream_content_block_stop(block_index)
                                     block_index += 1
                                 yield stream_content_block_start(block_index, "text")

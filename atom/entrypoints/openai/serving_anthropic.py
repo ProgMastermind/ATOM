@@ -175,10 +175,16 @@ def build_anthropic_response(
     content = []
 
     if reasoning_content:
+        import base64
+        import hashlib
+        import os
+
+        sig = base64.b64encode(hashlib.sha256(os.urandom(32)).digest()).decode()
         content.append(
             {
                 "type": "thinking",
                 "thinking": reasoning_content,
+                "signature": sig,
             }
         )
 
@@ -269,7 +275,7 @@ def stream_content_block_start(
     tool_name: str = "",
 ) -> str:
     if block_type == "thinking":
-        block = {"type": "thinking", "thinking": ""}
+        block = {"type": "thinking", "thinking": "", "signature": ""}
     elif block_type == "tool_use":
         block = {
             "type": "tool_use",
@@ -302,6 +308,23 @@ def stream_content_block_delta(index: int, text: str, block_type: str = "text") 
             "type": "content_block_delta",
             "index": index,
             "delta": delta,
+        },
+    )
+
+
+def stream_signature_delta(index: int) -> str:
+    """Emit a signature_delta for thinking blocks (required by Claude Code)."""
+    import base64
+    import hashlib
+    import os
+
+    dummy_sig = base64.b64encode(hashlib.sha256(os.urandom(32)).digest()).decode()
+    return format_sse(
+        "content_block_delta",
+        {
+            "type": "content_block_delta",
+            "index": index,
+            "delta": {"type": "signature_delta", "signature": dummy_sig},
         },
     )
 
