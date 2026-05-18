@@ -587,7 +587,7 @@ class MLAAttentionImplPluginModeMethods:
         paged_kv_indptr = attn_metadata.plugin_metadata.decode.paged_kv_indptr
         paged_kv_indices = attn_metadata.plugin_metadata.decode.paged_kv_indices
 
-        mla_decode_fwd(
+        _, lse = mla_decode_fwd(
             q,
             kv_buffer.view(-1, 1, 1, q.shape[-1]),
             o,
@@ -605,10 +605,11 @@ class MLAAttentionImplPluginModeMethods:
             reduce_partial_map=reduce_partial_map,
             q_scale=layer._q_scale,
             kv_scale=layer._k_scale,
+            return_lse=getattr(self, "need_to_return_lse_for_decode", False),
         )
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :]
-        return o, None
+        return o, lse
 
     def forward_impl_plugin_mode(
         self,
@@ -671,6 +672,9 @@ class MLAAttentionImplPluginModeMethods:
 
         if self.dcp_world_size == -1:
             self.dcp_world_size = get_dcp_group().world_size
+            self.need_to_return_lse_for_decode = (
+                self.dcp_world_size > 1 and self.can_return_lse_for_decode
+            )
 
         fp8_attention = self.kv_cache_dtype.startswith("fp8")
 
@@ -909,15 +913,22 @@ def _mla_plugin_mode_init(self, *args, **kwargs):
             MLACommonMetadataBuilder,
         )
 
+        vllm_config = get_current_vllm_config()
         self.supports_quant_query_input = False
-        self.dcp_world_size: int = -1
+        self.dcp_world_size = getattr(
+            vllm_config.parallel_config, "decode_context_parallel_size", -1
+        )
+        self.can_return_lse_for_decode = True
+        self.need_to_return_lse_for_decode = (
+            self.dcp_world_size > 1 and self.can_return_lse_for_decode
+        )
         self.chunked_prefill_workspace_size = (
             MLACommonMetadataBuilder.determine_chunked_prefill_workspace_size(
-                get_current_vllm_config()
+                vllm_config
             )
         )
         self.cp_kv_cache_interleave_size: int = (
-            get_current_vllm_config().parallel_config.cp_kv_cache_interleave_size
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
         )
         self.is_aiter_triton_fp4_bmm_enabled = (
             envs.ATOM_USE_TRITON_MXFP4_BMM
