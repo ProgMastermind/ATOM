@@ -134,13 +134,14 @@ CHECK_EOF
 }
 
 pick_decode_nodes() {
-    local my_hostname num_needed
+    local my_hostname my_short num_needed
     my_hostname=$(get_local_hostname)
+    my_short="${my_hostname%%.*}"
     num_needed=${NUM_DECODE_NODES}
     local node_list=${PD_NODE_LIST:?"PD_NODE_LIST must be set (comma-separated hostnames)"}
 
     echo "========== Picking ${num_needed} decode node(s) =========="
-    echo "Coordinator (prefill): ${my_hostname}"
+    echo "Coordinator (prefill): ${my_hostname} (short: ${my_short})"
     echo "Candidate nodes: ${node_list}"
     echo ""
 
@@ -150,7 +151,8 @@ pick_decode_nodes() {
     IFS=',' read -ra NODES <<< "$node_list"
     for node in "${NODES[@]}"; do
         node=$(echo "$node" | xargs)
-        if [ "$node" = "$my_hostname" ]; then
+        local node_short="${node%%.*}"
+        if [ "$node_short" = "$my_short" ]; then
             echo "  ${node}: SELF (prefill)"
             continue
         fi

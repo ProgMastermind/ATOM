@@ -363,9 +363,12 @@ jobs:
           docker stop atom-benchmark || true
           docker rm atom-benchmark || true
 
-  # ========== PD Disaggregation Benchmark (multi-node) ==========
-  # Runs after single-node benchmarks finish to avoid resource contention.
-  # The coordinator lands on any node, SSH-picks N peers for decode.
+  # ========== PD Disaggregation Benchmark (multi-node, no SSH) ===========
+  # Uses separate GitHub Actions jobs for prefill and decode nodes.
+  # Prefill uploads its IP as an artifact; decode polls and downloads it.
+  # Both jobs use the same runner label — since the prefill job is still
+  # running when decode starts, they are guaranteed to land on different
+  # runners.
 
   parse-pd-params:
     name: Parse PD parameter lists
@@ -411,6 +414,7 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       models_json: ${{ steps.load.outputs.models_json }}
+      decode_matrix_json: ${{ steps.load.outputs.decode_matrix_json }}
     steps:
       - uses: actions/checkout@v6
       - id: load
@@ -419,8 +423,26 @@ jobs:
           echo "models_json=${MODELS}" >> $GITHUB_OUTPUT
           echo "Loaded $(echo "$MODELS" | jq length) PD model config(s)"
 
-  pd-benchmark:
-    name: PD ${{ matrix.model.display }} (isl=${{ matrix.config.input_length }} osl=${{ matrix.config.output_length }} c=${{ matrix.config.concurrency }})
+          # Expand models into per-decode-node entries for the decode matrix
+          DECODE_MATRIX=$(python3 -c "
+          import json
+          models = json.load(open('.github/benchmark/pd_models.json'))
+          decode_entries = []
+          for m in models:
+              num_decode = m.get('num_decode_nodes', 1)
+              for i in range(num_decode):
+                  entry = dict(m)
+                  entry['decode_index'] = i
+                  entry['consumer_port'] = 8004 + i
+                  decode_entries.append(entry)
+          print(json.dumps(decode_entries))
+          ")
+          echo "decode_matrix_json=${DECODE_MATRIX}" >> $GITHUB_OUTPUT
+          echo "Decode matrix: $(echo "$DECODE_MATRIX" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)),"entries")')"
+
+  # ── Prefill node: proxy + producer + benchmark runner ──────────────
+  pd-prefill:
+    name: PD-Prefill ${{ matrix.model.display }}
     needs: [parse-pd-params, load-pd-models]
     if: >-
       !cancelled()
@@ -431,7 +453,6 @@ jobs:
       max-parallel: 1
       matrix:
         model: ${{ fromJson(needs.load-pd-models.outputs.models_json) }}
-        config: ${{ fromJson(needs.parse-pd-params.outputs.matrix_json) }}
 
     runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || 'atom-mi355-8gpu.predownload' }}
     timeout-minutes: 120
@@ -439,68 +460,21 @@ jobs:
     env:
       MODEL_PATH: ${{ matrix.model.path }}
       PREFILL_ARGS: ${{ matrix.model.prefill_args }}
-      DECODE_ARGS: ${{ matrix.model.decode_args }}
-      NUM_DECODE_NODES: ${{ matrix.model.num_decode_nodes || '1' }}
-      ISL: ${{ matrix.config.input_length }}
-      OSL: ${{ matrix.config.output_length }}
-      CONC: ${{ matrix.config.concurrency }}
-      RANDOM_RANGE_RATIO: ${{ matrix.config.random_range_ratio }}
-      RESULT_FILENAME: ${{ matrix.model.prefix }}-${{ matrix.config.input_length }}-${{ matrix.config.output_length }}-${{ matrix.config.concurrency }}-${{ matrix.config.random_range_ratio }}
       ATOM_DOCKER_IMAGE: ${{ inputs.image || 'rocm/atom-dev:latest' }}
-      PD_NODE_LIST: ${{ secrets.PD_NODE_LIST }}
 
     steps:
-      - name: Validate PD_NODE_LIST secret
+      - name: Clean up previous runs
         run: |
-          if [ -z "${{ secrets.PD_NODE_LIST }}" ]; then
-            echo "::error::Secret PD_NODE_LIST is not set."
-            echo "Set it to comma-separated CI node hostnames, e.g.:"
-            echo "  mia1-p01-g33,mia1-p01-g34,mia1-p01-g40,mia1-p01-g41,mia1-p01-g42,mia1-p01-g45"
-            exit 1
-          fi
-
-      - name: Clean up previous local runs
-        run: |
-          echo "=== Hostname: $(hostname) ==="
+          echo "=== Prefill node: $(hostname) ==="
           containers=$(docker ps -q)
-          if [ -n "$containers" ]; then
-            docker kill $containers || true
-          fi
+          [ -n "$containers" ] && docker kill $containers || true
           docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
             rocm/pytorch:latest bash -lc "find /workspace -mindepth 1 -delete" || true
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
 
-      - name: Setup SSH
-        run: |
-          mkdir -p ~/.ssh && chmod 700 ~/.ssh
-          if [ -n "${{ secrets.PD_SSH_KEY }}" ]; then
-            echo "${{ secrets.PD_SSH_KEY }}" > ~/.ssh/id_rsa
-            chmod 600 ~/.ssh/id_rsa
-          fi
-          IFS=',' read -ra NODES <<< "$PD_NODE_LIST"
-          for node in "${NODES[@]}"; do
-            ssh-keyscan -H "$(echo "$node" | xargs)" >> ~/.ssh/known_hosts 2>/dev/null || true
-          done
-
-      - name: Pick decode nodes
-        id: nodes
-        run: |
-          NUM_DECODE_NODES=${{ env.NUM_DECODE_NODES }} \
-          bash .github/scripts/atom_pd_test.sh pick-nodes
-
-      - name: Clean up decode nodes
-        run: |
-          DECODE_HOSTS="${{ steps.nodes.outputs.DECODE_HOSTS }}"
-          IFS=',' read -ra HOSTS <<< "$DECODE_HOSTS"
-          for i in "${!HOSTS[@]}"; do
-            echo "Cleaning decode node: ${HOSTS[$i]}"
-            ssh -o StrictHostKeyChecking=no "${HOSTS[$i]}" \
-              "docker stop atom-pd-consumer-${i} 2>/dev/null; docker rm atom-pd-consumer-${i} 2>/dev/null" || true
-          done
-
-      - name: Start local CI container (proxy + producer)
+      - name: Start prefill container
         run: |
           DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
           MODEL_MOUNT=""
@@ -508,7 +482,6 @@ jobs:
           IB_FLAG=""
           [ -e "/dev/infiniband" ] && IB_FLAG="--device=/dev/infiniband"
 
-          # NIC detection for RDMA userspace libs (ported from mori)
           NIC_MOUNTS=""
           NIC_TYPE="mlx5"
           if [ -d /sys/class/infiniband ]; then
@@ -542,23 +515,15 @@ jobs:
             -e ATOM_DISABLE_MMAP=true \
             -e NCCL_SOCKET_IFNAME=lo \
             -e AITER_LOG_LEVEL=WARNING \
-            -e DECODE_HOSTS="${{ steps.nodes.outputs.DECODE_HOSTS }}" \
-            -e NUM_DECODE_NODES=${{ env.NUM_DECODE_NODES }} \
-            -e PREFILL_ARGS="${{ matrix.model.prefill_args }}" \
-            -e DECODE_ARGS="${{ matrix.model.decode_args }}" \
-            -e ATOM_DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}" \
-            -e ISL=${{ env.ISL }} -e OSL=${{ env.OSL }} \
-            -e CONC=${{ env.CONC }} -e RANDOM_RANGE_RATIO=${{ env.RANDOM_RANGE_RATIO }} \
-            -v ~/.ssh:/root/.ssh:ro \
             --name atom-pd-prefill \
-            ${{ inputs.image || 'rocm/atom-dev:latest' }}
+            ${{ env.ATOM_DOCKER_IMAGE }}
 
       - name: Collect GPU info
         id: gpu-info
         run: |
           RUNNER_HINT="${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || 'atom-mi355-8gpu.predownload' }}"
           bash .github/scripts/collect_gpu_info.sh atom-pd-prefill docker "$RUNNER_HINT"
-          DOCKER_IMAGE="${{ inputs.image || 'rocm/atom-dev:latest' }}"
+          DOCKER_IMAGE="${{ env.ATOM_DOCKER_IMAGE }}"
           if [ "$DOCKER_IMAGE" = "rocm/atom-dev:latest" ]; then
             RESOLVED_IMAGE=""
             if RESOLUTION_JSON="$(python3 .github/scripts/resolve_atom_image.py --repository rocm/atom-dev --reference-tag latest --image-family native 2>/dev/null)"; then
@@ -567,55 +532,143 @@ jobs:
             DOCKER_IMAGE="${RESOLVED_IMAGE:-$DOCKER_IMAGE}"
           fi
           echo "docker_image=${DOCKER_IMAGE}" >> $GITHUB_OUTPUT
-          echo "Docker: ${DOCKER_IMAGE}"
 
-      - name: Download model (prefill node)
+      - name: Download model
         run: |
           if [ -d "/models" ]; then
             docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-pd-prefill bash -lc \
               "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}" || exit 1
           fi
 
-      - name: Install PD dependencies (prefill node)
+      - name: Install PD dependencies
         run: |
           docker exec atom-pd-prefill bash -lc \
-            "apt-get update -qq && apt --fix-broken install -y > /dev/null 2>&1; \
-             apt-get install -y -qq openssh-client curl > /dev/null && \
-             pip install msgpack msgspec quart mooncake-transfer-engine"
+            "pip install msgpack msgspec quart mooncake-transfer-engine"
 
-      - name: Launch all PD components
+      - name: Start proxy and producer
+        run: |
+          if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
+          else model_path="${{ env.MODEL_PATH }}"; fi
+
+          PROXY_IP=$(hostname -I | awk '{print $1}')
+          echo "Prefill IP: ${PROXY_IP}"
+
+          docker exec atom-pd-prefill bash -lc "
+            set -euo pipefail
+            PROXY_IP=${PROXY_IP}
+            PROXY_PORT=10001
+            PRODUCER_PORT=8003
+            DISCOVERY_PORT=36367
+
+            echo '========== Starting Proxy on ${PROXY_IP}:10001 =========='
+            PYTHONUNBUFFERED=1 python -m atom.kv_transfer.disaggregation.proxy \
+              --port 10001 > /tmp/atom_proxy.log 2>&1 &
+            echo \$! > /tmp/atom_proxy.pid
+            sleep 2
+
+            KV_CONFIG='{
+              \"kv_role\": \"kv_producer\",
+              \"kv_connector\": \"mooncake\",
+              \"proxy_ip\": \"${PROXY_IP}\",
+              \"proxy_ping_port\": 36367,
+              \"http_port\": 8003
+            }'
+
+            echo '========== Starting Producer on port 8003 =========='
+            rm -rf ~/.cache/atom/*
+            ATOM_DISABLE_MMAP=true NCCL_SOCKET_IFNAME=lo AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
+              python -m atom.entrypoints.openai_server \
+                --model $model_path \
+                --server-port 8003 \
+                --kv-transfer-config \"\$KV_CONFIG\" \
+                ${{ matrix.model.prefill_args }} ${{ inputs.extra_args || '' }} \
+                > /tmp/atom_producer.log 2>&1 &
+            echo \$! > /tmp/atom_producer.pid
+          "
+
+          # Upload proxy IP for decode node(s) to discover
+          echo "${PROXY_IP}" > /tmp/pd_proxy_ip.txt
+          echo "${{ matrix.model.prefix }}" >> /tmp/pd_proxy_ip.txt
+
+      - name: Upload proxy IP
+        uses: actions/upload-artifact@v7
+        with:
+          name: pd-proxy-ip-${{ matrix.model.prefix }}
+          path: /tmp/pd_proxy_ip.txt
+          overwrite: true
+
+      - name: Wait for producer health
+        timeout-minutes: 45
+        run: |
+          echo "Waiting for producer at http://localhost:8003/health ..."
+          for i in $(seq 1 45); do
+            if curl -sf http://localhost:8003/health -o /dev/null --max-time 10 2>/dev/null; then
+              echo "Producer healthy after $((i * 60))s"
+              break
+            fi
+            [ "$i" -eq 45 ] && echo "ERROR: Producer not healthy after 45min" && exit 1
+            echo "  Not ready ($i/45), retrying in 60s..."
+            sleep 60
+          done
+
+      - name: Wait for consumer to connect and warmup
+        timeout-minutes: 30
+        run: |
+          echo "Waiting for consumer to register via proxy warmup..."
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:10001/v1/completions \
+                -H "Content-Type: application/json" \
+                -d '{"model":"${{ env.MODEL_PATH }}","prompt":"hi","max_tokens":1}' \
+                -o /dev/null --max-time 120 2>/dev/null; then
+              echo "Proxy warmup succeeded — consumer is connected (after $((i * 30))s)"
+              break
+            fi
+            [ "$i" -eq 60 ] && echo "ERROR: Consumer did not connect after 30min" && exit 1
+            echo "  Proxy not ready ($i/60), retrying in 30s..."
+            sleep 30
+          done
+
+      - name: Run PD benchmarks
         timeout-minutes: 60
         run: |
           if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
           else model_path="${{ env.MODEL_PATH }}"; fi
 
-          docker exec atom-pd-prefill bash -lc "set -euo pipefail
-            .github/scripts/atom_pd_test.sh launch-all $model_path ${{ inputs.extra_args || '' }}"
+          CONFIGS_JSON='${{ needs.parse-pd-params.outputs.matrix_json }}'
+          echo "Running benchmarks for configs: ${CONFIGS_JSON}"
 
-      - name: Run PD benchmark
-        timeout-minutes: 30
+          echo "$CONFIGS_JSON" | python3 -c "
+          import json, sys
+          for c in json.load(sys.stdin):
+              print('{input_length}|{output_length}|{concurrency}|{random_range_ratio}'.format(**c))
+          " > /tmp/pd_configs.txt
+
+          while IFS='|' read -r ISL OSL CONC RRR; do
+            RESULT_FILENAME="${{ matrix.model.prefix }}-${ISL}-${OSL}-${CONC}-${RRR}"
+            echo ""
+            echo "========== Benchmark: ISL=${ISL} OSL=${OSL} CONC=${CONC} =========="
+            docker exec atom-pd-prefill bash -lc "set -euo pipefail
+              ISL=${ISL} OSL=${OSL} CONC=${CONC} RANDOM_RANGE_RATIO=${RRR} \
+              RESULT_FILENAME=${RESULT_FILENAME} \
+              PREFILL_ARGS='${{ matrix.model.prefill_args }}' \
+              DECODE_ARGS='${{ matrix.model.decode_args }}' \
+              NUM_DECODE_NODES=${{ matrix.model.num_decode_nodes || '1' }} \
+              BENCH_EXTRA_ARGS='${{ matrix.model.bench_args }}' \
+              .github/scripts/atom_pd_test.sh benchmark $model_path" || echo "::warning::Benchmark failed for ISL=${ISL} OSL=${OSL} CONC=${CONC}"
+          done < /tmp/pd_configs.txt
+
+      - name: Inject GPU metadata into results
         run: |
-          if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
-          else model_path="${{ env.MODEL_PATH }}"; fi
-
-          docker exec atom-pd-prefill bash -lc "set -euo pipefail
-            RESULT_FILENAME=${{ env.RESULT_FILENAME }} \
-            PREFILL_ARGS='${{ matrix.model.prefill_args }}' \
-            DECODE_ARGS='${{ matrix.model.decode_args }}' \
-            NUM_DECODE_NODES=${{ env.NUM_DECODE_NODES }} \
-            BENCH_EXTRA_ARGS='${{ matrix.model.bench_args }}' \
-            .github/scripts/atom_pd_test.sh benchmark $model_path"
-
-      - name: Inject GPU metadata into PD result
-        run: |
-          docker exec \
-            -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
-            -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
-            -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
-            -e DOCKER_IMAGE="${{ steps.gpu-info.outputs.docker_image }}" \
-            -e RESULT_PATH="${{ env.RESULT_FILENAME }}.json" \
-            -e DISPLAY_NAME="${{ matrix.model.display }}" \
-            atom-pd-prefill python3 -c "
+          for f in ${{ matrix.model.prefix }}-*.json; do
+            [ -f "$f" ] || continue
+            docker exec \
+              -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
+              -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
+              -e ROCM_VERSION="${{ steps.gpu-info.outputs.rocm_version }}" \
+              -e DOCKER_IMAGE="${{ steps.gpu-info.outputs.docker_image }}" \
+              -e RESULT_PATH="$f" \
+              -e DISPLAY_NAME="${{ matrix.model.display }}" \
+              atom-pd-prefill python3 -c "
           import json, os
           p = os.environ['RESULT_PATH']
           if not os.path.exists(p):
@@ -633,6 +686,15 @@ jobs:
               with open(p, 'w') as f:
                   json.dump(d, f, indent=2)
           "
+          done
+
+      - name: Upload benchmark done signal
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: pd-done-${{ matrix.model.prefix }}
+          path: /tmp/pd_proxy_ip.txt
+          overwrite: true
 
       - name: Dump proxy log
         if: always()
@@ -642,53 +704,206 @@ jobs:
         if: always()
         run: docker exec atom-pd-prefill cat /tmp/atom_producer.log 2>/dev/null || true
 
-      - name: Dump consumer logs (remote)
+      - name: Upload PD benchmark results
         if: always()
-        run: |
-          DECODE_HOSTS="${{ steps.nodes.outputs.DECODE_HOSTS }}"
-          IFS=',' read -ra HOSTS <<< "$DECODE_HOSTS"
-          for i in "${!HOSTS[@]}"; do
-            echo "========== Consumer-${i} (${HOSTS[$i]}) =========="
-            ssh -o StrictHostKeyChecking=no "${HOSTS[$i]}" \
-              "docker exec atom-pd-consumer-${i} cat /tmp/atom_consumer.log 2>/dev/null" || echo "(no log)"
-          done
-
-      - name: Upload PD benchmark result
         uses: actions/upload-artifact@v7
         with:
-          name: benchmark-${{ env.RESULT_FILENAME }}
-          path: ${{ env.RESULT_FILENAME }}.json
-
-      - name: Stop all PD components
-        if: always()
-        run: |
-          docker exec \
-            -e DECODE_HOSTS="${{ steps.nodes.outputs.DECODE_HOSTS }}" \
-            -e NUM_DECODE_NODES=${{ env.NUM_DECODE_NODES }} \
-            atom-pd-prefill bash -lc \
-            ".github/scripts/atom_pd_test.sh stop-all" || true
+          name: benchmark-pd-${{ matrix.model.prefix }}
+          path: ${{ matrix.model.prefix }}-*.json
+          if-no-files-found: ignore
 
       - name: Clean up
         if: always()
         run: |
-          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
-            ${{ inputs.image || 'rocm/atom-dev:latest' }} bash -lc "rm -rf /workspace/atom/ /workspace/aiter/" || true
-          docker stop atom-pd-prefill || true
-          docker rm atom-pd-prefill || true
+          docker stop atom-pd-prefill 2>/dev/null || true
+          docker rm atom-pd-prefill 2>/dev/null || true
 
-          DECODE_HOSTS="${{ steps.nodes.outputs.DECODE_HOSTS }}"
-          if [ -n "$DECODE_HOSTS" ]; then
-            IFS=',' read -ra HOSTS <<< "$DECODE_HOSTS"
-            for i in "${!HOSTS[@]}"; do
-              ssh -o StrictHostKeyChecking=no "${HOSTS[$i]}" \
-                "docker stop atom-pd-consumer-${i} 2>/dev/null; docker rm atom-pd-consumer-${i} 2>/dev/null" || true
+  # ── Decode node(s): consumer (launched concurrently with prefill) ───
+  # The decode matrix is expanded so each decode_index gets its own job.
+  # For a model with num_decode_nodes=2, two decode jobs run on two
+  # different runners simultaneously.
+  pd-decode:
+    name: PD-Decode ${{ matrix.entry.display }} #${{ matrix.entry.decode_index }}
+    needs: [load-pd-models]
+    if: >-
+      !cancelled()
+      && needs.load-pd-models.result == 'success'
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJson(needs.load-pd-models.outputs.decode_matrix_json) }}
+
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || 'atom-mi355-8gpu.predownload' }}
+    timeout-minutes: 120
+
+    env:
+      MODEL_PATH: ${{ matrix.entry.path }}
+      DECODE_ARGS: ${{ matrix.entry.decode_args }}
+      CONSUMER_PORT: ${{ matrix.entry.consumer_port }}
+      DECODE_INDEX: ${{ matrix.entry.decode_index }}
+      ATOM_DOCKER_IMAGE: ${{ inputs.image || 'rocm/atom-dev:latest' }}
+
+    steps:
+      - name: Clean up previous runs
+        run: |
+          echo "=== Decode node: $(hostname) ==="
+          containers=$(docker ps -q)
+          [ -n "$containers" ] && docker kill $containers || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
+            rocm/pytorch:latest bash -lc "find /workspace -mindepth 1 -delete" || true
+
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+
+      - name: Wait for proxy IP artifact
+        timeout-minutes: 10
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Polling for proxy IP artifact (pd-proxy-ip-${{ matrix.entry.prefix }})..."
+          for i in $(seq 1 60); do
+            if gh run download ${{ github.run_id }} \
+                -n "pd-proxy-ip-${{ matrix.entry.prefix }}" \
+                -D /tmp/proxy-ip 2>/dev/null; then
+              PROXY_IP=$(head -1 /tmp/proxy-ip/pd_proxy_ip.txt)
+              echo "Got proxy IP: ${PROXY_IP}"
+              echo "PROXY_IP=${PROXY_IP}" >> $GITHUB_ENV
+              break
+            fi
+            [ "$i" -eq 60 ] && echo "ERROR: Timed out waiting for proxy IP" && exit 1
+            echo "  Artifact not ready ($i/60), retrying in 10s..."
+            sleep 10
+          done
+
+      - name: Start decode container
+        run: |
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "--device /dev/dri")
+          MODEL_MOUNT=""
+          [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
+          IB_FLAG=""
+          [ -e "/dev/infiniband" ] && IB_FLAG="--device=/dev/infiniband"
+
+          NIC_MOUNTS=""
+          NIC_TYPE="mlx5"
+          if [ -d /sys/class/infiniband ]; then
+            for dev in /sys/class/infiniband/*; do
+              name=$(basename "$dev")
+              case "$name" in bnxt_re*) NIC_TYPE="bnxt"; break ;; ionic*) NIC_TYPE="ionic"; break ;; esac
             done
           fi
+          if [ "$NIC_TYPE" = "bnxt" ]; then
+            for c in /usr/lib64/libibverbs.so.1 /lib/x86_64-linux-gnu/libibverbs.so.1 /usr/lib/x86_64-linux-gnu/libibverbs.so.1; do
+              resolved=$(readlink -f "$c" 2>/dev/null || true)
+              if [ -f "$resolved" ]; then NIC_MOUNTS="$NIC_MOUNTS -v $resolved:/lib/x86_64-linux-gnu/libibverbs.so.1"; break; fi
+            done
+            for lib in /usr/local/lib/libbnxt_re-rdmav*.so; do
+              [ -f "$lib" ] && NIC_MOUNTS="$NIC_MOUNTS -v $lib:/usr/lib/x86_64-linux-gnu/libibverbs/$(basename $lib)"
+            done
+            for lib in /usr/local/lib/libbnxt_re.so; do
+              [ -f "$lib" ] && NIC_MOUNTS="$NIC_MOUNTS -v $lib:/usr/lib/x86_64-linux-gnu/$(basename $lib)"
+            done
+            [ -d /etc/libibverbs.d ] && NIC_MOUNTS="$NIC_MOUNTS -v /etc/libibverbs.d:/etc/libibverbs.d:ro"
+          fi
+
+          docker run -dt --device=/dev/kfd $DEVICE_FLAG $IB_FLAG \
+            $NIC_MOUNTS \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
+            -w /workspace --ipc=host --group-add video \
+            --shm-size=16G --privileged --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
+            --network=host \
+            -e ATOM_DISABLE_MMAP=true \
+            -e NCCL_SOCKET_IFNAME=lo \
+            -e AITER_LOG_LEVEL=WARNING \
+            --name atom-pd-consumer-${{ env.DECODE_INDEX }} \
+            ${{ env.ATOM_DOCKER_IMAGE }}
+
+      - name: Download model
+        run: |
+          if [ -d "/models" ]; then
+            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-pd-consumer-${{ env.DECODE_INDEX }} bash -lc \
+              "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}" || exit 1
+          fi
+
+      - name: Install PD dependencies
+        run: |
+          docker exec atom-pd-consumer-${{ env.DECODE_INDEX }} bash -lc \
+            "pip install msgpack msgspec quart mooncake-transfer-engine"
+
+      - name: Start consumer
+        run: |
+          if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
+          else model_path="${{ env.MODEL_PATH }}"; fi
+
+          KV_CONFIG="{
+            \"kv_role\": \"kv_consumer\",
+            \"kv_connector\": \"mooncake\",
+            \"proxy_ip\": \"${PROXY_IP}\",
+            \"proxy_ping_port\": 36367,
+            \"http_port\": ${{ env.CONSUMER_PORT }}
+          }"
+
+          echo "========== Starting Consumer #${{ env.DECODE_INDEX }} on port ${{ env.CONSUMER_PORT }} =========="
+          echo "Proxy IP: ${PROXY_IP}"
+
+          docker exec atom-pd-consumer-${{ env.DECODE_INDEX }} bash -lc "
+            rm -rf ~/.cache/atom/*
+            ATOM_DISABLE_MMAP=true NCCL_SOCKET_IFNAME=lo AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
+              python -m atom.entrypoints.openai_server \
+                --model $model_path \
+                --server-port ${{ env.CONSUMER_PORT }} \
+                --kv-transfer-config '${KV_CONFIG}' \
+                ${{ matrix.entry.decode_args }} \
+                > /tmp/atom_consumer.log 2>&1 &
+            echo \$! > /tmp/atom_consumer.pid
+          "
+
+      - name: Wait for consumer health
+        timeout-minutes: 45
+        run: |
+          echo "Waiting for consumer #${{ env.DECODE_INDEX }} at http://localhost:${{ env.CONSUMER_PORT }}/health ..."
+          for i in $(seq 1 45); do
+            if curl -sf http://localhost:${{ env.CONSUMER_PORT }}/health -o /dev/null --max-time 10 2>/dev/null; then
+              echo "Consumer healthy after $((i * 60))s"
+              break
+            fi
+            [ "$i" -eq 45 ] && echo "ERROR: Consumer not healthy after 45min" && exit 1
+            echo "  Not ready ($i/45), retrying in 60s..."
+            sleep 60
+          done
+
+      - name: Wait for prefill to finish benchmarks
+        timeout-minutes: 90
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          echo "Consumer is running. Waiting for prefill job to complete..."
+          for i in $(seq 1 180); do
+            if gh run download ${{ github.run_id }} \
+                -n "pd-done-${{ matrix.entry.prefix }}" \
+                -D /tmp/pd-done 2>/dev/null; then
+              echo "Prefill job signaled done after $((i * 30))s"
+              break
+            fi
+            [ "$i" -eq 180 ] && echo "Timed out waiting for prefill, exiting"
+            sleep 30
+          done
+
+      - name: Dump consumer log
+        if: always()
+        run: docker exec atom-pd-consumer-${{ env.DECODE_INDEX }} cat /tmp/atom_consumer.log 2>/dev/null || true
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker stop atom-pd-consumer-${{ env.DECODE_INDEX }} 2>/dev/null || true
+          docker rm atom-pd-consumer-${{ env.DECODE_INDEX }} 2>/dev/null || true
 
   summarize-benchmark-result:
     if: always()
     name: Summarize benchmark result
-    needs: [benchmark, pd-benchmark]
+    needs: [benchmark, pd-prefill, pd-decode]
     runs-on: ubuntu-latest
     outputs:
       has_regression: ${{ steps.check-regression.outputs.has_regression }}
