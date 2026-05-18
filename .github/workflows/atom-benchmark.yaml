@@ -154,7 +154,16 @@ jobs:
           if event == "schedule":
               filtered = models
           else:
-              filtered = [m for m in models if inputs.get(m["prefix"], True)]
+              def is_enabled(m):
+                  key = m.get("input_key") or m["prefix"]
+                  if key in inputs:
+                      return inputs[key]
+                  # suffix variants (e.g. prefix-mtp3): check base prefix
+                  base = m["prefix"]
+                  if base in inputs:
+                      return inputs[base]
+                  return True
+              filtered = [m for m in models if is_enabled(m)]
           with open(os.environ["GITHUB_OUTPUT"], "a") as f:
               f.write(f"models_json={json.dumps(filtered)}\n")
           print(f"Event={event}: {len(filtered)}/{len(models)} models enabled")
@@ -382,6 +391,8 @@ jobs:
       matrix_json: ${{ steps.parse.outputs.matrix_json }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
       - name: Parse PD parameter lists
         id: parse
         run: |
@@ -417,37 +428,102 @@ jobs:
       decode_matrix_json: ${{ steps.load.outputs.decode_matrix_json }}
     steps:
       - uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
       - id: load
         run: |
-          MODELS=$(jq -c . .github/benchmark/pd_models.json)
-          echo "models_json=${MODELS}" >> $GITHUB_OUTPUT
-          echo "Loaded $(echo "$MODELS" | jq length) PD model config(s)"
+          # Add model_index and prev_model_prefix for sequential scheduling
+          python3 << 'PY'
+          import json, os
 
-          # Expand models into per-decode-node entries for the decode matrix
-          DECODE_MATRIX=$(python3 -c "
-          import json
           models = json.load(open('.github/benchmark/pd_models.json'))
+          for i, m in enumerate(models):
+              m['model_index'] = i
+              m['prev_model_prefix'] = models[i - 1]['prefix'] if i > 0 else ''
+
           decode_entries = []
           for m in models:
               num_decode = m.get('num_decode_nodes', 1)
-              for i in range(num_decode):
+              for j in range(num_decode):
                   entry = dict(m)
-                  entry['decode_index'] = i
-                  entry['consumer_port'] = 8004 + i
+                  entry['decode_index'] = j
+                  entry['consumer_port'] = 8004 + j
                   decode_entries.append(entry)
-          print(json.dumps(decode_entries))
-          ")
-          echo "decode_matrix_json=${DECODE_MATRIX}" >> $GITHUB_OUTPUT
-          echo "Decode matrix: $(echo "$DECODE_MATRIX" | python3 -c 'import json,sys; print(len(json.load(sys.stdin)),"entries")')"
+
+          with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
+              f.write(f"models_json={json.dumps(models)}\n")
+              f.write(f"decode_matrix_json={json.dumps(decode_entries)}\n")
+
+          print(f"Loaded {len(models)} PD model(s), {len(decode_entries)} decode entries (sequential scheduling)")
+          PY
+
+  # ── IP round-trip validation (1 runner, no GPU) ───────────────────
+  # Smoke test: a single runner reports its IP via artifact, then
+  # downloads the same artifact back and verifies the value.
+  pd-ip-test:
+    name: PD IP round-trip test
+    if: >-
+      !cancelled()
+      && (github.event_name == 'schedule'
+          || inputs.pd-benchmark != false)
+    needs: [benchmark]
+    runs-on: atom-mi355-8gpu.predownload
+    timeout-minutes: 5
+    steps:
+      - name: Report IP
+        id: report
+        run: |
+          MY_IP=$(hostname -I | awk '{print $1}')
+          echo "Runner: $(hostname)"
+          echo "IP: ${MY_IP}"
+          echo "ip=${MY_IP}" >> $GITHUB_OUTPUT
+          mkdir -p /tmp/ip-test
+          echo "${MY_IP}" > /tmp/ip-test/ip.txt
+
+      - name: Upload IP artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: pd-ip-test
+          path: /tmp/ip-test/ip.txt
+          overwrite: true
+
+      - name: Download IP artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          for i in $(seq 1 10); do
+            if gh run download ${{ github.run_id }} \
+                -n "pd-ip-test" \
+                -D /tmp/ip-download 2>/dev/null; then
+              echo "Artifact downloaded on attempt $i"
+              break
+            fi
+            echo "  Retry ($i/10)..."
+            sleep 5
+          done
+
+      - name: Verify round-trip
+        run: |
+          ORIGINAL="${{ steps.report.outputs.ip }}"
+          DOWNLOADED=$(cat /tmp/ip-download/ip.txt)
+          echo "Original IP:   ${ORIGINAL}"
+          echo "Downloaded IP: ${DOWNLOADED}"
+          if [ "$ORIGINAL" = "$DOWNLOADED" ]; then
+            echo "IP round-trip OK"
+          else
+            echo "ERROR: IP mismatch!"
+            exit 1
+          fi
 
   # ── Prefill node: proxy + producer + benchmark runner ──────────────
   pd-prefill:
     name: PD-Prefill ${{ matrix.model.display }}
-    needs: [parse-pd-params, load-pd-models]
+    needs: [parse-pd-params, load-pd-models, pd-ip-test]
     if: >-
       !cancelled()
       && needs.parse-pd-params.result == 'success'
       && needs.load-pd-models.result == 'success'
+      && needs.pd-ip-test.result == 'success'
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -473,6 +549,26 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
+
+      - name: Report and upload proxy IP
+        id: proxy-ip
+        run: |
+          PROXY_IP=$(hostname -I | awk '{print $1}')
+          echo "Prefill runner: $(hostname)"
+          echo "Prefill IP: ${PROXY_IP}"
+          echo "proxy_ip=${PROXY_IP}" >> $GITHUB_OUTPUT
+          mkdir -p /tmp/pd-ip
+          echo "${PROXY_IP}" > /tmp/pd-ip/pd_proxy_ip.txt
+          echo "${{ matrix.model.prefix }}" >> /tmp/pd-ip/pd_proxy_ip.txt
+
+      - name: Upload proxy IP
+        uses: actions/upload-artifact@v7
+        with:
+          name: pd-proxy-ip-${{ matrix.model.prefix }}
+          path: /tmp/pd-ip/pd_proxy_ip.txt
+          overwrite: true
 
       - name: Start prefill container
         run: |
@@ -550,7 +646,7 @@ jobs:
           if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
           else model_path="${{ env.MODEL_PATH }}"; fi
 
-          PROXY_IP=$(hostname -I | awk '{print $1}')
+          PROXY_IP="${{ steps.proxy-ip.outputs.proxy_ip }}"
           echo "Prefill IP: ${PROXY_IP}"
 
           docker exec atom-pd-prefill bash -lc "
@@ -585,17 +681,6 @@ jobs:
                 > /tmp/atom_producer.log 2>&1 &
             echo \$! > /tmp/atom_producer.pid
           "
-
-          # Upload proxy IP for decode node(s) to discover
-          echo "${PROXY_IP}" > /tmp/pd_proxy_ip.txt
-          echo "${{ matrix.model.prefix }}" >> /tmp/pd_proxy_ip.txt
-
-      - name: Upload proxy IP
-        uses: actions/upload-artifact@v7
-        with:
-          name: pd-proxy-ip-${{ matrix.model.prefix }}
-          path: /tmp/pd_proxy_ip.txt
-          overwrite: true
 
       - name: Wait for producer health
         timeout-minutes: 45
@@ -693,7 +778,7 @@ jobs:
         uses: actions/upload-artifact@v7
         with:
           name: pd-done-${{ matrix.model.prefix }}
-          path: /tmp/pd_proxy_ip.txt
+          path: /tmp/pd-ip/pd_proxy_ip.txt
           overwrite: true
 
       - name: Dump proxy log
@@ -722,12 +807,15 @@ jobs:
   # The decode matrix is expanded so each decode_index gets its own job.
   # For a model with num_decode_nodes=2, two decode jobs run on two
   # different runners simultaneously.
+  # Sequential scheduling: decode jobs for model N wait for model N-1's
+  # done signal before starting, so models run one at a time.
   pd-decode:
     name: PD-Decode ${{ matrix.entry.display }} #${{ matrix.entry.decode_index }}
-    needs: [load-pd-models]
+    needs: [load-pd-models, pd-ip-test]
     if: >-
       !cancelled()
       && needs.load-pd-models.result == 'success'
+      && needs.pd-ip-test.result == 'success'
     strategy:
       fail-fast: false
       matrix:
@@ -754,6 +842,28 @@ jobs:
 
       - name: Checkout ATOM repo
         uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
+
+      - name: Wait for previous model to complete
+        if: matrix.entry.prev_model_prefix != ''
+        timeout-minutes: 120
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          PREV_PREFIX="${{ matrix.entry.prev_model_prefix }}"
+          echo "Sequential scheduling: waiting for model '${PREV_PREFIX}' to finish..."
+          for i in $(seq 1 240); do
+            if gh run download ${{ github.run_id }} \
+                -n "pd-done-${PREV_PREFIX}" \
+                -D /tmp/prev-done 2>/dev/null; then
+              echo "Previous model '${PREV_PREFIX}' completed (after $((i * 30))s)"
+              break
+            fi
+            [ "$i" -eq 240 ] && echo "ERROR: Timed out waiting for previous model" && exit 1
+            echo "  Not done ($i/240), retrying in 30s..."
+            sleep 30
+          done
 
       - name: Wait for proxy IP artifact
         timeout-minutes: 10

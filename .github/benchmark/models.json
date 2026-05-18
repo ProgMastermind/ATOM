@@ -113,6 +113,7 @@
     "display": "MiniMax-M2.7-MXFP4",
     "path": "amd/MiniMax-M2.7-MXFP4",
     "prefix": "MiniMax-M2.7-MXFP4",
+    "input_key": "MiniMax-M2.7",
     "args": "--kv_cache_dtype fp8 -tp 1 --trust-remote-code",
     "bench_args": "",
     "suffix": "",
