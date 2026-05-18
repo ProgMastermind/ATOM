@@ -44,6 +44,9 @@ from aiter.dist.parallel_state import (
 )
 from aiter.ops.topk import top_k_per_row_decode, top_k_per_row_prefill
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
+from aiter.ops.triton.quant.fused_fp8_quant import (
+    fused_flatten_fp8_group_quant,
+)
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
@@ -2025,6 +2028,10 @@ class DeepseekV4Attention(nn.Module):
         o = o.view(num_tokens, self.n_local_groups, -1)
         wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
         o = torch.einsum("sgd,grd->sgr", o, wo_a)
+        if self.wo_b.quant_type == QuantType.per_1x128:
+            o, o_scale = fused_flatten_fp8_group_quant(o, group_size=128)
+            x = self.wo_b(o, x_scale=o_scale)
+            return x
         x = self.wo_b(o.flatten(1))
         return x
 
