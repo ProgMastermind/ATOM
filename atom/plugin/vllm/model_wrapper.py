@@ -28,7 +28,10 @@ from vllm.forward_context import (
 )
 
 import atom  # noqa: F401
-from atom.plugin.config import generate_atom_config_for_plugin_mode
+from atom.plugin.config import (
+    _generate_atom_config_from_vllm_config,
+    generate_atom_config_for_plugin_mode,
+)
 from atom.plugin.prepare import _set_framework_backbone
 
 import logging
@@ -126,7 +129,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
-        from atom.config import get_current_atom_config
+        from atom.config import get_current_atom_config, use_custom_atom_config
 
         _set_framework_backbone("vllm")
 
@@ -160,7 +163,7 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             # that draft model has its own compilation config rather than carried 
             # over from main model. Also get the mutated hf_config from main model
             main_atom_config = get_current_atom_config()
-            self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
+            self.atom_config = _generate_atom_config_from_vllm_config(vllm_config)
             self.atom_config.hf_config = main_atom_config.hf_config
         else:
             self.atom_config = generate_atom_config_for_plugin_mode(vllm_config)
@@ -194,7 +197,15 @@ class ATOMModelBase(nn.Module, VllmModel, SupportsQuant, SupportsPP):
             self.atom_config.quant_config.apply_default_exclude_layers(default_excludes)
 
         logger.info(f"Construct ATOM model {model_arch} for vLLM plugin mode")
-        self.model = model_cls(self.atom_config)
+        if self.is_mtp_draft_model:
+            # Draft model's layers read get_current_atom_config() to register their
+            # static_forward_context, so swap out the global atom_config temporarily
+            # with the draft model's atom_config so that the correct forward context
+            # can be registered
+            with use_custom_atom_config(self.atom_config):
+                self.model = model_cls(self.atom_config)
+        else:
+            self.model = model_cls(self.atom_config)
 
         if model_arch in _MTP_MASK_INPUT_ARCH:
             self._adapt_mtp_layers_for_vllm()
