@@ -1688,11 +1688,18 @@ class DeepseekV4Attention(nn.Module):
             self.alt_stream is not None and self.compressor is not None
         )
 
-        self.use_fuse_qk_norm_rope_swa_write = _V4_USE_TRITON_FUSION
-
         self.layer_name = prefix
         atom_config = get_current_atom_config()
         atom_config.compilation_config.static_forward_context[self.layer_name] = self
+
+        spec_method = (
+            atom_config.speculative_config.method
+            if atom_config.speculative_config is not None
+            else None
+        )
+        self.use_fuse_qk_norm_rope_swa_write = (
+            _V4_USE_TRITON_FUSION and spec_method is None
+        )
 
     def process_weights_after_loading(self) -> None:
         """Dequant wo_a (FP8 + e8m0 block scale) → BF16 in place.
