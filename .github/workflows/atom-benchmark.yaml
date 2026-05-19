@@ -491,21 +491,10 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Download IP artifact
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          echo "Polling for artifact pd-ip-test..."
-          for i in $(seq 1 30); do
-            if gh run download ${{ github.run_id }} \
-                -n "pd-ip-test" \
-                -D /tmp/ip-download 2>/dev/null; then
-              echo "Artifact downloaded on attempt $i"
-              break
-            fi
-            [ "$i" -eq 30 ] && echo "ERROR: Timed out" && exit 1
-            echo "  Retry ($i/30)..."
-            sleep 5
-          done
+        uses: actions/download-artifact@v8
+        with:
+          name: pd-ip-test
+          path: /tmp/ip-download
 
       - name: Verify round-trip
         run: |
