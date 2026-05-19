@@ -553,11 +553,10 @@ jobs:
           echo "${{ matrix.model.prefix }}" >> /tmp/pd-ip/pd_proxy_ip.txt
 
       - name: Upload proxy IP
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v3
         with:
           name: pd-proxy-ip-${{ matrix.model.prefix }}
           path: /tmp/pd-ip/pd_proxy_ip.txt
-          overwrite: true
 
       - name: Start prefill container
         run: |
@@ -764,11 +763,10 @@ jobs:
 
       - name: Upload benchmark done signal
         if: always()
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@v3
         with:
           name: pd-done-${{ matrix.model.prefix }}
           path: /tmp/pd-ip/pd_proxy_ip.txt
-          overwrite: true
 
       - name: Dump proxy log
         if: always()
@@ -837,15 +835,11 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           PREV_PREFIX="${{ matrix.entry.prev_model_prefix }}"
-          ARTIFACT_NAME="pd-done-${PREV_PREFIX}"
           echo "Sequential scheduling: waiting for model '${PREV_PREFIX}' to finish..."
           for i in $(seq 1 240); do
-            ARTIFACT_ID=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
-              --jq ".artifacts[] | select(.name==\"${ARTIFACT_NAME}\") | .id" 2>/dev/null) || true
-            if [ -n "$ARTIFACT_ID" ]; then
-              mkdir -p /tmp/prev-done
-              gh api "repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" > /tmp/_prev.zip 2>/dev/null
-              unzip -qo /tmp/_prev.zip -d /tmp/prev-done && rm -f /tmp/_prev.zip
+            if gh run download ${{ github.run_id }} \
+                -n "pd-done-${PREV_PREFIX}" \
+                -D /tmp/prev-done 2>/dev/null; then
               echo "Previous model '${PREV_PREFIX}' completed (after $((i * 30))s)"
               break
             fi
@@ -859,15 +853,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ARTIFACT_NAME="pd-proxy-ip-${{ matrix.entry.prefix }}"
-          echo "Polling for proxy IP artifact (${ARTIFACT_NAME})..."
+          echo "Polling for proxy IP artifact (pd-proxy-ip-${{ matrix.entry.prefix }})..."
           for i in $(seq 1 60); do
-            ARTIFACT_ID=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
-              --jq ".artifacts[] | select(.name==\"${ARTIFACT_NAME}\") | .id" 2>/dev/null) || true
-            if [ -n "$ARTIFACT_ID" ]; then
-              mkdir -p /tmp/proxy-ip
-              gh api "repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" > /tmp/_proxy.zip 2>/dev/null
-              unzip -qo /tmp/_proxy.zip -d /tmp/proxy-ip && rm -f /tmp/_proxy.zip
+            if gh run download ${{ github.run_id }} \
+                -n "pd-proxy-ip-${{ matrix.entry.prefix }}" \
+                -D /tmp/proxy-ip 2>/dev/null; then
               PROXY_IP=$(head -1 /tmp/proxy-ip/pd_proxy_ip.txt)
               echo "Got proxy IP: ${PROXY_IP}"
               echo "PROXY_IP=${PROXY_IP}" >> $GITHUB_ENV
@@ -981,15 +971,11 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ARTIFACT_NAME="pd-done-${{ matrix.entry.prefix }}"
           echo "Consumer is running. Waiting for prefill job to complete..."
           for i in $(seq 1 180); do
-            ARTIFACT_ID=$(gh api "repos/${{ github.repository }}/actions/runs/${{ github.run_id }}/artifacts" \
-              --jq ".artifacts[] | select(.name==\"${ARTIFACT_NAME}\") | .id" 2>/dev/null) || true
-            if [ -n "$ARTIFACT_ID" ]; then
-              mkdir -p /tmp/pd-done
-              gh api "repos/${{ github.repository }}/actions/artifacts/${ARTIFACT_ID}/zip" > /tmp/_done.zip 2>/dev/null
-              unzip -qo /tmp/_done.zip -d /tmp/pd-done && rm -f /tmp/_done.zip
+            if gh run download ${{ github.run_id }} \
+                -n "pd-done-${{ matrix.entry.prefix }}" \
+                -D /tmp/pd-done 2>/dev/null; then
               echo "Prefill job signaled done after $((i * 30))s"
               break
             fi
