@@ -17,16 +17,17 @@ The ATOM vLLM plugin backend keeps the standard vLLM CLI, server APIs, and gener
 ```bash
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export ATOM_USE_CUSTOM_ALL_GATHER=0
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_USE_FLYDSL_GDR=0
 export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
-    --host localhost \
+    --host 0.0.0.0 \
     --port 8000 \
     --tensor-parallel-size 1 \
     --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
     --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --max-model-len 16384 \
     --max-num-batched-tokens 32768 \
@@ -37,16 +38,17 @@ vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
 ```bash
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
 export ATOM_USE_CUSTOM_ALL_GATHER=0
-export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export ATOM_USE_FLYDSL_GDR=0
 export ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE=0
 
 vllm serve Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
-    --host localhost \
+    --host 0.0.0.0 \
     --port 8000 \
     --tensor-parallel-size 1 \
     --kv-cache-dtype fp8 \
-    --gpu_memory_utilization 0.9 \
     --async-scheduling \
+    --load-format fastsafetensors \
+    --trust-remote-code \
     --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}' \
     --max-model-len 16384 \
     --max-num-batched-tokens 32768 \
@@ -59,16 +61,22 @@ Users can use the default vllm bench commands for performance benchmarking.
 
 ```bash
 vllm bench serve \
-    --host localhost \
-    --port 8000 \
+    --backend vllm \
+    --base-url http://127.0.0.1:8000 \
+    --endpoint /v1/completions \
     --model Qwen/Qwen3-Next-80B-A3B-Instruct-FP8 \
     --dataset-name random \
-    --random-input-len 8000 \
-    --random-output-len 1000 \
-    --random-range-ratio 0.8 \
-    --max-concurrency 64 \
-    --num-prompts 640 \
+    --random-input-len 1000 \
+    --random-output-len 100 \
+    --temperature 0.0 \
+    --max-concurrency 4 \
+    --num-prompts 40 \
     --trust_remote_code \
+    --num-warmups 8 \
+    --request-rate inf \
+    --ignore-eos \
+    --disable-tqdm \
+    --save-result \
     --percentile-metrics ttft,tpot,itl,e2el
 ```
 
