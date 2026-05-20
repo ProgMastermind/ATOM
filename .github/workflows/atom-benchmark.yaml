@@ -1212,7 +1212,7 @@ jobs:
             }
 
       - name: Wait for proxy IP artifact
-        timeout-minutes: 10
+        timeout-minutes: 30
         uses: actions/github-script@v7
         with:
           script: |
