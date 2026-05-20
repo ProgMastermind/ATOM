@@ -22,13 +22,6 @@ from atom.utils.forward_context import ForwardContext, get_forward_context
 from torch import nn
 from aiter.dist.parallel_state import get_tp_group
 
-try:
-    gdn_decode_update_fast = importlib.import_module(
-        "atom.model_ops.fla_ops.gdn_decode_fast"
-    ).gdn_decode_update_fast
-except ImportError:
-    gdn_decode_update_fast = None
-
 
 @triton.jit
 def fused_gdn_gating_kernel(
@@ -296,7 +289,6 @@ class GatedDeltaNet(nn.Module):
             gdn_metadata.num_prefills == 0
             and gdn_metadata.num_decodes > 0
             and spec_sequence_masks is None
-            and gdn_decode_update_fast is not None
         )
 
         needs_materialized_gates = (
