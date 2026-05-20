@@ -172,7 +172,7 @@
   {
     "model_name": "Kimi-K2.5-MXFP4 Eagle3",
     "model_path": "amd/Kimi-K2.5-MXFP4",
-    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --trust-remote-code --method eagle3 --draft-model lightseekorg/kimi-k2.5-eagle3 --num-speculative-tokens 3",
+    "extraArgs": "--kv_cache_dtype fp8 -tp 8 --trust-remote-code --method eagle3 --draft-model lightseekorg/kimi-k2.5-eagle3 --num-speculative-tokens 3 --no-enable_prefix_caching",
     "env_vars": "HSA_NO_SCRATCH_RECLAIM=1",
     "runner": "atom-mi355-8gpu.predownload",
     "test_level": "nightly",
