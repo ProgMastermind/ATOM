@@ -263,18 +263,5 @@
     "accuracy_baseline": 0.9598,
     "accuracy_baseline_model": "google/gemma-4-31b-it",
     "_baseline_note": "gsm8k_cot with chat template"
-  },
-  {
-    "model_name": "gemma-4-31b-it-MXFP4",
-    "model_path": "amd/gemma-4-31b-it-MXFP4",
-    "extraArgs": "-tp 8 --trust-remote-code --max-model-len 4096",
-    "env_vars": "",
-    "runner": "atom-mi355-8gpu.predownload",
-    "test_level": "nightly",
-    "accuracy_task": "gsm8k_cot",
-    "accuracy_threshold": 0.92,
-    "accuracy_baseline": 0.9484,
-    "accuracy_baseline_model": "amd/gemma-4-31b-it-MXFP4",
-    "_baseline_note": "gsm8k_cot with chat template"
   }
 ]
