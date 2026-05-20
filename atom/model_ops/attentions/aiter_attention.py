@@ -20,6 +20,7 @@ from atom.plugin.sglang.attention_backend.radix_attention import RadixAttention
 from atom.utils.forward_context import AttentionMetaData, Context
 
 from .backends import AttentionBackend, CommonAttentionBuilder
+from .utils import per_rank_kv_heads
 from atom.plugin.prepare import is_plugin_mode
 from atom.plugin.attention import AiterAttentionMetadataBuilderDecoratorForPluginMode
 from atom.plugin.attention import AiterBackendDecoratorForPluginMode
@@ -83,7 +84,7 @@ class AiterAttentionMetadataBuilder:
         else:
             max_qlen = 1
 
-        num_head_k = max(1, hf_config.num_key_value_heads // get_tp_group().world_size)
+        num_head_k = per_rank_kv_heads(hf_config.num_key_value_heads, get_tp_group().world_size)
         (
             (work_meta_data_size, work_meta_data_type),
             (work_indptr_size, work_indptr_type),
@@ -316,8 +317,8 @@ class AiterAttentionMetadataBuilder:
             num_sliding = len(sliding_idxs) + num_draft_layers
             num_full = len(full_idxs)
 
-            s_kv_heads = max(1, hf_config.num_key_value_heads // runner.world_size)
-            f_kv_heads = max(1, hf_config.num_global_key_value_heads // runner.world_size)
+            s_kv_heads = per_rank_kv_heads(hf_config.num_key_value_heads, runner.world_size)
+            f_kv_heads = per_rank_kv_heads(hf_config.num_global_key_value_heads, runner.world_size)
             s_head_dim = hf_config.head_dim
             f_head_dim = hf_config.global_head_dim
 
@@ -420,8 +421,8 @@ class AiterAttentionMetadataBuilder:
             num_sliding = len(sliding_idxs) + num_draft_layers
             num_full = len(full_idxs)
 
-            s_kv_heads = max(1, hf_config.num_key_value_heads // runner.world_size)
-            f_kv_heads = max(1, hf_config.num_global_key_value_heads // runner.world_size)
+            s_kv_heads = per_rank_kv_heads(hf_config.num_key_value_heads, runner.world_size)
+            f_kv_heads = per_rank_kv_heads(hf_config.num_global_key_value_heads, runner.world_size)
             kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
 
             # Pre-build the layer_id -> (kind, slot) routing map. MTP/draft
@@ -641,12 +642,12 @@ class AiterAttentionMetadataBuilder:
             cache = runner.kv_cache
             scale = runner.kv_scale
             head_dim = hf_config.head_dim
-            kv_heads = max(1, hf_config.num_key_value_heads // runner.world_size)
+            kv_heads = per_rank_kv_heads(hf_config.num_key_value_heads, runner.world_size)
         else:
             cache = runner.kv_cache_full
             scale = runner.kv_scale_full
             head_dim = hf_config.global_head_dim
-            kv_heads = max(1, hf_config.num_global_key_value_heads // runner.world_size)
+            kv_heads = per_rank_kv_heads(hf_config.num_global_key_value_heads, runner.world_size)
 
         x = 16 // cache.element_size()
         k_cache = cache[0, slot].view(

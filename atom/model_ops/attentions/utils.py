@@ -14,6 +14,46 @@ import torch
 _CK_MAX_HEAD_DIM = 256
 
 
+def per_rank_kv_heads(num_heads: int, world_size: int) -> int:
+    """Per-rank KV head count for a sharded attention layer.
+
+    Mirrors ModelRunner._get_num_kv_heads's logic so the assertion behavior
+    is consistent across the (model_runner, KV-cache allocation builder,
+    attention-impl init) call sites. Two regimes:
+
+      * num_heads >= world_size: shard across ranks, requires clean
+        divisibility (`num_heads % world_size == 0`).
+      * num_heads <  world_size: MQA-style replication, requires the
+        inverse divisibility (`world_size % num_heads == 0`).
+
+    Raising in both cases avoids the silent-under-allocation failure mode
+    pointed out by Copilot on the previous `max(1, num_heads // world_size)`
+    sites: that expression rounded TP=non-divisor configs down to 1 head
+    without complaint, then later code allocated KV cache tensors with the
+    wrong shape and triggered cryptic CUDA shape mismatches inside the
+    kernel rather than a clear "TP not supported for this head count"
+    error.
+    """
+    if num_heads >= world_size:
+        if num_heads % world_size != 0:
+            raise ValueError(
+                f"per_rank_kv_heads: num_heads ({num_heads}) is not "
+                f"divisible by world_size ({world_size}); cannot shard "
+                f"the KV heads cleanly. Pick a TP size that divides "
+                f"num_heads, or extend KV-cache allocation to handle "
+                f"uneven sharding."
+            )
+        return num_heads // world_size
+    if world_size % num_heads != 0:
+        raise ValueError(
+            f"per_rank_kv_heads: world_size ({world_size}) is not a "
+            f"multiple of num_heads ({num_heads}); cannot replicate KV "
+            f"heads cleanly. Pick a TP size that's a multiple of "
+            f"num_heads."
+        )
+    return 1
+
+
 def _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
                       softmax_scale, causal, return_lse=False, out=None):
     """PyTorch SDPA fallback for varlen attention when CK is unsupported
