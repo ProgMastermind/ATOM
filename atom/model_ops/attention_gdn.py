@@ -429,4 +429,8 @@ class GatedDeltaNet(nn.Module):
         else:
             core_attn_out[:num_actual_tokens] = core_attn_out_non_spec.squeeze(0)
 
+        # Zero padding tail for CUDA graph replay safety
+        if num_actual_tokens < core_attn_out.shape[0]:
+            core_attn_out[num_actual_tokens:].zero_()
+
         return core_attn_out
