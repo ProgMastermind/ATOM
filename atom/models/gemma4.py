@@ -3,8 +3,10 @@
 
 """Inference-only Gemma 4 model (text-only backbone)."""
 
+from __future__ import annotations
+
 from collections.abc import Iterable
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any, Optional
 
 import torch
 from torch import nn
@@ -14,7 +16,20 @@ from aiter.dist.parallel_state import get_tp_group
 from aiter.rotary_embedding import get_rope
 
 from atom.config import Config, QuantizationConfig
-from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
+
+# `transformers.models.gemma4` was introduced in transformers 5.5.0, but this
+# repo pins `transformers==5.2.0` in pyproject.toml (see #322, which pinned
+# down to avoid a 5.3.0 tokenizer regression). To avoid forcing every other
+# ATOM user to upgrade for Gemma 4 support, we only need Gemma4TextConfig at
+# type-check time — the runtime path receives an already-instantiated config
+# via `atom_config.hf_config`, never the class itself. Combined with
+# `from __future__ import annotations` above this turns the Gemma4TextConfig
+# annotations into strings, so importing this module on transformers 5.2.0
+# no longer fails at import time. Anyone actually instantiating Gemma 4 still
+# needs transformers >= 5.5.0 — that's a runtime requirement enforced by the
+# config loader, not by this module.
+if TYPE_CHECKING:
+    from transformers.models.gemma4.configuration_gemma4 import Gemma4TextConfig
 from atom.model_loader.loader import load_model_in_plugin_mode
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
