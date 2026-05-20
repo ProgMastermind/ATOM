@@ -1097,7 +1097,7 @@ class ModelRunner:
         cudagraph_overhead = self._estimate_cudagraph_overhead()
 
         # Safety margin (2% of total)
-        safety_margin = int(total * 0.04)
+        safety_margin = int(total * 0.05)
 
         # Budget: this server may use up to gpu_memory_utilization * total.
         # Subtract our own PyTorch usage + CUDA graph estimate + safety.
@@ -1109,10 +1109,12 @@ class ModelRunner:
         # In disagg mode, subtract safety_margin again so NCCL/system allocs
         # (e.g. the 512MB NCCL barrier buffer) don't OOM when two processes
         # share the GPU.
-        free_clamp = (
-            free - safety_margin if getattr(config, "enable_disagg", False) else free
-        )
-        available_for_kv = min(available_for_kv, free_clamp)
+        # free_clamp = (
+        #     free - safety_margin if getattr(config, "enable_disagg", False) else free
+        # )
+        # available_for_kv = min(available_for_kv, free_clamp)
+        if getattr(config, "enable_disagg", False):
+            available_for_kv -= safety_margin
 
         torch.set_default_device("cpu")
 
@@ -1695,9 +1697,9 @@ class ModelRunner:
         dynamically each iteration via _optimal_cu_fraction().
         """
         self._prefill_streams = {}
-        # for f in self._CU_POOL_FRACTIONS:
-        #     mask = self._cu_mask_for_fraction(f, upper=False)
-        #     self._prefill_streams[f] = self._stream_with_cu_mask(mask)
+        for f in self._CU_POOL_FRACTIONS:
+            mask = self._cu_mask_for_fraction(f, upper=False)
+            self._prefill_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask)
         self._prefill_streams[None] = torch.cuda.Stream()
         logger.info(
@@ -1713,14 +1715,14 @@ class ModelRunner:
         forward() selects the stream dynamically each iteration.
         """
         self._decode_streams = {}
-        # for f in self._CU_POOL_FRACTIONS:
-        #     mask = self._cu_mask_for_fraction(f, upper=True)
-        #     self._decode_streams[f] = self._stream_with_cu_mask(mask)
+        for f in self._CU_POOL_FRACTIONS:
+            mask = self._cu_mask_for_fraction(f, upper=True)
+            self._decode_streams[f] = self._stream_with_cu_mask(mask)
         # Full-CU fallback (no mask)
         self._decode_streams[None] = torch.cuda.Stream()
         #torch.cuda.set_stream(self._decode_streams[None])
         self._model_fwd_event = torch.cuda.Event()
-        #self._done_event = torch.cuda.Event()
+        self._done_event = torch.cuda.Event()
         logger.info(
             f"Decode stream pool created: fractions={list(self._decode_streams.keys())}"
         )
@@ -2085,14 +2087,10 @@ class ModelRunner:
     @torch.inference_mode()
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         decode_streams = getattr(self, "_decode_streams", None)
-        # Only use a CU-masked stream when a non-None fraction is requested.
-        # CUDAGraphs are captured on the default stream; replaying them on a
-        # different stream hangs on ROCm/HIP, so the None-fraction (full-CU)
-        # path must stay on the default stream.
         if decode_streams is not None:
-            #torch.cuda.current_stream().synchronize()
-            stream = decode_streams[None]
-            #stream.wait_event(self._done_event)
+            self._done_event.record()
+            stream = decode_streams[batch.cu_stream_fraction]
+            stream.wait_event(self._done_event)
             with torch.cuda.stream(stream):
                 input_ids, temperatures, top_ks, top_ps, all_greedy = (
                     self.prepare_model(batch)
