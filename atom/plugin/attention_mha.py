@@ -54,6 +54,16 @@ def _sdpa_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k,
     # tensors instead of launching one SDPA per sequence from Python.
     num_kv_heads = k.shape[1]
     if num_heads_q != num_kv_heads:
+        # GQA expansion via repeat_interleave assumes num_heads_q is an
+        # integer multiple of num_kv_heads. Validate explicitly so a
+        # malformed model config fails loudly here instead of silently
+        # producing the wrong head mapping downstream.
+        if num_kv_heads == 0 or num_heads_q % num_kv_heads != 0:
+            raise ValueError(
+                f"Invalid GQA head configuration in _sdpa_varlen_attn: "
+                f"num_heads_q ({num_heads_q}) must be a positive multiple "
+                f"of num_kv_heads ({num_kv_heads})."
+            )
         rep = num_heads_q // num_kv_heads
         k = k.repeat_interleave(rep, dim=1)
         v = v.repeat_interleave(rep, dim=1)
