@@ -42,16 +42,22 @@ def build_entries(
         except (OSError, json.JSONDecodeError):
             continue
 
-        # Extract accuracy scores
+        # Lookup model config for threshold and baseline. We need the config
+        # before extracting scores because the accuracy task can be overridden
+        # per-model in models_accuracy.json (e.g. Gemma 4 uses gsm8k_cot).
+        cfg = model_configs.get(model_name, {})
+        accuracy_task = cfg.get("accuracy_task", "gsm8k")
+
+        # Extract accuracy scores. lm_eval keys results by the task name,
+        # so models with accuracy_task=gsm8k_cot land under results["gsm8k_cot"]
+        # rather than results["gsm8k"]. Read the configured task to avoid
+        # silently dropping non-default tasks from the dashboard.
         results = data.get("results", {})
-        gsm8k = results.get("gsm8k", {})
-        score = gsm8k.get("exact_match,flexible-extract")
+        task_results = results.get(accuracy_task, {})
+        score = task_results.get("exact_match,flexible-extract")
         if score is None:
             continue
-        strict_score = gsm8k.get("exact_match,strict-match")
-
-        # Lookup model config for threshold and baseline
-        cfg = model_configs.get(model_name, {})
+        strict_score = task_results.get("exact_match,strict-match")
 
         # Build extra metadata
         extra_parts = []
@@ -102,10 +108,10 @@ def build_entries(
         except (TypeError, ValueError):
             pass
 
-        # Include num_fewshot: check configs.gsm8k first, then top-level config
+        # Include num_fewshot: check configs.<task> first, then top-level config
         lm_config = data.get("config", {})
         task_configs = data.get("configs", {})
-        num_fewshot = task_configs.get("gsm8k", {}).get("num_fewshot") or lm_config.get(
+        num_fewshot = task_configs.get(accuracy_task, {}).get("num_fewshot") or lm_config.get(
             "num_fewshot"
         )
         if num_fewshot is not None:
