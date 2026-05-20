@@ -566,6 +566,18 @@ jobs:
           fi
           score=$(jq --arg task "$RESULT_TASK" --arg metric "$RESULT_METRIC" \
             '.results[$task][$metric]' "$result_file")
+          # jq returns the literal string "null" (not an empty string) when the
+          # task/metric path is missing. awk's numeric comparison then treats
+          # "null" as 0, which turns a missing-key bug into a confusing
+          # "score (0) < threshold (0.93)" accuracy failure. Catch this here
+          # with a clearer error so model_name / accuracy_task mismatches
+          # surface obviously.
+          if [ -z "$score" ] || [ "$score" = "null" ]; then
+            echo "ERROR: missing accuracy score in $result_file for task '$RESULT_TASK', metric '$RESULT_METRIC'."
+            echo "       Check that the model entry's accuracy_task matches the lm_eval task key in the result JSON:"
+            jq '.results | keys' "$result_file" 2>/dev/null || true
+            exit 2
+          fi
           echo "Score ($RESULT_TASK / $RESULT_METRIC): $score"
 
           # Read threshold from models_accuracy.json (via env var to avoid shell injection)
