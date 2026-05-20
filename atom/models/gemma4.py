@@ -535,9 +535,28 @@ class Gemma4ForCausalLM(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         **model_kwargs: dict[str, Any],
     ) -> torch.Tensor:
+        # Pipeline parallelism: non-first PP ranks receive hidden_states via
+        # `intermediate_tensors` instead of input_ids. Gemma4Model.forward does
+        # not yet implement the PP-rank split (no make_layers, no
+        # `if get_pp_group().is_first_rank` branch), so PP > 1 is unsupported
+        # for this model today. Fail loudly here instead of crashing in
+        # embed_tokens(None) inside Gemma4Model.
+        if intermediate_tensors is not None:
+            raise NotImplementedError(
+                "Gemma4ForCausalLM does not support pipeline parallelism yet "
+                "(received intermediate_tensors from a previous PP rank, but "
+                "Gemma4Model.forward does not implement the rank-split / "
+                "IntermediateTensors path). Use tensor parallelism only."
+            )
+        # Forward inputs_embeds through so the plugin's get_input_embeddings()
+        # path (used e.g. by vLLM's spec-decode and multimodal preprocessing
+        # even on a single PP rank) reaches Gemma4Model's existing
+        # `if inputs_embeds is not None` branch instead of getting silently
+        # dropped and re-embedding None.
         hidden_states = self.model(
             input_ids=input_ids,
             positions=positions,
+            inputs_embeds=inputs_embeds,
             **model_kwargs,
         )
         return hidden_states
