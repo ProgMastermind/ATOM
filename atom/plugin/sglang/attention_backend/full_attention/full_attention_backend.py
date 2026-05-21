@@ -77,6 +77,7 @@ try:
 except ImportError:
     pass
 
+
 class ATOMAttnBackendForSgl(AiterAttnBackend):
     """ATOM's custom attention backend for sglang plugin mode.
 

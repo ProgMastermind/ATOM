@@ -133,9 +133,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
                 if q_scale is not None
                 else attn.q_proj(q_input)
             )
-        return _unwrap_linear_output(q).view(
-            -1, attn.num_local_heads, attn.qk_head_dim
-        )
+        return _unwrap_linear_output(q).view(-1, attn.num_local_heads, attn.qk_head_dim)
 
     def _forward_absorbed(
         self,
@@ -160,14 +158,15 @@ class SGLangDeepseekMLAAttention(nn.Module):
         q = self._project_q(q_input, q_scale)
         k_nope = kv_c_normed.unsqueeze(1)
         k_pe = k_pe.unsqueeze(1)
-        q_nope, q_pe = q.split(
-            [attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1
-        )
+        q_nope, q_pe = q.split([attn.qk_nope_head_dim, attn.qk_rope_head_dim], dim=-1)
         q_nope_out = mla_absorbed_bmm(
             attn, q_nope, attn.w_kc, attn.w_scale, attn.w_scale_k, attn.kv_lora_rank
         )
 
-        if attn.rotary_emb is not None and not attn.use_fused_qk_rope_concat_and_cache_mla:
+        if (
+            attn.rotary_emb is not None
+            and not attn.use_fused_qk_rope_concat_and_cache_mla
+        ):
             q_pe, k_pe = attn.rotary_emb(positions, q_pe, k_pe)
 
         if nsa_use_prefill_cp(forward_batch):
@@ -181,9 +180,7 @@ class SGLangDeepseekMLAAttention(nn.Module):
             mla_attn = _get_sglang_radix_attn(self.base_attn)
             kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(mla_attn.layer_id)
             q_out_dtype = (
-                dtypes.fp8
-                if attn.kv_cache_dtype == "fp8_e4m3"
-                else q_nope_out.dtype
+                dtypes.fp8 if attn.kv_cache_dtype == "fp8_e4m3" else q_nope_out.dtype
             )
             q = torch.empty(
                 (
@@ -295,14 +292,16 @@ class SGLangDeepseekMLAAttention(nn.Module):
 
         attn_tp_context = get_attn_tp_context()
         with attn_tp_context.maybe_input_scattered(forward_batch):
-            q_input, kv_c_normed, k_pe, positions, q_scale = self._gather_runtime_inputs(
-                q_input,
-                kv_c_normed,
-                k_pe,
-                positions,
-                q_scale,
-                forward_batch=forward_batch,
-                input_scattered=attn_tp_context.input_scattered,
+            q_input, kv_c_normed, k_pe, positions, q_scale = (
+                self._gather_runtime_inputs(
+                    q_input,
+                    kv_c_normed,
+                    k_pe,
+                    positions,
+                    q_scale,
+                    forward_batch=forward_batch,
+                    input_scattered=attn_tp_context.input_scattered,
+                )
             )
 
             use_non_absorbed = forward_batch.forward_mode.is_extend_without_speculative()
