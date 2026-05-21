@@ -360,7 +360,7 @@ def gdn_decode_update_lossy_fast(
     beta: float = 1.0,
     threshold: float = 20.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Old decode fast path with beta rounded to b.dtype; still not bitwise accurate."""
+    """Approximate decode fast path that fuses gating and recurrent update."""
     if beta != 1.0 or threshold != 20.0:
         raise ValueError("gdn_decode_update_lossy_fast supports beta=1.0 and threshold=20.0")
     if not use_qk_l2norm_in_kernel:

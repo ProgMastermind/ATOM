@@ -1,7 +1,6 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-
 import torch
 import triton
 import triton.language as tl
@@ -15,6 +14,7 @@ from atom.model_ops.fla_ops import (
     fused_recurrent_gated_delta_rule,
     gdn_decode_update_lossy_fast,
 )
+from atom.utils import envs
 
 # from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
 from atom.utils.forward_context import ForwardContext, get_forward_context
@@ -218,7 +218,8 @@ class GatedDeltaNet(nn.Module):
             mixed_qkv_non_spec = mixed_qkv
 
         use_lossy_gdn_decode = (
-            spec_sequence_masks is None
+            envs.ATOM_ENABLE_GDN_DECODE_LOSSY_FAST
+            and spec_sequence_masks is None
             and gdn_metadata.num_prefills == 0
             and gdn_metadata.num_decodes > 0
             and non_spec_state_indices_tensor is not None
