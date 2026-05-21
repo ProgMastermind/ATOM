@@ -45,7 +45,6 @@ try:
         flash_attn_varlen_func,
         dtypes,
         get_pa_metadata_info_v1,
-        get_pa_metadata_v1,
         mha_batch_prefill_func,
         pa_fwd_asm,
         pa_persistent_fwd,
