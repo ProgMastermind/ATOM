@@ -274,6 +274,7 @@ def _a8w4_fused_experts(
     residual: torch.Tensor | None = None,
     # Step 3: apply_swiglu fold into GEMM1. Requires interleaved W13 (done at weight load).
     swiglu_fold: bool = False,
+    x_scale: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Step 1 minimum a8w4 fused experts.
 
@@ -289,7 +290,10 @@ def _a8w4_fused_experts(
     BLOCK_M = recommend_block_m(M)
 
     # Pre-MoE quant: bf16 -> fp8 e4m3 + ue8m0 per-1x32.
-    x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
+    if x_scale is None:
+        x_fp8, x_scale = downcast_to_mxfp(hidden_states, torch.float8_e4m3fn, axis=-1)
+    else:
+        x_fp8 = hidden_states
 
     # Step 4: skip bridge when pre_built_aiter_routing is provided.
     if pre_built_aiter_routing is not None:
@@ -303,10 +307,8 @@ def _a8w4_fused_experts(
         gather_src_indx = gather_indx.src_indx
         scatter_src_indx = scatter_indx.src_indx
 
-    if w1_scale.dtype != torch.uint8:
-        w1_scale = w1_scale.view(torch.uint8)
-    if w2_scale.dtype != torch.uint8:
-        w2_scale = w2_scale.view(torch.uint8)
+    w1_scale = w1_scale.view(torch.uint8)
+    w2_scale = w2_scale.view(torch.uint8)
 
     if swiglu_fold:
         # Step 5: optional fold of MXFP8 (fp8 e4m3 + ue8m0 per-1×32) emit into

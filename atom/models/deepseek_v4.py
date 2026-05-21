@@ -47,10 +47,15 @@ from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
 from aiter.ops.triton.fusions.fused_clamp_act_mul import (
     fused_clamp_act_mul,
 )
+from aiter.ops.triton.gemm.fused.fused_gemm_a16w16_quant_x import (
+    fused_gemm_a16w16_quant_x,
+)
 from aiter.ops.triton.fusions.fused_reduce_qk_norm_rope_swa_write import (
     fused_reduce_qk_norm_rope_swa_write,
 )
 from aiter.ops.triton.pa_mqa_logits import deepgemm_fp8_paged_mqa_logits
+from aiter.tuned_gemm import tgemm
+from aiter.ops.triton.moe.quant_moe import downcast_to_mxfp
 from atom.config import (
     Config,
     LayerQuantConfig,
@@ -69,7 +74,7 @@ from atom.model_ops.linear import (
     ReplicatedLinear,
     RowParallelLinear,
 )
-from atom.model_ops.moe import FusedMoE
+from atom.model_ops.moe import FusedMoE, Mxfp4MoEMethod
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from aiter import rope_rotate_activation
 from atom.model_ops.quant_v4 import act_quant_inplace
@@ -134,6 +139,9 @@ ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 _V4_USE_MXFP8 = os.environ.get("ATOM_FP8_BLOCKSCALE_USE_MXFP8", "0") == "1"
 _V4_DISABLE_FCAM = os.environ.get("ATOM_V4_DISABLE_FCAM", "0") == "1"
 _MXFP8_BYPASS_FCAM = os.environ.get("ATOM_MXFP8_BYPASS_FCAM", "0") == "1"
+_A8W4_TRITON_MOE = os.environ.get(
+    "ATOM_MOE_BACKEND", "matmul_ogs"
+) == "a8w4" and envs.is_set("ATOM_USE_TRITON_MOE")
 
 
 def _fuse_rmsnorm_mxfp8_quant(
@@ -280,6 +288,44 @@ def fused_qk_norm_rope_swa_write(
                 win,
             )
     return q_out
+
+
+def _fused_router_gate_a16w16_quant_fake(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_tokens, K = x.shape
+    n_routed_experts = gate_weight.shape[0]
+    router_logits = torch.empty(
+        (num_tokens, n_routed_experts), dtype=torch.bfloat16, device=x.device
+    )
+    x_out = torch.empty((num_tokens, K), dtype=dtypes.fp8, device=x.device)
+    x_scales = torch.empty((num_tokens, K // 32), dtype=torch.uint8, device=x.device)
+    return router_logits, x_out, x_scales
+
+
+@torch_compile_guard(gen_fake=_fused_router_gate_a16w16_quant_fake, mutates_args=[])
+def fused_router_gate_a16w16_quant(
+    x: torch.Tensor,
+    gate_weight: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """A16W16 router-gate GEMM, optionally fused with a BF16->FP8 downcast
+    copy of x.
+
+    For decode-shaped batches (num_tokens <= 64) the GEMM and the activation
+    downcast run in a single triton kernel; the FP8 copy is consumed by the
+    downstream fused_moe kernel, replacing its internal
+    `hidden_states.to(dtypes.fp8)` cast with a copy done inline with the
+    gate GEMM's A-loads. For larger batches the fusion's per-element copy
+    overhead is not worth the savings, so we fall back to tgemm.mm and let
+    aiter re-trigger the `.to(fp8)` cast on its side.
+    """
+    num_tokens = x.shape[0]
+    if num_tokens <= 64:
+        return fused_gemm_a16w16_quant_x(x, gate_weight, quant_dtype=dtypes.fp8)
+    router_logits = tgemm.mm(x, gate_weight, None, otype=torch.bfloat16)
+    x, x_scale = downcast_to_mxfp(x, dtypes.fp8, axis=-1)
+    return router_logits, x, x_scale
 
 
 def _make_weightless_rmsnorm(dim: int, eps: float) -> RMSNorm:
@@ -2203,6 +2249,12 @@ class MoE(nn.Module):
                 prefix
             ] = self
 
+        self._use_a8w4_triton_moe = False
+        if self.experts.quant_method.__class__ is Mxfp4MoEMethod and getattr(
+            self.experts.quant_method, "use_triton", False
+        ):
+            self._use_a8w4_triton_moe = _A8W4_TRITON_MOE
+
     def _hash_topk(
         self,
         hidden_states: torch.Tensor,
@@ -2263,6 +2315,15 @@ class MoE(nn.Module):
         `_hash_topk` (FusedMoE's custom_routing_function) reads it there.
         """
         router_logits = self.gate(x)  # [num_tokens, n_routed_experts]
+        if self._use_a8w4_triton_moe:
+            router_logits, x, x_scale = fused_router_gate_a16w16_quant(
+                x, self.gate.weight
+            )
+            return self.experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                hidden_states_scale=x_scale,
+            )
         return self.experts(hidden_states=x, router_logits=router_logits)
 
     def combine_outputs(

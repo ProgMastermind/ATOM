@@ -283,6 +283,7 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         apply_router_weight_on_input: bool = False,
         activation: str = "silu",
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         raise NotImplementedError
 
@@ -1005,6 +1006,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import (
@@ -1110,6 +1112,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         pre_built_aiter_routing=aiter_routing,
                         residual=moe_residual,
                         swiglu_fold=getattr(self, "swiglu_fold", False),
+                        x_scale=x_scale,
                     )
 
                 _a8w4_triton_routing = (
@@ -1163,6 +1166,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                         pre_built_aiter_routing=aiter_routing,
                         residual=moe_residual,
                         swiglu_fold=getattr(self, "swiglu_fold", False),
+                        x_scale=x_scale,
                     )
 
                 # Use ATOM's full-featured select_experts for routing,
@@ -1685,6 +1689,7 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Apply compressed-tensors FP8 MoE computation."""
         # Select top-k experts using router logits
@@ -2041,6 +2046,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         apply_router_weight_on_input: bool = False,
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
+        x_scale: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
@@ -2145,16 +2151,18 @@ def moe_forward(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
+    hidden_states_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-    return self.forward_impl(hidden_states, router_logits)
+    return self.forward_impl(hidden_states, router_logits, hidden_states_scale)
 
 
 def moe_forward_fake(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,
     layer_name: str,
+    hidden_states_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.empty_like(hidden_states)
 
@@ -3192,13 +3200,24 @@ class FusedMoE(torch.nn.Module):
 
         return topk_weights, topk_ids
 
-    def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        hidden_states_scale: torch.Tensor = None,
+    ):
         return torch.ops.aiter.moe_forward(
-            hidden_states, router_logits, self.layer_name
+            hidden_states,
+            router_logits,
+            self.layer_name,
+            hidden_states_scale=hidden_states_scale,
         )
 
     def forward_impl_graph(
-        self, hidden_states: torch.Tensor, router_logits: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        hidden_states_scale: torch.Tensor = None,
     ):
         # There are three mode
         # 1. Pure DP mode: only DP is used
@@ -3246,6 +3265,7 @@ class FusedMoE(torch.nn.Module):
             fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            x_scale=hidden_states_scale,
         )
 
         # Use reduce_scatter when DP > 1 but not using mori all2all kernels
@@ -3266,11 +3286,18 @@ class FusedMoE(torch.nn.Module):
 
         return final_hidden_states
 
-    def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
+    def forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        hidden_states_scale: torch.Tensor = None,
+    ):
         assert self.quant_method is not None
         # cuda graph not supported forward with combine and dispatch
         if self.use_chunked:
-            return self.forward_impl_graph(hidden_states, router_logits)
+            return self.forward_impl_graph(
+                hidden_states, router_logits, hidden_states_scale=hidden_states_scale
+            )
             # return self.forward_impl_chunked(hidden_states, router_logits)
 
         dp_group = get_dp_group()
@@ -3300,6 +3327,7 @@ class FusedMoE(torch.nn.Module):
             fused_shared_experts_scoring_func=self.shared_expert_scoring_func,
             activation=self.activation,
             apply_router_weight_on_input=self.apply_router_weight_on_input,
+            x_scale=hidden_states_scale,
         )
 
         dp_group = get_dp_group()
