@@ -1,64 +1,8 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1779423882196,
+  "lastUpdate": 1779426792783,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
-      {
-        "commit": {
-          "author": {
-            "name": "ZhangLirong-amd",
-            "username": "ZhangLirong-amd",
-            "email": "Lirong.Zhang@amd.com"
-          },
-          "committer": {
-            "name": "ZhangLirong-amd",
-            "username": "ZhangLirong-amd",
-            "email": "Lirong.Zhang@amd.com"
-          },
-          "id": "2d32205351fb1751bd25bed70dccbad40fd5c732",
-          "message": "refactor: replace SSH-based PD benchmark with multi-job artifact coordination",
-          "timestamp": "2026-05-18T12:56:08Z",
-          "url": "https://github.com/ROCm/ATOM/commit/2d32205351fb1751bd25bed70dccbad40fd5c732"
-        },
-        "date": 1779109117155,
-        "tool": "customBiggerIsBetter",
-        "benches": [
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 throughput (tok/s)",
-            "value": 3928.9,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26019222713 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171131-mooncake_build"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 Total Tput (tok/s)",
-            "value": 7866.43,
-            "unit": "tok/s",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26019222713 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171131-mooncake_build"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 TTFT (ms)",
-            "value": 217.65,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26019222713 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171131-mooncake_build"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 TPOT (ms)",
-            "value": 31.54,
-            "unit": "ms",
-            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26019222713 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | Docker: rocm/atom-dev:nightly_202605171131-mooncake_build"
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 _gpu_count",
-            "value": 1,
-            "unit": ""
-          },
-          {
-            "name": "ATOM::MiniMax-M2.7-MXFP4 1024/1024 c=128 _tp",
-            "value": 1,
-            "unit": ""
-          }
-        ]
-      },
       {
         "commit": {
           "author": {
@@ -53636,6 +53580,99 @@ window.BENCHMARK_DATA = {
             "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 MTP avg toks/fwd (tok/fwd)",
             "value": 1,
             "unit": "tok/fwd"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "jiayyu@amd.com",
+            "name": "Jiayun",
+            "username": "jiayyu"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "983a39fee90eb7dad77201776df1cfd6e86f719d",
+          "message": "[fix](mla): remove block_table_convert (#857)\n\n* [fix](mla): use raw logical block_table in kernels that self-multiply PAGE_SIZE\n\nWhen aiter_mla forces physical_block_size=1, block_ratio = block_size/1 > 1,\nso attn_metadata.block_tables is the CONVERTED (per-physical-slot) view with\nvalues = raw_id * ratio + r. Kernels that internally compute\n`block_table[req,blk] * PAGE_SIZE + offset` already do the multiply; feeding\nthem the converted view multiplies by PAGE_SIZE twice and over-indexes the\nflat kv_cache by ratio×, causing HIP illegal memory access under\nprefix_caching at non-trivial concurrency.\n\nFix by carrying the pre-conversion view as block_tables_raw in\nForwardContext, and routing the three affected sites to it:\n  - cp_gather and deepgemm in deepseek_v2 (V3 narrow fix)\n  - triton_convert_req_index_to_global_index_dsa_prefill in attention_mla\n    (V4: same pattern, second occurrence found via fix-then-sweep)\n\nVerified on GLM-5.1-MXFP4 TP=4 with --enable_prefix_caching --kv_cache_dtype\nfp8: churn at conc=64/128 passes; benchmark_serving conc=64/128/256\n(isl=8192 osl=1024) all clean with zero crash markers; gsm8k flexible-extract\n0.884 / strict-match 0.930.\n\nCo-Authored-By: Claude Opus 4 <noreply@anthropic.com>\n\n* [refactor](mla): drop dead block_tables_converted machinery\n\nAfter 278d6fd switched kernels to the raw logical block_table, the\nconverted (physical-per-slot) view has no remaining consumer. Remove\nthe buffer allocation, the convert_triton call sites, the ctor kwarg\nplumbing, and the AttentionMetaData fields (block_tables_converted,\nblock_tables_raw). attn_metadata.block_tables is now always logical.\n\nCo-Authored-By: Claude Opus 4 <noreply@anthropic.com>\n\n---------\n\nCo-authored-by: Claude Opus 4 <noreply@anthropic.com>",
+          "timestamp": "2026-05-22T12:52:39+08:00",
+          "tree_id": "b8c14df8d96c5b8e5c21ab8fa3aa0019607263c1",
+          "url": "https://github.com/ROCm/ATOM/commit/983a39fee90eb7dad77201776df1cfd6e86f719d"
+        },
+        "date": 1779426788595,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP accuracy (GSM8K)",
+            "value": 0.9469,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26269138954 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:latest@sha256:e8f24d74ba5a0f19fa344b338be7d2da32382ac60bbe10472fba28b479f02bfe | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9424 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP MTP acceptance (%)",
+            "value": 64.21,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26269138954 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: Same base model as DeepSeek-R1-0528 FP8 | Docker: rocm/atom-dev:latest@sha256:e8f24d74ba5a0f19fa344b338be7d2da32382ac60bbe10472fba28b479f02bfe | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9424 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528 MTP avg toks/fwd (tok/fwd)",
+            "value": 2.93,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP accuracy (GSM8K)",
+            "value": 0.9416,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26269138954 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:latest@sha256:e8f24d74ba5a0f19fa344b338be7d2da32382ac60bbe10472fba28b479f02bfe | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9371 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP MTP acceptance (%)",
+            "value": 61.18,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26269138954 | Threshold: 0.93 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (deepseek-ai/DeepSeek-R1-0528 is natively FP8) | Docker: rocm/atom-dev:latest@sha256:e8f24d74ba5a0f19fa344b338be7d2da32382ac60bbe10472fba28b479f02bfe | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.9371 | fewshot: 3 | Model: /models/amd/DeepSeek-R1-0528-MXFP4-MTP-MoEFP4"
+          },
+          {
+            "name": "ATOM::DeepSeek-R1-0528-FP4 MTP avg toks/fwd (tok/fwd)",
+            "value": 2.84,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::Qwen3-Next-80B-A3B-Thinking accuracy (GSM8K)",
+            "value": 0.7028,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26269138954 | Threshold: 0.65 | Baseline: 0.69 | BaselineModel: Qwen/Qwen3-Next-80B-A3B-Thinking | BaselineNote: No public GSM8K baseline; HF card has no GSM8K | Docker: rocm/atom-dev:latest@sha256:e8f24d74ba5a0f19fa344b338be7d2da32382ac60bbe10472fba28b479f02bfe | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.8036 | fewshot: 3 | Model: /models/Qwen/Qwen3-Next-80B-A3B-Thinking"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP accuracy (GSM8K)",
+            "value": 0.8514,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26269138954 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 speculative decoding | Docker: rocm/atom-dev:latest@sha256:e8f24d74ba5a0f19fa344b338be7d2da32382ac60bbe10472fba28b479f02bfe | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.8378 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP MTP acceptance (%)",
+            "value": 0,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26269138954 | Threshold: 0.85 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: Same base model as Qwen3.5-397B-A17B-FP8; MTP3 speculative decoding | Docker: rocm/atom-dev:latest@sha256:e8f24d74ba5a0f19fa344b338be7d2da32382ac60bbe10472fba28b479f02bfe | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.8378 | fewshot: 3 | Model: /models/Qwen/Qwen3.5-397B-A17B-FP8"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-FP8 MTP avg toks/fwd (tok/fwd)",
+            "value": 1,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOM::Qwen3.5-397B-A17B-MXFP4 accuracy (GSM8K)",
+            "value": 0.8393,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26269138954 | Threshold: 0.835 | Baseline: 0.9538 | BaselineModel: Qwen/Qwen3.5-397B-A17B-FP8 | BaselineNote: CI baseline=0.8605 (FP8 tp=4, 3-shot completions API, thinking mode active). HF card reports 0.9538 but uses chat API with reasoning_parser | Docker: rocm/atom-dev:latest@sha256:e8f24d74ba5a0f19fa344b338be7d2da32382ac60bbe10472fba28b479f02bfe | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.3 | strict-match: 0.8218 | fewshot: 3 | Model: /models/amd/Qwen3.5-397B-A17B-MXFP4"
+          },
+          {
+            "name": "ATOM::gpt-oss-120b (2 GPUs) accuracy (GSM8K)",
+            "value": 0.8886,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/26269138954 | Threshold: 0.88 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202605201600 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.3 | strict-match: 0.3859 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
