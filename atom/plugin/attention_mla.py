@@ -144,10 +144,10 @@ def reorg_kvcache(
 
 @triton.jit
 def mla_fold_kv_metadata_kernel(
-    paged_kv_indptr_ptr,   # [num_reqs + 1]   int32
+    paged_kv_indptr_ptr,  # [num_reqs + 1]   int32
     paged_kv_indices_ptr,  # [>= paged_kv_indptr[-1]]  int32
-    fold_kv_indptr_ptr,    # [num_reqs * FOLD_FACTOR + 1]  int32, entry [0] pre-zeroed
-    fold_kv_indices_ptr,   # [>= FOLD_FACTOR * paged_kv_indptr[-1] + TAIL_PADDING] int32
+    fold_kv_indptr_ptr,  # [num_reqs * FOLD_FACTOR + 1]  int32, entry [0] pre-zeroed
+    fold_kv_indices_ptr,  # [>= FOLD_FACTOR * paged_kv_indptr[-1] + TAIL_PADDING] int32
     FOLD_FACTOR: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
 ):
@@ -701,9 +701,7 @@ class MLAAttentionImplPluginModeMethods:
                 # for the buffer length that's preserved at replay (the
                 # captured allocation has this exact size).
                 max_seq_len = attn_metadata.plugin_metadata.max_seq_len
-                fold_kv_indices_len = (
-                    num_reqs * max_seq_len * fold_factor
-                )
+                fold_kv_indices_len = num_reqs * max_seq_len * fold_factor
 
                 new_kv_indptr = torch.zeros(
                     new_bs + 1, dtype=torch.int32, device=q.device
