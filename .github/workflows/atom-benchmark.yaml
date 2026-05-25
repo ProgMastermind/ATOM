@@ -713,7 +713,7 @@ jobs:
           done
 
       - name: Run PD benchmarks
-        timeout-minutes: 60
+        timeout-minutes: 120
         run: |
           if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
           else model_path="${{ env.MODEL_PATH }}"; fi
