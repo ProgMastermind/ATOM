@@ -24,7 +24,6 @@ from aiter.dist.parallel_state import get_tensor_model_parallel_world_size, get_
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.attention_mla import (
     dynamic_per_batched_tensor_quant,
-    fused_qk_rope_concat_and_cache_mla,
 )
 from atom.models.utils import maybe_prefix
 from atom.models.deepseek_v2 import _fuse_rmsnorm_quant
@@ -202,7 +201,6 @@ def init_sgl_attrs(
     attn.use_deep_gemm_bmm = False
     attn.alt_stream = None
     attn.kv_cache_dtype = kv_cache_dtype
-    attn.use_fused_qk_rope_concat_and_cache_mla = _use_aiter_gfx95
     attn.current_sgl_plugin_attn_path = None
     attn.w_kc, attn.w_vc = None, None
     attn.w_scale = None
@@ -488,7 +486,7 @@ def forward_sgl_prepare(
         attn, q_nope, attn.w_kc, attn.w_scale, attn.w_scale_k, attn.kv_lora_rank
     )
 
-    if attn.rotary_emb is not None and not attn.use_fused_qk_rope_concat_and_cache_mla:
+    if attn.rotary_emb is not None:
         q_pe, k_pe = attn.rotary_emb(positions, q_pe, k_pe)
 
     if nsa_use_prefill_cp(forward_batch):
@@ -514,52 +512,9 @@ def forward_sgl_core(
     prepared: SglPrepareResult,
 ) -> torch.Tensor:
     """Core MLA attention computation for sglang (adapted from sglang forward_absorb_core)."""
-    save_kv_cache = True
-
-    if attn.use_fused_qk_rope_concat_and_cache_mla:
-        mla_attn = _get_sglang_radix_attn(attn.mla_attn)
-        kv_cache = prepared.forward_batch.token_to_kv_pool.get_key_buffer(
-            mla_attn.layer_id
-        )
-        q_out_dtype = (
-            dtypes.fp8
-            if attn.kv_cache_dtype == "fp8_e4m3"
-            else prepared.q_nope_out.dtype
-        )
-        q = torch.empty(
-            (
-                prepared.q_nope_out.shape[0],
-                attn.num_local_heads,
-                attn.kv_lora_rank + attn.qk_rope_head_dim,
-            ),
-            dtype=q_out_dtype,
-            device=prepared.q_nope_out.device,
-        )
-
-        fused_qk_rope_concat_and_cache_mla(
-            prepared.q_nope_out,
-            prepared.q_pe,
-            prepared.k_nope,
-            prepared.k_pe,
-            kv_cache,
-            q,
-            prepared.forward_batch.out_cache_loc,
-            mla_attn.k_scale,
-            mla_attn.k_scale,
-            prepared.positions,
-            attn.rotary_emb.cos_cache,
-            attn.rotary_emb.sin_cache,
-            is_neox=attn.rotary_emb.is_neox_style,
-            is_nope_first=True,
-        )
-        # Decode/speculative MLA consumes q plus packed MLA cache directly.
-        k = None
-        v = None
-        save_kv_cache = False
-    else:
-        q = torch.cat([prepared.q_nope_out, prepared.q_pe], dim=-1)
-        k = torch.cat([prepared.k_nope, prepared.k_pe], dim=-1)
-        v = prepared.k_nope
+    q = torch.cat([prepared.q_nope_out, prepared.q_pe], dim=-1)
+    k = torch.cat([prepared.k_nope, prepared.k_pe], dim=-1)
+    v = prepared.k_nope
 
     if prepared.llama_4_scaling is not None:
         q = q * prepared.llama_4_scaling
@@ -573,7 +528,7 @@ def forward_sgl_core(
         k,
         v,
         forward_batch=prepared.forward_batch,
-        save_kv_cache=save_kv_cache,
+        save_kv_cache=True,
         **extra_kwargs,
     )
     attn_output = attn_output.view(-1, attn.num_local_heads, attn.kv_lora_rank)
@@ -645,7 +600,7 @@ def _can_run_sgl_mha_now(attn: DeepseekV2MLAAttention, forward_batch) -> bool:
     """Check if the model configuration supports the MHA attention path.
 
     This is a *capability* gate — NSA models and MXFP4-quantised weights
-    (uint8) cannot use the MHA path. Distinct from
+    cannot use the MHA path. Distinct from
     ``_dispatch_sgl_plugin_attn_path`` which routes each batch.
     """
     del forward_batch
@@ -906,7 +861,11 @@ def _read_kv_b_proj_weight(attn: DeepseekV2MLAAttention) -> torch.Tensor:
             attn.kv_b_proj.qzeros,
         ).T
     else:
-        w = attn.kv_b_proj.weight
+        w = getattr(
+            attn.kv_b_proj,
+            "_mxfp4_unshuffled_weight",
+            attn.kv_b_proj.weight,
+        )
 
     # On ROCm, ATOM creates parameters with fnuz dtype but loads fn bytes.
     # View-cast back to fn so the normalize path works correctly.
@@ -1068,13 +1027,21 @@ def _split_and_assign_kc_vc(
         [attn.qk_nope_head_dim, attn.v_head_dim], dim=1
     )
 
-    # quark fp4 special path
+    # Quark MXFP4 LinearBase modules store quantization on layer_quant_config;
+    # there is no kv_b_proj.quant_method object to inspect in this path.
+    layer_quant_config = getattr(attn.kv_b_proj, "layer_quant_config", None)
     quant_method = getattr(attn.kv_b_proj, "quant_method", None)
     quant_config = getattr(quant_method, "quant_config", None)
-    if (
-        _use_aiter_gfx95
-        and quant_config is not None
-        and quant_config.get_name() == "quark"
+    is_quark_quant_method = (
+        quant_config is not None and quant_config.get_name() == "quark"
+    )
+    is_quark_mxfp4_linear = (
+        layer_quant_config is not None
+        and layer_quant_config.quant_method == "quark"
+        and layer_quant_config.quant_dtype == dtypes.fp4x2
+    )
+    if _use_aiter_gfx95 and (
+        is_quark_quant_method or is_quark_mxfp4_linear
     ):
         w_kc, attn.w_scale_k, w_vc, attn.w_scale_v = quark_post_load_weights(
             attn, w, "mxfp4"
@@ -1082,7 +1049,7 @@ def _split_and_assign_kc_vc(
 
     if not use_deep_gemm_bmm:
         use_vllm_weight_layout = _is_hip and not (
-            quant_config is not None and quant_config.get_name() == "quark"
+            is_quark_quant_method or is_quark_mxfp4_linear
         )
 
         if use_vllm_weight_layout:

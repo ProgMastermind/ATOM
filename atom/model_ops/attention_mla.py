@@ -22,7 +22,10 @@ from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.gather_kv_b_proj import gather_kv_b_proj
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
-from atom.model_ops.utils import get_and_maybe_dequant_weights
+from atom.model_ops.utils import (
+    get_and_maybe_dequant_weights,
+    reshape_mxfp4_scale_for_triton,
+)
 from atom.plugin import is_plugin_mode
 from atom.plugin.attention_mla import MLAAttentionImplDecoratorForPluginMode
 from atom.plugin.attention_mla_sparse import (
@@ -371,10 +374,7 @@ class MLAAttention(nn.Module):
                     shuffle=(m >= 32),
                 )
 
-                if m >= 32:
-                    x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
-                else:
-                    x_scale = x_scale[:m, ...].view(torch.uint8)
+                x_scale = reshape_mxfp4_scale_for_triton(x_scale, rows=m)
 
                 k, v = fused_gemm_afp4wfp4_preshuffle_split_cat(
                     q_input.view(torch.uint8),

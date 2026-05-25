@@ -375,9 +375,9 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 f"ATOM failed to create model for architecture {self.model_arch}"
             )
 
-        # Under SGLang dp-attention, ATOM runtime interprets non-MoE modules
-        # like lm_head with tp=1 semantics, so plugin logits must not perform
-        # an extra TP all-gather after local lm_head matmul.
+        # LogitsProcessor bypasses ParallelLMHead.forward() and multiplies
+        # directly with the local lm_head.weight shard, so it must own the
+        # TP logits all-gather except in SGLang DP-attention mode.
         plugin_skip_all_gather = bool(self.model.atom_config.enable_dp_attention)
         self.logits_processor = LogitsProcessor(
             config, skip_all_gather=plugin_skip_all_gather

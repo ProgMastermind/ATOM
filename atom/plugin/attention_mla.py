@@ -20,6 +20,7 @@ from aiter.mla import mla_decode_fwd
 from functools import partial as functools_partial
 from atom.config import get_current_atom_config
 from atom.model_ops.linear import use_triton_gemm
+from atom.model_ops.utils import reshape_mxfp4_scale_for_triton
 from atom.plugin.prepare import is_vllm
 from atom.utils import envs
 
@@ -438,10 +439,7 @@ class MLAAttentionImplPluginModeMethods:
                     shuffle=(m >= 32),
                 )
 
-                if m >= 32:
-                    x_scale = x_scale.view(torch.uint8).view(x_scale.shape[0] // 32, -1)
-                else:
-                    x_scale = x_scale[:m, ...].view(torch.uint8)
+                x_scale = reshape_mxfp4_scale_for_triton(x_scale, rows=m)
 
                 k, v = fused_gemm_afp4wfp4_preshuffle_split_cat(
                     q_input.view(torch.uint8),

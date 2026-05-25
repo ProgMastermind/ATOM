@@ -25,9 +25,11 @@ from aiter.utility import fp4_utils
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.quant_spec import LayerQuantConfig
 from atom.model_ops.utils import (
+    MXFP4_QUANT_BLOCK_SIZE,
     atom_parameter,
     normalize_e4m3fn_to_e4m3fnuz,
     requantize_with_max_scale,
+    reshape_mxfp4_scale_for_triton,
     shuffle_weights,
 )
 from atom.utils import envs
@@ -41,6 +43,14 @@ logger = logging.getLogger("atom")
 def use_triton_gemm() -> bool:
     return envs.ATOM_USE_TRITON_GEMM
 
+
+try:
+    from aiter.ops.triton.gemm_afp4wfp4 import (  # noqa: E402
+        gemm_afp4wfp4_preshuffle as attention_gemm_afp4wfp4_preshuffle,
+    )
+except ImportError as e:
+    logger.warning(f"Triton FP4 attention GEMM not available: {e}")
+    attention_gemm_afp4wfp4_preshuffle = None
 
 if use_triton_gemm():
     try:
@@ -63,7 +73,10 @@ if use_triton_gemm():
 else:
     gemm_afp4wfp4_preshuffle = None
     gemm_a8w8_blockscale_bpreshuffle_triton = None
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
+
+
+def use_triton_fp4_attention_gemm(prefix: str) -> bool:
+    return attention_gemm_afp4wfp4_preshuffle is not None and ".self_attn." in prefix
 
 
 def divide(numerator, denominator):
@@ -82,6 +95,7 @@ def gemm_a4w4_quant_fake(
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
     output_size: int,
+    prefix: str = "",
 ) -> torch.Tensor:
     return torch.empty((*x.shape[:-1], weight.shape[0]), dtype=otype, device=x.device)
 
@@ -97,8 +111,13 @@ def gemm_a4w4_quant(
     params_dtype: torch.dtype,
     input_scale: torch.Tensor,
     output_size: int,
+    prefix: str = "",
 ) -> torch.Tensor:
-    if gemm_afp4wfp4_preshuffle is None:
+    fp4_triton_gemm = gemm_afp4wfp4_preshuffle
+    if fp4_triton_gemm is None and use_triton_fp4_attention_gemm(prefix):
+        fp4_triton_gemm = attention_gemm_afp4wfp4_preshuffle
+
+    if fp4_triton_gemm is None:
         if x_scale is None:
             quant_func = get_hip_quant(QuantType.per_1x32)
             x, x_scale = quant_func(
@@ -153,14 +172,9 @@ def gemm_a4w4_quant(
             x_scale = x_scale.view(torch.float8_e8m0fnu)
             x = x.view(torch.float4_e2m1fn_x2)
 
-        if m >= MXFP4_QUANT_BLOCK_SIZE:
-            x_scale = x_scale.view(torch.uint8).view(
-                x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
-            )
-        else:
-            x_scale = x_scale[:m, ...].view(torch.uint8)
+        x_scale = reshape_mxfp4_scale_for_triton(x_scale, rows=m)
 
-        y = gemm_afp4wfp4_preshuffle(
+        y = fp4_triton_gemm(
             x.view(torch.uint8),
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
             x_scale,
@@ -461,6 +475,16 @@ class LinearBase(nn.Module):
             "quant_dtype": str(online_quant_dtype),
         }
 
+    def _maybe_preserve_unshuffled_mxfp4_kv_b_proj(self):
+        if (
+            self.weight.dim() == 2
+            and ".self_attn.kv_b_proj" in self.prefix
+            and self.quant_type == QuantType.per_1x32
+            and self.params_dtype == dtypes.fp4x2
+        ):
+            self._mxfp4_unshuffled_weight = self.weight.detach().clone()
+            self._mxfp4_unshuffled_weight_scale = self.weight_scale.detach().clone()
+
     def process_weights_after_loading(self):
         # Re-quantize before process_weights if online quantization is enabled
         if self.quant_config is not None and self.quant_config.online_quant:
@@ -503,6 +527,7 @@ class LinearBase(nn.Module):
             # Qwen3-Next/Qwen3.5 GDN conv1d expands its weight to 3D, so FP8/blocked
             # quantized models must keep that tensor unshuffled here.
             if self.weight.dim() == 2:
+                self._maybe_preserve_unshuffled_mxfp4_kv_b_proj()
                 shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
@@ -515,6 +540,7 @@ class LinearBase(nn.Module):
                 need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
             if need_shuffle:
                 if self.weight.dim() == 2:
+                    self._maybe_preserve_unshuffled_mxfp4_kv_b_proj()
                     shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
@@ -607,6 +633,7 @@ class LinearBase(nn.Module):
                     self.params_dtype,
                     getattr(self, "input_scale", None),
                     self.output_size,
+                    prefix=self.prefix,
                 )
                 if self.bias is not None:
                     y += self.bias

@@ -2073,6 +2073,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
     def _call_mla_decode_fwd(self, q, k_buffer, o, layer):
         """Common mla_decode_fwd invocation shared across decode/extend paths."""
         md = self.forward_metadata
+        use_persistent_metadata = q.shape[0] < 232
         mla_decode_fwd(
             q,
             k_buffer.view(-1, 1, 1, layer.qk_head_dim),
@@ -2084,16 +2085,16 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             md.max_q_len,
             sm_scale=layer.scaling,
             logit_cap=layer.logit_cap,
-            work_meta_data=md.work_metadata,
-            work_indptr=md.work_indptr,
-            work_info_set=md.work_info_set,
-            reduce_indptr=md.reduce_indptr,
-            reduce_final_map=md.reduce_final_map,
-            reduce_partial_map=md.reduce_partial_map,
+            work_meta_data=md.work_metadata if use_persistent_metadata else None,
+            work_indptr=md.work_indptr if use_persistent_metadata else None,
+            work_info_set=md.work_info_set if use_persistent_metadata else None,
+            reduce_indptr=md.reduce_indptr if use_persistent_metadata else None,
+            reduce_final_map=md.reduce_final_map if use_persistent_metadata else None,
+            reduce_partial_map=md.reduce_partial_map if use_persistent_metadata else None,
             q_scale=layer.k_scale,
             kv_scale=layer.k_scale,
             intra_batch_mode=_sglang_aiter.intra_batch_mode,
-            num_kv_splits=md.num_kv_splits,
+            num_kv_splits=md.num_kv_splits if use_persistent_metadata else None,
         )
 
     def _forward_extend_mla_speculative(

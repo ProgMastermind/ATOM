@@ -66,7 +66,11 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
+from atom.model_ops.utils import (
+    MXFP4_QUANT_BLOCK_SIZE,
+    atom_parameter,
+    reshape_mxfp4_scale_for_triton,
+)
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -199,7 +203,7 @@ def _fuse_rmsnorm_fp4_quant_fake(
     if res1 is not None:
         out_res1 = torch.empty((m, n1), dtype=x1.dtype, device=x1.device)
 
-    out1_unquantized = None
+    out1_unquantized = torch.empty_like(x1) if output_unquantized_inp1 else None
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
@@ -285,7 +289,7 @@ def _fuse_rmsnorm_fp4_quant(
         )
     )
 
-    out1_unquantized = None
+    out1_unquantized = _out1_unquantized if output_unquantized_inp1 else None
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
 
@@ -512,12 +516,7 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
                 shuffle=(M >= MXFP4_QUANT_BLOCK_SIZE),
             )
 
-            if M >= MXFP4_QUANT_BLOCK_SIZE:
-                x_scale = x_scale.view(torch.uint8).view(
-                    x_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1
-                )
-            else:
-                x_scale = x_scale[:M, ...].view(torch.uint8)
+            x_scale = reshape_mxfp4_scale_for_triton(x_scale, rows=M)
 
             qkv_lora = gemm_afp4wfp4_preshuffle(
                 x.view(torch.uint8),
@@ -531,14 +530,10 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant_fp4(
                 skip_reduce=True,
             )
     else:
-        if M >= MXFP4_QUANT_BLOCK_SIZE:
-            hidden_states_quant_scale = hidden_states_quant_scale.view(
-                torch.uint8
-            ).view(hidden_states_quant_scale.shape[0] // MXFP4_QUANT_BLOCK_SIZE, -1)
-        else:
-            hidden_states_quant_scale = hidden_states_quant_scale[:M, ...].view(
-                torch.uint8
-            )
+        hidden_states_quant_scale = reshape_mxfp4_scale_for_triton(
+            hidden_states_quant_scale,
+            rows=M,
+        )
 
         qkv_lora = gemm_afp4wfp4_preshuffle(
             hidden_states_quant.view(torch.uint8),
@@ -1512,8 +1507,8 @@ class DeepseekV2MLAAttention(nn.Module):
         self.max_position_embeddings = max_position_embeddings
         self.layer_num = layer_num
 
-        # For FP4 and use_triton_gemm(), fused_qkv_a_proj and q_b_proj are AITER-Triton FP4 GEMMs but o_proj remains AITER BF16 GEMMs,
-        # For FP8 and use_triton_gemm(), fused_qkv_a_proj is AITER-Triton FP8 GEMMs while others remain AITER FP8 GEMMs
+        # Full-MXFP4 checkpoints store attention weights and per-1x32 scales on
+        # disk, so keep quant_config attached and load them directly.
         q_a_proj_name = (
             "fused_qkv_a_proj" if self.q_lora_rank is not None else "q_a_proj"
         )
@@ -1529,13 +1524,8 @@ class DeepseekV2MLAAttention(nn.Module):
             None if layer_quant_type is None else layer_quant_type.value
         )
         if layer_quant_dtype == dtypes.fp4x2:
-            if not use_triton_gemm():
-                source_quant_dtype = None
-                quant_config = None
-                base_quant_config = None
-            else:
-                source_quant_dtype = torch.bfloat16
-                base_quant_config = None
+            source_quant_dtype = None
+            base_quant_config = quant_config
         else:
             source_quant_dtype = None
             # Check exclude patterns (e.g. W4A8 checkpoints exclude attention)
