@@ -882,7 +882,7 @@ jobs:
             }
 
       - name: Wait for proxy IP artifact
-        timeout-minutes: 30
+        timeout-minutes: 60
         uses: actions/github-script@v7
         with:
           script: |
@@ -890,7 +890,7 @@ jobs:
             const { execSync } = require('child_process');
             const artifactName = 'pd-proxy-ip-${{ matrix.entry.prefix }}';
             core.info(`Polling for proxy IP artifact (${artifactName})...`);
-            for (let i = 0; i < 180; i++) {
+            for (let i = 0; i < 360; i++) {
               try {
                 const { data } = await github.rest.actions.listWorkflowRunArtifacts({
                   owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
@@ -910,8 +910,8 @@ jobs:
                   return;
                 }
               } catch (e) { core.debug(`Attempt ${i+1} error: ${e.message}`); }
-              if (i === 179) { core.setFailed('Timed out waiting for proxy IP'); return; }
-              core.info(`  Artifact not ready (${i+1}/180), retrying in 10s...`);
+              if (i === 359) { core.setFailed('Timed out waiting for proxy IP'); return; }
+              core.info(`  Artifact not ready (${i+1}/360), retrying in 10s...`);
               await new Promise(r => setTimeout(r, 10000));
             }
 
@@ -1179,11 +1179,6 @@ jobs:
           python3 -c "
           import json
           models = json.loads(open('.github/benchmark/models.json').read())
-          # Include PD model configs in dashboard mapping
-          try:
-              models += json.loads(open('.github/benchmark/pd_models.json').read())
-          except FileNotFoundError:
-              pass
           mapping = {}
           for m in models:
               display = m.get('display','')
@@ -1194,6 +1189,18 @@ jobs:
               # HF path-derived key (old data used model_id last segment + optional suffix)
               hf_key = hf_name + suffix.lower() if suffix else hf_name
               mapping[hf_key] = display
+          # PD models share HF paths with regular models (e.g. both use
+          # deepseek-ai/DeepSeek-R1-0528), so use prefix as key instead
+          # to avoid overwriting the regular model's mapping.
+          try:
+              pd_models = json.loads(open('.github/benchmark/pd_models.json').read())
+              for m in pd_models:
+                  display = m.get('display','')
+                  prefix = m.get('prefix','')
+                  if not display or not prefix: continue
+                  mapping[prefix.lower()] = display
+          except FileNotFoundError:
+              pass
           with open('/tmp/dashboard_models_map.js','w') as f:
               f.write('window.MODELS_DISPLAY_MAP = ' + json.dumps(mapping) + ';')
           "
