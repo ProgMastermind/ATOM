@@ -613,13 +613,21 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         )
 
     def _init_extend_mla(self, bs, forward_batch):
+        max_q_len = self._max_len(
+            forward_batch.extend_seq_lens_cpu,
+            forward_batch.extend_seq_lens,
+        )
+        max_kv_len = self._max_len(
+            forward_batch.seq_lens_cpu,
+            forward_batch.seq_lens,
+        )
         self.mla_indices_updater_prefill.update(
             forward_batch.req_pool_indices,
             forward_batch.seq_lens,
             forward_batch.seq_lens_sum,
             forward_batch.extend_seq_lens,
-            forward_batch.extend_seq_lens.max().item(),
-            forward_batch.seq_lens.max().item(),
+            max_q_len,
+            max_kv_len,
             spec_info=None,
         )
 

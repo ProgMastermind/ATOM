@@ -949,6 +949,107 @@ class DeepseekV2MoE(nn.Module):
         )
         return final_hidden_states
 
+    def op_gate(self, state):
+        if not _is_non_idle_and_non_empty(
+            state.forward_batch, state.hidden_states_mlp_input
+        ):
+            state.router_logits = None
+            return
+        state.router_logits = self.gate(state.hidden_states_mlp_input)
+
+    def op_select_experts(self, state):
+        # Keep this state explicit so the operation-level runner can later
+        # split routed dispatch/combine without changing the layer contract.
+        router_logits = state.router_logits
+        if router_logits is None:
+            num_tokens = int(state.hidden_states_mlp_input.shape[0])
+            top_k = int(self.experts.top_k)
+            device = state.hidden_states_mlp_input.device
+            state.topk_weights = torch.empty(
+                (num_tokens, top_k), dtype=torch.float32, device=device
+            )
+            state.topk_ids = torch.empty(
+                (num_tokens, top_k), dtype=torch.int32, device=device
+            )
+            return
+        state.topk_weights, state.topk_ids = self.experts.select_experts(
+            hidden_states=state.hidden_states_mlp_input,
+            router_logits=router_logits,
+            top_k=self.experts.top_k,
+            use_grouped_topk=self.experts.use_grouped_topk,
+            renormalize=self.experts.renormalize,
+            topk_group=self.experts.topk_group,
+            num_expert_group=self.experts.num_expert_group,
+            custom_routing_function=self.experts.custom_routing_function,
+            scoring_func=self.experts.scoring_func,
+            e_score_correction_bias=self.experts.e_score_correction_bias,
+            num_routing_experts=self.experts.global_num_experts,
+            num_fused_shared_experts=self.experts.num_fused_shared_experts,
+            fused_shared_experts_scoring_func=self.experts.shared_expert_scoring_func,
+            routed_scaling_factor=self.experts.routed_scaling_factor,
+        )
+
+    def op_dispatch_a(self, state):
+        state.dispatch_hidden_states = state.hidden_states_mlp_input
+
+    def op_dispatch_b(self, state):
+        topk_weights = state.topk_weights
+        topk_ids = state.topk_ids
+        (
+            state.dispatch_a1,
+            state.dispatch_scale,
+            state.expert_tokens_meta,
+            state.dispatch_ids,
+            state.dispatch_weights,
+        ) = self.experts.fine_grain_prepare(
+            state.dispatch_hidden_states,
+            topk_weights,
+            topk_ids,
+        )
+
+    def op_experts(self, state):
+        state.fused_out = self.experts.fine_grain_experts(
+            state.dispatch_hidden_states,
+            state.pop("dispatch_a1"),
+            state.pop("dispatch_scale"),
+            state.pop("expert_tokens_meta"),
+            state.pop("dispatch_ids"),
+            state.pop("dispatch_weights"),
+        )
+
+    def op_combine_a(self, state):
+        return None
+
+    def op_combine_b(self, state):
+        dispatch_hidden_states = state.pop("dispatch_hidden_states")
+        state.hidden_states_after_combine = self.experts.fine_grain_finalize(
+            None,
+            state.pop("fused_out"),
+            dispatch_hidden_states,
+            state.pop("topk_weights"),
+            state.pop("topk_ids"),
+        )
+        state.pop("router_logits")
+
+    def op_shared_experts(self, state):
+        hidden_states = state.hidden_states_mlp_input
+        if (
+            self.n_shared_experts is not None
+            and not is_rocm_aiter_fusion_shared_expert_enabled()
+            and _is_non_idle_and_non_empty(state.forward_batch, hidden_states)
+        ):
+            state.shared_output = self.shared_experts(hidden_states)
+        else:
+            state.shared_output = None
+
+    def op_output(self, state):
+        shared_output = state.pop("shared_output")
+        state.hidden_states_mlp_output = self.combine_outputs(
+            state.pop("hidden_states_after_combine"),
+            shared_output,
+            state.pop("hidden_states_mlp_input"),
+        )
+
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         assert (
             hidden_states.dim() == 2
@@ -1819,6 +1920,19 @@ class DeepseekV2MLAAttention(nn.Module):
             hidden_states_or_q_c_scale,
         )
 
+    def op_prepare(self, state):
+        hidden_states = state.pop("hidden_states_after_comm_pre_attn")
+        if not _is_non_idle_and_non_empty(state.forward_batch, hidden_states):
+            state.attn_output = torch.zeros_like(hidden_states)
+            return
+        state.attn_output = self(
+            positions=state.positions,
+            hidden_states=hidden_states,
+        )
+
+    def op_core(self, state):
+        state.hidden_states_after_attn = state.pop("attn_output")
+
 
 class DeepseekV2DecoderLayer(nn.Module):
     def __init__(
@@ -2020,6 +2134,111 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         return hidden_states, residual
 
+    def op_comm_prepare_attn(
+        self,
+        state,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        residual: Optional[torch.Tensor],
+        **kwargs,
+    ):
+        if not _is_non_idle_and_non_empty(kwargs["forward_batch"], hidden_states):
+            state.hidden_states_after_comm_pre_attn = hidden_states
+            state.residual_after_input_ln = (
+                torch.zeros_like(hidden_states) if residual is None else residual
+            )
+            state.update(dict(positions=positions, **kwargs))
+            return
+
+        if self.fuse_input_norm_quant:
+            assert self.quant_dtype is not None
+            weight = self.input_layernorm.weight
+            eps = self.input_layernorm.eps
+            if residual is None:
+                residual = hidden_states
+                (hidden_states_quant, hidden_states_quant_scale), _, _, _ = (
+                    _fuse_rmsnorm_quant(
+                        hidden_states,
+                        weight,
+                        eps,
+                        None,
+                        None,
+                        None,
+                        None,
+                        dtype_quant=self.quant_dtype,
+                        shuffle=True,
+                        scale_shuffle_padding=True,
+                        group_size=128,
+                        quant_type=self.input_norm_quant_type,
+                        output_unquantized_inp1=False,
+                        transpose_scale=True,
+                    )
+                )
+            else:
+                (hidden_states_quant, hidden_states_quant_scale), _, _, residual = (
+                    _fuse_rmsnorm_quant(
+                        hidden_states,
+                        weight,
+                        eps,
+                        None,
+                        None,
+                        None,
+                        residual,
+                        dtype_quant=self.quant_dtype,
+                        shuffle=True,
+                        scale_shuffle_padding=True,
+                        group_size=128,
+                        quant_type=self.input_norm_quant_type,
+                        output_unquantized_inp1=False,
+                        transpose_scale=True,
+                    )
+                )
+            hidden_states = (hidden_states_quant, hidden_states_quant_scale)
+        else:
+            if residual is None:
+                residual = hidden_states
+                hidden_states = self.input_layernorm(hidden_states)
+            else:
+                hidden_states, residual = self.input_layernorm(hidden_states, residual)
+
+        state.hidden_states_after_comm_pre_attn = hidden_states
+        state.residual_after_input_ln = residual
+        state.update(dict(positions=positions, **kwargs))
+
+    def op_comm_prepare_mlp(self, state):
+        hidden_states = state.pop("hidden_states_after_attn")
+        residual = state.pop("residual_after_input_ln")
+        if not _is_non_idle_and_non_empty(state.forward_batch, hidden_states):
+            state.hidden_states_mlp_input = hidden_states
+            state.residual_after_comm_pre_mlp = residual
+            return
+
+        if hidden_states.dtype == torch.float16:
+            hidden_states *= 1.0 / self.routed_scaling_factor
+            if self.layer_idx == 0:
+                residual *= 1.0 / self.routed_scaling_factor
+        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        state.hidden_states_mlp_input = hidden_states
+        state.residual_after_comm_pre_mlp = residual
+
+    def op_mlp(self, state):
+        state.hidden_states_mlp_output = self.mlp(state.pop("hidden_states_mlp_input"))
+
+    def op_comm_postprocess_layer(self, state):
+        hidden_states = state.pop("hidden_states_mlp_output")
+        residual = state.pop("residual_after_comm_pre_mlp")
+        if isinstance(self.mlp, DeepseekV2MLP) and hidden_states.dtype == torch.float16:
+            hidden_states *= 1.0 / self.routed_scaling_factor
+        output = dict(
+            positions=state.positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=state.forward_batch,
+            tbo_subbatch_index=state.tbo_subbatch_index,
+        )
+        state.clear(expect_keys={"positions", "forward_batch", "tbo_subbatch_index"})
+        return output
+
 
 @support_torch_compile
 class DeepseekV2Model(nn.Module):
@@ -2118,13 +2337,37 @@ class DeepseekV2Model(nn.Module):
             residual = intermediate_tensors["residual"]
 
         aux_hidden_states = []
-        for idx in range(self.start_layer, self.end_layer):
-            layer = self.layers[idx]
-            if idx in self.aux_hidden_state_layers:
-                aux_hidden_states.append(
-                    hidden_states if residual is None else hidden_states + residual
+        forward_batch = _get_sglang_forward_batch_for_tbo()
+        if (
+            forward_batch is not None
+            and not self.aux_hidden_state_layers
+            and _can_run_sglang_fine_grain_tbo(forward_batch)
+        ):
+            tbo_start_layer = self.start_layer
+            while (
+                tbo_start_layer < self.end_layer
+                and not isinstance(self.layers[tbo_start_layer].mlp, DeepseekV2MoE)
+            ):
+                layer = self.layers[tbo_start_layer]
+                hidden_states, residual = layer(positions, hidden_states, residual)
+                tbo_start_layer += 1
+
+            if tbo_start_layer < self.end_layer:
+                hidden_states, residual = _run_sglang_fine_grain_tbo(
+                    layers=self.layers[tbo_start_layer : self.end_layer],
+                    positions=positions,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    forward_batch=forward_batch,
                 )
-            hidden_states, residual = layer(positions, hidden_states, residual)
+        else:
+            for idx in range(self.start_layer, self.end_layer):
+                layer = self.layers[idx]
+                if idx in self.aux_hidden_state_layers:
+                    aux_hidden_states.append(
+                        hidden_states if residual is None else hidden_states + residual
+                    )
+                hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
@@ -2153,7 +2396,53 @@ class DeepseekV2Model(nn.Module):
         )
 
 
+def _get_sglang_forward_batch_for_tbo():
+    try:
+        from atom.plugin.sglang.models.base_model_wrapper import (
+            get_current_forward_batch,
+        )
+    except ImportError:
+        return None
+    return get_current_forward_batch()
+
+
+def _can_run_sglang_fine_grain_tbo(forward_batch) -> bool:
+    try:
+        from atom.plugin.sglang.tbo.fine_grain import can_run
+    except ImportError:
+        return False
+    return can_run(forward_batch)
+
+
+def _run_sglang_fine_grain_tbo(
+    *,
+    layers,
+    positions: torch.Tensor,
+    hidden_states: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    forward_batch,
+):
+    from atom.plugin.sglang.tbo.fine_grain import run_deepseek_tbo
+
+    return run_deepseek_tbo(
+        layers=layers,
+        positions=positions,
+        hidden_states=hidden_states,
+        residual=residual,
+        forward_batch=forward_batch,
+    )
+
+
+def _is_non_idle_and_non_empty(forward_batch, tensor: torch.Tensor) -> bool:
+    forward_mode = getattr(forward_batch, "forward_mode", None)
+    if forward_mode is not None and getattr(forward_mode, "is_idle", lambda: False)():
+        return False
+    return int(tensor.shape[0]) > 0
+
+
 class DeepseekV2ForCausalLM(nn.Module):
+    supports_sglang_fine_grain_tbo = True
+
     def __init__(
         self,
         atom_config: Config,

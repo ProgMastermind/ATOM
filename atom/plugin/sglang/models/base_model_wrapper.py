@@ -495,8 +495,12 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 self.model_arch_spec.apply_deepseek_patch
                 or self.model_arch_spec.wrapper_binds_gdn_context
             )
+            uses_model_fine_grain_tbo = bool(
+                getattr(self.model, "supports_sglang_fine_grain_tbo", False)
+                and getattr(model_forward_batch, "can_run_tbo", False)
+            )
             with SGLangForwardBatchMetadata.bind(metadata):
-                if self.tbo_runner.can_run(
+                if (not uses_model_fine_grain_tbo) and self.tbo_runner.can_run(
                     atom_config=self.atom_config,
                     forward_batch=model_forward_batch,
                     model_inputs=model_inputs,

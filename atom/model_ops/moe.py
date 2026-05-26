@@ -2904,6 +2904,105 @@ class FusedMoE(torch.nn.Module):
             hidden_states, router_logits, self.layer_name
         )
 
+    def supports_fine_grain_tbo(self) -> bool:
+        return bool(
+            self.quant_method is not None
+            and getattr(self.quant_method, "fused_experts", None) is not None
+        )
+
+    def fine_grain_prepare(
+        self,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ):
+        fused_experts = getattr(self.quant_method, "fused_experts", None)
+        if fused_experts is None:
+            raise RuntimeError(
+                "Fine-grain TBO requires FusedMoEModularKernel-backed MoE"
+            )
+        quant_type = getattr(self.quant_method, "quant_type", QuantType.No)
+        return fused_experts._prepare(
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            self.global_num_experts,
+            self.expert_mask,
+            self.apply_router_weight_on_input,
+            quant_type,
+        )
+
+    def fine_grain_experts(
+        self,
+        hidden_states: torch.Tensor,
+        dispatch_a1: torch.Tensor,
+        dispatch_scale: Optional[torch.Tensor],
+        expert_tokens_meta,
+        dispatch_ids: torch.Tensor,
+        dispatch_weights: torch.Tensor,
+    ) -> torch.Tensor:
+        quant_method = self.quant_method
+        quant_type = getattr(quant_method, "quant_type", QuantType.No)
+        if int(dispatch_a1.shape[0]) == 0:
+            return dispatch_a1.new_zeros((0, self.hidden_size))
+        context = get_forward_context().context
+        dp_size = get_dp_group().world_size
+        topk = dispatch_ids.shape[1]
+        total_valid_tokens = context.graph_bs * topk * dp_size
+        if total_valid_tokens < dispatch_a1.shape[0] and not context.is_prefill:
+            dispatch_a1 = dispatch_a1[:total_valid_tokens]
+            dispatch_ids = dispatch_ids[:total_valid_tokens]
+            dispatch_weights = dispatch_weights[:total_valid_tokens]
+            if dispatch_scale is not None:
+                dispatch_scale = dispatch_scale[:total_valid_tokens]
+        return fused_moe(
+            dispatch_a1,
+            self.w13_weight,
+            self.w2_weight,
+            dispatch_weights,
+            dispatch_ids,
+            self.expert_mask,
+            self.activation,
+            quant_type=quant_type,
+            num_local_tokens=expert_tokens_meta.expert_num_tokens,
+            w1_scale=getattr(self, "w13_weight_scale", None),
+            w2_scale=getattr(self, "w2_weight_scale", None),
+            a1_scale=(
+                dispatch_scale
+                if dispatch_scale is not None
+                else getattr(self, "w13_input_scale", None)
+            ),
+            a2_scale=getattr(self, "w2_input_scale", None),
+            doweight_stage1=self.apply_router_weight_on_input,
+            hidden_pad=getattr(quant_method, "hidden_pad", 0),
+            intermediate_pad=getattr(quant_method, "intermediate_pad", 0),
+            bias1=getattr(self, "w13_bias", None),
+            bias2=getattr(self, "w2_bias", None),
+            dtype=hidden_states.dtype,
+        )
+
+    def fine_grain_finalize(
+        self,
+        output: torch.Tensor | None,
+        fused_out: torch.Tensor,
+        hidden_states: torch.Tensor,
+        topk_weights: torch.Tensor,
+        topk_ids: torch.Tensor,
+    ):
+        fused_experts = getattr(self.quant_method, "fused_experts", None)
+        if fused_experts is None:
+            raise RuntimeError(
+                "Fine-grain TBO requires FusedMoEModularKernel-backed MoE"
+            )
+        return fused_experts._finalize(
+            output,
+            fused_out,
+            hidden_states,
+            topk_weights,
+            topk_ids,
+            self.apply_router_weight_on_input,
+        )
+
     def forward_impl_graph(
         self, hidden_states: torch.Tensor, router_logits: torch.Tensor
     ):

@@ -26,14 +26,15 @@ def _pad_optional_list_field(batch: Any, field_name: str, batch_size: int) -> No
 
 
 def _normalize_tbo_batch_for_dp_padding(batch: Any) -> None:
-    """Make SGLang TBO split tolerate DP max-len padded decode batches.
+    """Make SGLang TBO split tolerate DP max-len padded decode/idle batches.
 
     Under DP attention SGLang may pad decode tensors from the local real request
-    count to the cross-DP max batch size. Some optional host-side list fields
-    such as ``rids`` still describe only real requests, but SGLang's native TBO
-    splitter asserts that these fields have ``batch_size`` entries before it
-    slices child batches. Padding those optional lists with ``None`` keeps the
-    dummy padded row aligned without changing token tensors or sampling state.
+    count to the cross-DP max batch size. Idle ranks can also be materialized as
+    dummy rows for TBO/MLP sync. Some optional host-side list fields such as
+    ``rids`` still describe only real requests, but SGLang's native TBO splitter
+    asserts that these fields have ``batch_size`` entries before it slices child
+    batches. Padding those optional lists with ``None`` keeps the dummy padded
+    row aligned without changing token tensors or sampling state.
     """
 
     batch_size = int(getattr(batch, "batch_size", 0) or 0)
@@ -41,7 +42,16 @@ def _normalize_tbo_batch_for_dp_padding(batch: Any) -> None:
         return
 
     forward_mode = getattr(batch, "forward_mode", None)
-    if forward_mode is None or not getattr(forward_mode, "is_decode", lambda: False)():
+    if forward_mode is None:
+        return
+    is_decode_or_idle = getattr(forward_mode, "is_decode_or_idle", None)
+    if callable(is_decode_or_idle):
+        should_normalize = is_decode_or_idle()
+    else:
+        should_normalize = getattr(forward_mode, "is_decode", lambda: False)() or getattr(
+            forward_mode, "is_idle", lambda: False
+        )()
+    if not should_normalize:
         return
 
     for field_name in ("rids", "lora_ids"):
