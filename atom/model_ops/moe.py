@@ -225,6 +225,14 @@ def reduce_scatter_with_unpadding(
     return scattered_output
 
 
+def all_gatherv(x: torch.Tensor, sizes: list[int], group) -> torch.Tensor:
+    return group.device_communicator.all_gatherv(x, dim=0, sizes=list(sizes))
+
+
+def reduce_scatterv(x: torch.Tensor, sizes: list[int], group) -> torch.Tensor:
+    return group.device_communicator.reduce_scatterv(x, dim=0, sizes=list(sizes))
+
+
 @torch_compile_guard()
 def get_max_tokens_across_dispatchers(input: torch.Tensor) -> int:
     return input.item()
@@ -2028,8 +2036,6 @@ class FusedMoE(torch.nn.Module):
         self.e_score_correction_bias = e_score_correction_bias
         self.activation = activation
 
-        self.use_chunked = get_dp_group().world_size > 1
-
         moe = FusedMoEConfig(
             num_experts=self.global_num_experts,
             experts_per_token=self.top_k,
@@ -2912,6 +2918,7 @@ class FusedMoE(torch.nn.Module):
         # 2. DP attention + EP mori Moe
         # 3. DP attention + TP All_gahter/reduce Moe
         original_hidden_size = None
+        sizes = None
         # Use all_gather/reduce_scatter when DP > 1 but not using mori all2all kernels
         use_dp_gather_scatter = (
             self.dp_size > 1
@@ -2919,6 +2926,10 @@ class FusedMoE(torch.nn.Module):
             and get_current_atom_config().enable_dp_attention
         )
         if use_dp_gather_scatter:
+            ctx = get_forward_context()
+            dp_group = get_dp_group()
+            dp_variable_len = not ctx.context.dp_uniform_decode
+
             from atom.utils.tbo.ubatching import tbo_active
 
             _tbo = tbo_active()
@@ -2930,8 +2941,32 @@ class FusedMoE(torch.nn.Module):
                 )
 
                 tbo_yield_and_switch_from_compute_to_comm()
-            hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
-            router_logits, _ = all_gather_with_padding(router_logits)
+
+            if dp_variable_len:
+                sizes = ctx.dp_metadata.get_sizes_across_dp()
+                original_hidden_size = hidden_states.shape[0]
+                _h_dim = hidden_states.shape[-1]
+                _r_dim = router_logits.shape[-1]
+                _r_dtype = router_logits.dtype
+                _r_for_gather = (
+                    router_logits
+                    if _r_dtype == hidden_states.dtype
+                    else router_logits.to(hidden_states.dtype)
+                )
+                _combined = torch.cat([hidden_states, _r_for_gather], dim=-1)
+                _combined = all_gatherv(_combined, sizes, dp_group)
+                hidden_states, router_logits = _combined.split([_h_dim, _r_dim], dim=-1)
+                hidden_states = hidden_states.contiguous()
+                if router_logits.dtype != _r_dtype:
+                    router_logits = router_logits.to(_r_dtype)
+                else:
+                    router_logits = router_logits.contiguous()
+            else:
+                hidden_states, original_hidden_size = all_gather_with_padding(
+                    hidden_states
+                )
+                router_logits, _ = all_gather_with_padding(router_logits)
+
             if _tbo:
                 tbo_switch_to_compute_sync()
 
@@ -2959,9 +2994,14 @@ class FusedMoE(torch.nn.Module):
         if use_dp_gather_scatter:
             if _tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
-            final_hidden_states = reduce_scatter_with_unpadding(
-                final_hidden_states, original_hidden_size
-            )
+            if dp_variable_len:
+                final_hidden_states = reduce_scatterv(
+                    final_hidden_states, sizes, dp_group
+                )
+            else:
+                final_hidden_states = reduce_scatter_with_unpadding(
+                    final_hidden_states, original_hidden_size
+                )
             if _tbo:
                 tbo_yield_and_switch_from_comm_to_compute()
 
@@ -2975,10 +3015,9 @@ class FusedMoE(torch.nn.Module):
 
     def forward_impl(self, hidden_states: torch.Tensor, router_logits: torch.Tensor):
         assert self.quant_method is not None
-        # cuda graph not supported forward with combine and dispatch
-        if self.use_chunked:
+
+        if get_dp_group().world_size > 1:
             return self.forward_impl_graph(hidden_states, router_logits)
-            # return self.forward_impl_chunked(hidden_states, router_logits)
 
         dp_group = get_dp_group()
         if dp_group.world_size > 1:

@@ -982,14 +982,7 @@ class ModelRunner:
             is_dummy_run=True,
         )
 
-        bs = self.prepare_inputs(dummy_batch)
-        self.forward_vars["input_ids"].gpu[:bs].zero_()
-        input_ids = self.forward_vars["input_ids"].gpu[:bs]
-
-        logits, hidden_states = self.run_model(input_ids)
-        self._run_dummy_drafter(hidden_states)
-
-        reset_forward_context()
+        self.forward(dummy_batch)
         logger.debug(
             f"{self.label}: dummy batch executed with {dummy_batch.total_tokens_num} tokens"
         )
@@ -1573,7 +1566,7 @@ class ModelRunner:
         dp_rank = self.config.parallel_config.data_parallel_rank
 
         if dp_size <= 1:
-            return num_input_tokens, None, None
+            return num_input_tokens, None, None, False, None
 
         reqs_across_dp = None
         if self.config.enable_tbo:
@@ -1593,15 +1586,49 @@ class ModelRunner:
         else:
             _, num_tokens_across_dp = self.get_dp_padding(num_input_tokens)
 
-        num_input_tokens = int(torch.max(num_tokens_across_dp).item())
-        return num_input_tokens, num_tokens_across_dp, reqs_across_dp
+        max_tokens = int(torch.max(num_tokens_across_dp).item())
+
+        # Sync is_prefill across DP ranks: if ANY rank has prefill, all go eager
+        prefill_flag = torch.tensor(
+            [1 if is_prefill else 0], dtype=torch.int32, device="cpu"
+        )
+        torch.distributed.all_reduce(
+            prefill_flag,
+            op=torch.distributed.ReduceOp.MAX,
+            group=get_dp_group().cpu_group,
+        )
+        any_rank_has_prefill = prefill_flag.item() == 1
+        # vLLM-style flag: True iff this step is safe for the fixed-size
+        # CUDAGraph path across DP ranks (no rank doing prefill, or DP off).
+        dp_uniform_decode = (not any_rank_has_prefill) or (
+            not self.config.enable_dp_attention
+        )
+
+        if dp_uniform_decode:
+            # CUDAGraph path: all ranks pad to same max for fixed-size all_gather
+            num_input_tokens = max_tokens
+        # else: variable-length path — each rank keeps its own token count
+
+        return (
+            num_input_tokens,
+            num_tokens_across_dp,
+            reqs_across_dp,
+            dp_uniform_decode,
+            max_tokens,
+        )
 
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):
         is_prefill = batch.total_tokens_num_prefill > 0
         bs = batch.total_seqs_num
         num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
         cu_seqlens_q, arange = self._get_cumsum_and_arange(num_scheduled_tokens)
-        num_input_tokens, num_tokens_across_dp, reqs_across_dp = self._preprocess(batch)
+        (
+            num_input_tokens,
+            num_tokens_across_dp,
+            reqs_across_dp,
+            dp_uniform_decode,
+            max_tokens,
+        ) = self._preprocess(batch)
         self.forward_vars["cu_seqlens_q"].np[1 : bs + 1] = cu_seqlens_q
         if not is_prefill:
             scheduled_bs = batch.total_seqs_num_decode
@@ -1620,7 +1647,6 @@ class ModelRunner:
                     (x for x in self.graph_bs if x >= padded_scheduled_bs),
                     padded_scheduled_bs,
                 )
-                # Use cudagraph and padding to batch_size, if bs > graph_bs, use eager mode
             )
             assert (
                 bs >= padded_scheduled_bs
@@ -1631,7 +1657,6 @@ class ModelRunner:
         attn_metadata, positions = self.attn_metadata_builder.build(batch=batch, bs=bs)
         context_bs = batch.total_seqs_num_prefill if is_prefill else scheduled_bs
 
-        # graph_bs should be batch size (number of sequences), not token count
         graph_bs = num_input_tokens if is_prefill else bs
         context = Context(
             positions=positions,
@@ -1639,7 +1664,9 @@ class ModelRunner:
             is_dummy_run=batch.is_dummy_run,
             batch_size=context_bs,
             graph_bs=graph_bs,
+            dp_uniform_decode=dp_uniform_decode,
         )
+
         actual_num_tokens = batch.total_tokens_num
 
         spec_decode_metadata = None
@@ -1748,9 +1775,18 @@ class ModelRunner:
         is_prefill = context.is_prefill
         positions = context.positions
 
-        if is_prefill or self.enforce_eager or bs > self.graph_bs[-1]:
-            # prefill[bs=1 tok=115 ctx=115]
-            label = f"prefill[bs={bs}" if is_prefill else f"eager_decode[bs={bs}"
+        if (
+            is_prefill
+            or self.enforce_eager
+            or not context.dp_uniform_decode
+            or bs > self.graph_bs[-1]
+        ):
+            # prefill, or decode forced eager (enforce_eager / DP peer
+            # prefill / bs above the largest captured graph).
+            if is_prefill:
+                label = f"prefill[bs={bs}"
+            else:
+                label = f"eager_decode[bs={bs}"
             if batch is not None:
                 ctx = batch.context_lens
                 if len(ctx) == 1:

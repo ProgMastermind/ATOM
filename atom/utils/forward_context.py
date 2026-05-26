@@ -147,6 +147,11 @@ class DPMetadata:
     def get_chunk_sizes_across_dp_rank(self) -> Optional[list[int]]:
         return self.local_sizes
 
+    def get_sizes_across_dp(self) -> list[int]:
+        """Per-rank token counts derived from cumulative tensor."""
+        cu = self.cu_tokens_across_dp_cpu
+        return [(cu[i] - (cu[i - 1] if i > 0 else 0)).item() for i in range(len(cu))]
+
 
 @dataclass
 class SpecDecodeMetadata:
@@ -167,6 +172,10 @@ class Context:
     batch_size: int = 0
     graph_bs: int = 0
     is_draft: bool = False
+    # True iff all DP ranks are running pure decode this step (DP-disabled
+    # case is treated as True). Mirrors vLLM's `uniform_decode` flag and
+    # gates DP-specific variable-length all_gather/scatter paths.
+    dp_uniform_decode: bool = True
     # Optional flat token ids for the current forward. Read by callbacks
     # invoked inside Dynamo-opaque custom ops (e.g. V4 MoE hash routing)
     # that need the token ids but cannot receive them as a function arg
@@ -181,6 +190,7 @@ class Context:
         batch_size: int = 0,
         graph_bs: int = 0,
         is_draft: bool = False,
+        dp_uniform_decode: bool = True,
         input_ids: Optional[torch.Tensor] = None,
     ):
         self.positions = positions
@@ -189,6 +199,7 @@ class Context:
         self.batch_size = batch_size
         self.graph_bs = graph_bs
         self.is_draft = is_draft
+        self.dp_uniform_decode = dp_uniform_decode
         self.input_ids = input_ids
 
 

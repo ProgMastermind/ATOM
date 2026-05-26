@@ -18,6 +18,7 @@ This module provides:
 from __future__ import annotations
 
 import logging
+import os
 import time
 from collections import deque
 from typing import Optional
@@ -31,6 +32,15 @@ from atom.model_engine.request import RequestOutput
 from atom.model_engine.sequence import Sequence, SequenceStatus, SequenceType
 
 logger = logging.getLogger("atom")
+
+# Chunked-prefill threshold (in tokens). 0 = disabled (legacy single-shot
+# prefill). When set, each forward admits at most `threshold` *new* prompt
+# tokens per prefill seq, and an in-flight chunked prefill seq is given
+# absolute priority over both decode and new-prefill admission so that no
+# more than ONE prefill seq is half-finished at any time. Steps remain
+# pure-prefill or pure-decode (no mixed batches) to preserve the
+# attention/MoE/DP-sync invariants the rest of the stack relies on.
+_LONG_PREFILL_THRESHOLD = int(os.environ.get("ATOM_LONG_PREFILL_THRESHOLD", "0"))
 
 
 class SpecStats:
@@ -226,7 +236,19 @@ class ScheduledBatch:
         scheduled_spec_decode_tokens: dict[int, np.ndarray] | None = None,
         remote_kv_block_ids: list[int] | None = None,
         remote_kv_seq_blocks: dict[int, list[int]] | None = None,
+        chunked_overrides: dict[int, tuple[int, int]] | None = None,
     ):
+        """
+        chunked_overrides: per-seq override for (effective_context_len,
+        effective_cached_tokens) when a prefill seq is being run as a chunk
+        rather than the full prompt. Lets prepare_prefill see the seq as if
+        its prompt were `effective_context_len` long with `effective_cached`
+        tokens already in KV, so seqlen_q = ctx - cached = chunk_size and
+        positions = range(cached, ctx) line up with the new tokens of this
+        chunk only. Block tables (allocated for the full prompt at chunk 0)
+        and num_blocks are reused as-is — the unwritten blocks for future
+        chunks just sit unfilled until those chunks run.
+        """
         if scheduled_spec_decode_tokens is None:
             scheduled_spec_decode_tokens = {}
         self.remote_kv_block_ids = remote_kv_block_ids or []
@@ -244,9 +266,18 @@ class ScheduledBatch:
         self.temperatures = np.asarray(
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
-        self.context_lens = np.asarray(
-            [seq.num_tokens for seq in seqs.values()], dtype=np.int32
-        )
+        # Effective context length per seq. For a chunked prefill seq, this
+        # is the cumulative token count *after* this chunk completes
+        # (= num_computed_tokens_after_chunk), NOT the full prompt length.
+        # That makes seqlen_q = context_len - num_cached = chunk_size in
+        # prepare_prefill without touching that function.
+        _ctx = []
+        for _sid, _seq in seqs.items():
+            if chunked_overrides and _sid in chunked_overrides:
+                _ctx.append(chunked_overrides[_sid][0])
+            else:
+                _ctx.append(_seq.num_tokens)
+        self.context_lens = np.asarray(_ctx, dtype=np.int32)
         self.num_rejected = np.asarray(
             [seq.num_rejected for seq in seqs.values()], dtype=np.int32
         )
@@ -288,10 +319,28 @@ class ScheduledBatch:
         self.block_tables = [
             seq.block_table for seq in seqs.values() if seq.block_table
         ]
-        self.last_block_num_tokens = [
-            seq.last_block_num_tokens for seq in seqs.values()
-        ]
-        self.num_cached_tokens = [seq.num_cached_tokens for seq in seqs.values()]
+        # last_block_num_tokens must match effective context_len so the
+        # prepare_prefill slot_mapping loop ends on the right partial block.
+        _lbnt = []
+        for i, (_sid, _seq) in enumerate(seqs.items()):
+            eff = int(self.context_lens[i])
+            if chunked_overrides and _sid in chunked_overrides:
+                bs = _seq.block_size
+                nblk = (eff + bs - 1) // bs
+                _lbnt.append(eff - (nblk - 1) * bs)
+            else:
+                _lbnt.append(_seq.last_block_num_tokens)
+        self.last_block_num_tokens = _lbnt
+        # num_cached_tokens override: for a chunked prefill seq, the "cached"
+        # half is everything already computed in previous chunks. prepare_prefill
+        # uses this to start `positions` at this chunk's first token.
+        _nct = []
+        for _sid, _seq in seqs.items():
+            if chunked_overrides and _sid in chunked_overrides:
+                _nct.append(chunked_overrides[_sid][1])
+            else:
+                _nct.append(_seq.num_cached_tokens)
+        self.num_cached_tokens = _nct
 
         # Total number of tokens scheduled for all requests.
         self.total_tokens_num = total_tokens_num
@@ -413,6 +462,63 @@ class Scheduler:
         from atom.utils.forward_context import get_kvconnector
 
         self.kv_connector = get_kvconnector("scheduler", config)
+
+        # Cross-DP prefill alignment. Set by DPEngineCoreProc after
+        # dp_group is available. See `prefill_delayer.py` for rationale.
+        from atom.model_engine.prefill_delayer import PrefillDelayer
+
+        self.prefill_delayer: Optional[PrefillDelayer] = None
+
+    def set_prefill_delayer(self, delayer) -> None:
+        self.prefill_delayer = delayer
+
+    def _can_admit_head_prefill(self) -> bool:
+        """Match SGL's `local_prefillable=True` semantics: report True iff
+        this rank would *actually* admit a new prefill this tick.
+
+        Just having `self.waiting` non-empty is too coarse — during a
+        concurrent-burst workload (e.g. 1k/1k @ high concurrency) every
+        DP rank has a full waiting queue, so `bool(self.waiting)` is
+        ALWAYS True on all ranks → status="all" → delayer never engages.
+        But only the 1-2 ranks with free KV blocks actually admit a
+        prefill that tick; the other 6-7 ranks decode. That's the real
+        "mixed" we need to delay.
+
+        We peek the front of `waiting` (skipping a few unschedulable
+        entries) and check `can_allocate` + token-budget, mirroring the
+        same checks the admission while-loop runs below.
+        """
+        if not self.waiting:
+            return False
+        # Bounded peek: in practice the head is admissible or not; we
+        # cap at 4 to avoid pathological O(queue) work per tick.
+        for i, seq in enumerate(self.waiting):
+            if i >= 4:
+                break
+            if self._unschedulable_reason(seq) is not None:
+                continue
+            if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
+            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            if num_new_tokens > self.max_num_batched_tokens:
+                continue
+            if not self.block_manager.can_allocate(seq):
+                return False  # KV-pressured: definitely cannot prefill
+            return True
+        return False
+
+    def _kv_usage(self) -> float:
+        """Fraction of KV-cache blocks currently in use ∈ [0, 1].
+
+        Used as the `token_usage` signal for PrefillDelayer's low-watermark
+        safety valve. Derived from BlockManager bookkeeping; cheap (no
+        traversal of seq tables).
+        """
+        bm = self.block_manager
+        total = len(bm.blocks)
+        if total <= 0:
+            return 0.0
+        return len(bm.used_block_ids) / total
 
     def is_finished(self):
         # `_rejected` must be considered too: if a batch of seqs is all
@@ -541,11 +647,89 @@ class Scheduler:
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
 
+        # ─── Cross-DP prefill alignment (PrefillDelayer) ───────────────
+        _delayer_allows_prefill = True
+        if self.prefill_delayer is not None:
+            _delayer_allows_prefill = self.prefill_delayer.should_allow_prefill(
+                local_prefillable=self._can_admit_head_prefill(),
+                token_usage=self._kv_usage(),
+            )
+
         if not self.running and not self.waiting:
             return None
 
-        # --- Prefill scheduling ---
-        while self.waiting and num_seqs_prefill < self.max_num_seqs:
+        threshold = _LONG_PREFILL_THRESHOLD
+        block_size = self.block_manager.block_size
+        if threshold > 0 and threshold % block_size != 0:
+            # Align down so chunk boundaries land on block boundaries
+            # (prepare_prefill's slot_mapping loop iterates whole blocks).
+            threshold = max(block_size, (threshold // block_size) * block_size)
+        chunked_overrides: dict[int, tuple[int, int]] = {}
+
+        if threshold > 0:
+            in_flight_seq = next(
+                (
+                    s
+                    for s in self.running
+                    if s.type == SequenceType.PREFILL and not s.is_prefill_done
+                ),
+                None,
+            )
+            if in_flight_seq is not None:
+                seq = in_flight_seq
+                remaining = seq.num_prompt_tokens - seq.num_computed_tokens
+                avail = self.max_num_batched_tokens
+                chunk = min(remaining, threshold, avail)
+                # Final chunk may be non-aligned; intermediate chunks must
+                # be a multiple of block_size so blocks fill exactly.
+                if chunk < remaining and chunk >= block_size:
+                    chunk = (chunk // block_size) * block_size
+                assert chunk > 0, (
+                    f"chunked prefill produced empty chunk for seq {seq.id} "
+                    f"(remaining={remaining} threshold={threshold} avail={avail})"
+                )
+                chunk_start = seq.num_computed_tokens
+                chunk_end = chunk_start + chunk
+                chunked_overrides[seq.id] = (chunk_end, chunk_start)
+                seq.num_computed_tokens = chunk_end
+                if chunk_end >= seq.num_prompt_tokens:
+                    seq.is_prefill_done = True
+                scheduled_seqs[seq.id] = seq
+                num_scheduled_tokens.append(chunk)
+                num_seqs_prefill = 1
+                num_batched_tokens = chunk
+                total_tokens_num_prefill = chunk
+                logger.info(
+                    f"Scheduled prefill CHUNK: seq {seq.id} "
+                    f"chunk=[{chunk_start},{chunk_end}) of {seq.num_prompt_tokens}, "
+                    f"done={seq.is_prefill_done}"
+                )
+                self.prev_prompt = True
+                connector_meta_output = None
+                if self.kv_connector is not None:
+                    connector_meta_output = self.kv_connector.build_connector_meta()
+                return (
+                    ScheduledBatch(
+                        seqs=scheduled_seqs,
+                        num_scheduled_tokens=num_scheduled_tokens,
+                        total_tokens_num=total_tokens_num_prefill,
+                        total_tokens_num_prefill=total_tokens_num_prefill,
+                        total_seqs_num=num_seqs_prefill,
+                        total_seqs_num_prefill=num_seqs_prefill,
+                        connector_meta_output=connector_meta_output,
+                        chunked_overrides=chunked_overrides,
+                    ),
+                    scheduled_seqs,
+                )
+
+        # --- Prefill scheduling --- (gated by `_delayer_allows_prefill`
+        # computed at the very top of schedule() to keep the cross-DP
+        # collective aligned across all early-return paths)
+        while (
+            _delayer_allows_prefill
+            and self.waiting
+            and num_seqs_prefill < self.max_num_seqs
+        ):
             seq = self.waiting.popleft()
 
             # Drop seqs the static-capacity check at submit-time flagged as
@@ -626,12 +810,34 @@ class Scheduler:
             num_new_tokens = seq.num_tokens - seq.num_cached_tokens
             if self.cache_stats:
                 self.cache_stats.update(seq.num_cached_tokens, seq.num_tokens)
+            # Chunked prefill: first chunk only. Final chunk may be smaller.
+            # Block-aligned cap unless this *is* the final chunk.
+            if threshold > 0:
+                chunk = min(num_new_tokens, threshold)
+                if chunk < num_new_tokens and chunk >= block_size:
+                    chunk = (chunk // block_size) * block_size
+                chunk = max(chunk, 1)  # never empty
+                chunk_start = seq.num_cached_tokens
+                chunk_end = chunk_start + chunk
+                chunked_overrides[seq.id] = (chunk_end, chunk_start)
+                seq.num_computed_tokens = chunk_end
+                seq.is_prefill_done = chunk_end >= seq.num_prompt_tokens
+                num_new_tokens = chunk
+            else:
+                # Legacy: prefill completes in one shot.
+                seq.num_computed_tokens = seq.num_tokens
+                seq.is_prefill_done = True
             num_batched_tokens += num_new_tokens
             seq.status = SequenceStatus.RUNNING
             seq.type = SequenceType.PREFILL
             self.running.append(seq)
             scheduled_seqs[seq.id] = seq
             num_scheduled_tokens.append(num_new_tokens)
+
+            # Chunked mode: only admit one new prefill per step (the first
+            # chunk must monopolize the next step's chunk continuation).
+            if threshold > 0:
+                break
 
         if skipped_waiting_requests:
             logger.debug(
@@ -665,6 +871,7 @@ class Scheduler:
                     total_seqs_num=num_seqs_prefill,
                     total_seqs_num_prefill=num_seqs_prefill,
                     connector_meta_output=connector_meta_output,
+                    chunked_overrides=chunked_overrides,
                 ),
                 scheduled_seqs,
             )
@@ -756,6 +963,11 @@ class Scheduler:
         seq.num_bonus_tokens = 0
         seq.spec_token_ids = np.array([], dtype=np.int32)
         seq.is_first_decode = False
+        # Reset chunked-prefill bookkeeping so the re-admitted seq restarts
+        # prefill from scratch (block_manager.allocate() at re-admission
+        # will refresh num_cached_tokens from prefix-cache hits).
+        seq.num_computed_tokens = 0
+        seq.is_prefill_done = False
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
 
