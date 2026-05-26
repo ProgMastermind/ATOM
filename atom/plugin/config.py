@@ -336,6 +336,8 @@ def _generate_atom_config_from_sglang_config(config: Any):
         enable_expert_parallel=bool(server_args.ep_size > 1),
         master_addr=None,
         enable_dp_attention=server_args.enable_dp_attention,
+        enable_tbo=bool(server_args.enable_two_batch_overlap),
+        enable_tbo_decode=False,
         plugin_config=plugin_config,
     )
 

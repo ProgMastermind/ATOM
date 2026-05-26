@@ -374,6 +374,9 @@ class _AtomCausalLMBaseForSglang(nn.Module):
             raise ValueError(
                 f"ATOM failed to create model for architecture {self.model_arch}"
             )
+        from atom.plugin.sglang.tbo import SGLangAtomTBORunner
+
+        self.tbo_runner = SGLangAtomTBORunner(self.model)
 
         # Under SGLang dp-attention, ATOM runtime interprets non-MoE modules
         # like lm_head with tp=1 semantics, so plugin logits must not perform
@@ -493,7 +496,22 @@ class _AtomCausalLMBaseForSglang(nn.Module):
                 or self.model_arch_spec.wrapper_binds_gdn_context
             )
             with SGLangForwardBatchMetadata.bind(metadata):
-                if self.model_arch_spec.wrapper_binds_gdn_context:
+                if self.tbo_runner.can_run(
+                    atom_config=self.atom_config,
+                    forward_batch=model_forward_batch,
+                    model_inputs=model_inputs,
+                    uses_context_only_forward=uses_context_only_forward,
+                    pp_proxy_tensors=pp_proxy_tensors,
+                ):
+                    hidden_states = self.tbo_runner.run(
+                        atom_config=self.atom_config,
+                        model_inputs=model_inputs,
+                        forward_batch=model_forward_batch,
+                        metadata=metadata,
+                        set_atom_forward_context=_set_sglang_forward_context,
+                        reset_atom_forward_context=_reset_sglang_forward_context,
+                    )
+                elif self.model_arch_spec.wrapper_binds_gdn_context:
                     from atom.plugin.sglang.attention_backend.attention_gdn import (
                         SGLangGDNForwardContext,
                     )

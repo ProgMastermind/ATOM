@@ -74,6 +74,7 @@ class TBOContext:
         cpu_signal_event: threading.Event,
         gpu_comm_done_event: torch.Event,
         gpu_compute_done_event: torch.Event,
+        restore_callback: Optional[Callable[[], None]] = None,
     ):
         self.ubatch_id = ubatch_id
         self.compute_stream = compute_stream
@@ -86,6 +87,7 @@ class TBOContext:
         self.gpu_compute_done_event = gpu_compute_done_event
         self.current_stream = compute_stream
         self.recv_hook: Optional[Callable] = None
+        self.restore_callback = restore_callback
 
     # -- context manager protocol ----------------------------------------
 
@@ -154,6 +156,8 @@ class TBOContext:
         from atom.utils.forward_context import _forward_context_local
 
         _forward_context_local.ctx = self.forward_context
+        if self.restore_callback is not None:
+            self.restore_callback()
 
     # -- CPU yield (ping-pong) -------------------------------------------
 
@@ -265,6 +269,7 @@ def make_tbo_contexts(
     comm_stream: torch.cuda.Stream,
     forward_contexts: list,
     ready_barrier: threading.Barrier,
+    restore_callbacks: Optional[list[Callable[[], None]]] = None,
 ) -> list[TBOContext]:
     """Create TBOContext instances for all micro-batches.
 
@@ -285,6 +290,7 @@ def make_tbo_contexts(
 
     ctxs = []
     for i in range(num_micro_batches):
+        restore_callback = None if restore_callbacks is None else restore_callbacks[i]
         ctx = TBOContext(
             ubatch_id=i,
             compute_stream=compute_stream,
@@ -295,6 +301,7 @@ def make_tbo_contexts(
             cpu_signal_event=cpu_events[(i + 1) % num_micro_batches],
             gpu_comm_done_event=gpu_comm_done_events[i],
             gpu_compute_done_event=gpu_compute_done_events[i],
+            restore_callback=restore_callback,
         )
         ctxs.append(ctx)
 
