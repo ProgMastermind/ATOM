@@ -1029,13 +1029,13 @@ jobs:
           done
 
       - name: Wait for prefill to finish benchmarks
-        timeout-minutes: 90
+        timeout-minutes: 180
         uses: actions/github-script@v7
         with:
           script: |
             const artifactName = 'pd-done-${{ matrix.entry.prefix }}';
             core.info('Consumer is running. Waiting for prefill job to complete...');
-            for (let i = 0; i < 180; i++) {
+            for (let i = 0; i < 360; i++) {
               try {
                 const { data } = await github.rest.actions.listWorkflowRunArtifacts({
                   owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
@@ -1045,7 +1045,7 @@ jobs:
                   return;
                 }
               } catch (e) {}
-              if (i === 179) { core.info('Timed out waiting for prefill, exiting'); return; }
+              if (i === 359) { core.info('Timed out waiting for prefill, exiting'); return; }
               await new Promise(r => setTimeout(r, 30000));
             }
 
