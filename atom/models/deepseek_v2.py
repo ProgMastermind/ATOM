@@ -31,6 +31,7 @@ from aiter import (
     QuantType,
     cp_gather_indexer_k_quant_cache,
     dtypes,
+    fused_qk_rmsnorm,
     gemm_a8w8_blockscale_bpreshuffle,
     get_hip_quant,
     indexer_k_quant_and_cache,
@@ -41,11 +42,7 @@ from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.dist.parallel_state import get_pp_group, get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.triton.fp8_mqa_logits import fp8_mqa_logits
-from aiter.ops.triton.fused_fp8_quant import (
-    fused_reduce_rms_fp8_group_quant,
-    fused_rms_fp8_group_quant,
-)
-from aiter import fused_qk_rmsnorm
+from aiter.ops.triton.fused_fp8_quant import fused_reduce_rms_fp8_group_quant
 from aiter.ops.triton.fused_mxfp4_quant import (
     fused_reduce_rms_mxfp4_quant,
     fused_rms_mxfp4_quant,
@@ -68,7 +65,7 @@ from atom.model_ops.linear import (
 )
 from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
-from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE
+from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE, atom_parameter
 from atom.models.utils import (
     IntermediateTensors,
     PPMissingLayer,
@@ -80,6 +77,10 @@ from atom.utils import envs
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
+from atom.plugin.attention_mla_sparse import (
+    IndexerDecoratorForPluginMode,
+    DeepseekV32IndexerCacheDecoratorForPluginMode,
+)
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -175,14 +176,9 @@ def _fused_rms_fp8_group_quant_fake(
 ]:
     m, n1 = x1.shape
     out1_quantized = torch.empty((m, n1), dtype=dtype_quant, device=x1.device)
-    out1_bs = torch.empty(
-        (m, (n1 + group_size - 1) // group_size), dtype=torch.float32, device=x1.device
-    )
-    if transpose_scale:
-        out1_bs = out1_bs.transpose(0, 1).contiguous().view(*out1_bs.shape)
-    out1_unquantized = None
-    if output_unquantized_inp1:
-        out1_unquantized = torch.empty_like(x1)
+    num_bs_cols = (n1 + group_size - 1) // group_size
+    out1_bs = torch.empty((m, num_bs_cols), dtype=torch.float32, device=x1.device)
+    out1_unquantized = torch.empty_like(x1) if output_unquantized_inp1 else None
     out2 = None
     if x2 is not None:
         _, n2 = x2.shape
@@ -255,20 +251,39 @@ def _fused_rms_fp8_group_quant(
     torch.Tensor,
     torch.Tensor,
 ]:
-    (out1_quantized, out1_bs), out1_unquantized, out2, out_res1 = (
-        fused_rms_fp8_group_quant(
+    out1_quantized, out1_bs, out1_unquantized, out2, out_res1 = (
+        _fused_rms_fp8_group_quant_fake(
             x1,
             x1_weight,
             x1_epsilon,
             x2,
             x2_weight,
             x2_epsilon,
-            group_size,
-            dtype_quant,
             res1,
+            dtype_quant,
+            group_size,
             output_unquantized_inp1,
             transpose_scale,
         )
+    )
+
+    from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+
+    fused_qk_rmsnorm_group_quant(
+        q_out_quantized=out1_quantized,
+        q_out_scale=out1_bs,
+        q=x1,
+        q_weight=x1_weight,
+        q_epsilon=x1_epsilon,
+        q_out_unquantized=out1_unquantized,
+        k_out=out2,
+        q_res_out=out_res1,
+        k=x2,
+        k_weight=x2_weight,
+        k_epsilon=x2_epsilon,
+        q_residual=res1,
+        group_size=group_size,
+        transpose_scale=transpose_scale,
     )
     return out1_quantized, out1_bs, out1_unquantized, out2, out_res1
 
@@ -683,6 +698,36 @@ def _fuse_qkv_a_proj_reduce_rmsnorm_quant(
     return q_c, q_c_scale, kv_c_normed, k_pe
 
 
+def _fused_qk_rmsnorm_fake(
+    q_c: torch.Tensor,
+    q_a_layernorm_weight: torch.Tensor,
+    q_a_layernorm_variance_epsilon: float,
+    kv_c: torch.Tensor,
+    kv_a_layernorm_weight: torch.Tensor,
+    kv_a_layernorm_variance_epsilon: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(q_c), torch.empty_like(kv_c)
+
+
+@torch_compile_guard(gen_fake=_fused_qk_rmsnorm_fake)
+def _fused_qk_rmsnorm(
+    q_c: torch.Tensor,
+    q_a_layernorm_weight: torch.Tensor,
+    q_a_layernorm_variance_epsilon: float,
+    kv_c: torch.Tensor,
+    kv_a_layernorm_weight: torch.Tensor,
+    kv_a_layernorm_variance_epsilon: float,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return fused_qk_rmsnorm(
+        q_c,
+        q_a_layernorm_weight,
+        q_a_layernorm_variance_epsilon,
+        kv_c,
+        kv_a_layernorm_weight,
+        kv_a_layernorm_variance_epsilon,
+    )
+
+
 class DeepseekV2MLP(nn.Module):
 
     def __init__(
@@ -791,7 +836,7 @@ class DeepseekV2MoE(nn.Module):
             prefix=f"{prefix}.gate",
         )
         if config.topk_method == "noaux_tc":
-            self.gate.e_score_correction_bias = nn.Parameter(
+            self.gate.e_score_correction_bias = atom_parameter(
                 torch.empty(config.n_routed_experts)
             )
         else:
@@ -823,7 +868,8 @@ class DeepseekV2MoE(nn.Module):
 
         if config.n_shared_experts is not None:
             if not is_rocm_aiter_fusion_shared_expert_enabled():
-                if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0:
+                tbo_active = get_current_atom_config().enable_tbo
+                if envs.ATOM_DUAL_STREAM_MOE_TOKEN_THRESHOLD > 0 and not tbo_active:
                     self._use_dual_stream = True
                     compilation_config = get_current_atom_config().compilation_config
                     compilation_config.static_forward_context[prefix] = self
@@ -874,9 +920,11 @@ class DeepseekV2MoE(nn.Module):
         alt_stream.wait_stream(current_stream)
 
         with torch.cuda.stream(alt_stream):
-            final_hidden_states = self.routed_expert_forward(hidden_states)
+            # final_hidden_states = self.routed_expert_forward(hidden_states)
+            shared_output = self.shared_experts(hidden_states)
 
-        shared_output = self.shared_experts(hidden_states)
+        final_hidden_states = self.routed_expert_forward(hidden_states)
+        # shared_output = self.shared_experts(hidden_states)
 
         current_stream.wait_stream(alt_stream)
 
@@ -925,6 +973,7 @@ def yarn_get_mscale(scale: float = 1, mscale: float = 1) -> float:
     return 0.1 * mscale * math.log(scale) + 1.0
 
 
+@DeepseekV32IndexerCacheDecoratorForPluginMode
 class DeepseekV32IndexerCache(nn.Module):
 
     def __init__(
@@ -1101,6 +1150,7 @@ direct_register_custom_op(
 )
 
 
+@IndexerDecoratorForPluginMode
 class Indexer(nn.Module):
 
     def __init__(
@@ -1142,7 +1192,7 @@ class Indexer(nn.Module):
         self.weights_proj = ReplicatedLinear(
             hidden_size,
             self.n_head,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.weights_proj",
         )
         self.softmax_scale = self.head_dim**-0.5
@@ -1163,6 +1213,8 @@ class Indexer(nn.Module):
         self.prefix = prefix
         self.max_total_seq_len = atom_config.max_num_seqs * self.max_model_len
         # register_metadata_builder("indexer_attn_metadata", self.k_cache.get_attn_backend().get_builder_cls())
+
+        self.sparse_attn_indexer_impl = torch.ops.aiter.sparse_attn_indexer
 
     def forward(
         self,
@@ -1199,7 +1251,7 @@ class Indexer(nn.Module):
         )
         weights = weights.squeeze(-1)
 
-        return torch.ops.aiter.sparse_attn_indexer(
+        return self.sparse_attn_indexer_impl(
             hidden_states,
             self.k_cache.prefix,
             self.k_cache.kv_cache[0],
@@ -1519,7 +1571,7 @@ class DeepseekV2MLAAttention(nn.Module):
                         transpose_scale=True,
                     )
                 elif self.fuse_qknorm:
-                    hidden_states_or_q_c, kv_c_normed = fused_qk_rmsnorm(
+                    hidden_states_or_q_c, kv_c_normed = _fused_qk_rmsnorm(
                         q_c,
                         self.q_a_layernorm.weight,
                         self.q_a_layernorm.eps,
@@ -1961,4 +2013,11 @@ class DeepseekV3ForCausalLM(DeepseekV2ForCausalLM):
 class GlmMoeDsaForCausalLM(DeepseekV2ForCausalLM):
     """GLM 5.0 MoE (structurally similar to DeepSeek v3.2). Reuses DeepseekV2 implementation."""
 
-    pass
+    # GLM-5's HF quant config uses `indexers_proj` in modules_to_not_convert, but
+    # the ATOM module path is `indexer.weights_proj`.  Declaring the mapping here
+    # keeps the translation co-located with the model and out of config.py.
+    quant_exclude_name_mapping: dict[str, str] = {
+        # HF quant config uses "indexers_proj" but the ATOM module path is
+        # "indexer.weights_proj".  str.replace translates each exclude entry.
+        "indexers_proj": "indexer.weights_proj",
+    }
