@@ -1149,6 +1149,7 @@ class ModelRunner:
     def allocate_kv_cache(self, num_kvcache_blocks):
         # Decode in disagg mode: kvcache is imported from prefill, not allocated here.
         if self.config.disagg_is_decode:
+            logger.info("decode skipping kv cache allocation")
             return True
 
         pre_alloc = torch.cuda.memory_stats()["allocated_bytes.all.current"]
@@ -1685,22 +1686,42 @@ class ModelRunner:
         )
         return words
 
+    @staticmethod
+    def _full_cu_mask() -> list[int]:
+        """Return CU mask bits for the given fraction.
+
+        For upper=False (prefill): CUs [0, split).
+        For upper=True  (decode):  CUs [split, total).
+        split = round(total * fraction).
+        """
+        total = torch.cuda.get_device_properties(
+            torch.cuda.current_device()
+        ).multi_processor_count
+        num_words = (total + 31) // 32
+        words = [0xFFFFFFFF] * num_words
+        return words
+
     # CU fractions for which we pre-create masked streams.
     _CU_POOL_FRACTIONS = [0.5]
 
     def create_prefill_stream_pool(self) -> bool:
-        """Create a pool of CU-masked CUDA streams for disaggregated prefill.
+        """Create a pool of CUDA streams for disaggregated prefill.
 
         Called once by PrefillEngineCore._init_disagg() after IPC import.
-        Pre-creates one stream per fraction in _CU_POOL_FRACTIONS plus a
-        full-CU fallback (None key).  prefill_forward() selects the stream
-        dynamically each iteration via _optimal_cu_fraction().
+        In constrained mode, pre-creates one CU-masked stream per fraction
+        in _CU_POOL_FRACTIONS plus a full-CU fallback (None key);
+        prefill_forward() selects the stream dynamically each iteration via
+        _optimal_cu_fraction().  In unconstrained mode, only the plain
+        full-CU stream (None key) is created.
         """
         self._prefill_streams = {}
-        for f in self._CU_POOL_FRACTIONS:
-            mask = self._cu_mask_for_fraction(f, upper=False)
-            self._prefill_streams[f] = self._stream_with_cu_mask(mask)
-        # Full-CU fallback (no mask)
+        if getattr(self.config, "disagg_constrained", False):
+            for f in self._CU_POOL_FRACTIONS:
+                mask = self._cu_mask_for_fraction(f, upper=False)
+                #mask = self._full_cu_mask()
+                self._prefill_streams[f] = self._stream_with_cu_mask(mask)
+                #self._prefill_streams[f] = torch.cuda.Stream()
+        # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
         self._prefill_streams[None] = torch.cuda.Stream()
         logger.info(
             f"Prefill stream pool created: fractions={list(self._prefill_streams.keys())}"
@@ -1708,17 +1729,22 @@ class ModelRunner:
         return True
 
     def create_decode_stream_pool(self) -> bool:
-        """Create a pool of CU-masked CUDA streams for disaggregated decode.
+        """Create a pool of CUDA streams for disaggregated decode.
 
-        Called once by DecodeEngineCore._init_disagg().  Complementary to the
-        prefill pool: for fraction F, decode gets CUs [F*total, total).
-        forward() selects the stream dynamically each iteration.
+        Called once by DecodeEngineCore._init_disagg().  In constrained mode,
+        complementary to the prefill pool: for fraction F, decode gets CUs
+        [F*total, total).  forward() selects the stream dynamically each
+        iteration.  In unconstrained mode, only the plain full-CU stream
+        (None key) is created.
         """
         self._decode_streams = {}
-        for f in self._CU_POOL_FRACTIONS:
-            mask = self._cu_mask_for_fraction(f, upper=True)
-            self._decode_streams[f] = self._stream_with_cu_mask(mask)
-        # Full-CU fallback (no mask)
+        if getattr(self.config, "disagg_constrained", False):
+            for f in self._CU_POOL_FRACTIONS:
+                mask = self._cu_mask_for_fraction(f, upper=True)
+                #mask = self._full_cu_mask()
+                self._decode_streams[f] = self._stream_with_cu_mask(mask)
+                #self._decode_streams[f] = torch.cuda.Stream()
+        # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
         self._decode_streams[None] = torch.cuda.Stream()
         #torch.cuda.set_stream(self._decode_streams[None])
         self._model_fwd_event = torch.cuda.Event()
@@ -2088,8 +2114,8 @@ class ModelRunner:
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         decode_streams = getattr(self, "_decode_streams", None)
         if decode_streams is not None:
-            self._done_event.record()
             stream = decode_streams[batch.cu_stream_fraction]
+            self._done_event.record()
             stream.wait_event(self._done_event)
             with torch.cuda.stream(stream):
                 input_ids, temperatures, top_ks, top_ps, all_greedy = (

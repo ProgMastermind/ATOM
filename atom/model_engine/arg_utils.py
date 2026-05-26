@@ -48,6 +48,7 @@ class EngineArgs:
     mark_trace: bool = False
     enable_disagg: bool = False
     disagg_prefill_max_num_seqs: Optional[int] = None
+    disagg_constrained: bool = False
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
@@ -181,7 +182,10 @@ class EngineArgs:
         parser.add_argument(
             "--enable-disagg",
             action="store_true",
-            help="Enable intra-GPU prefill/decode disaggregation.",
+            help="Enable intra-GPU prefill/decode disaggregation. "
+            "Defaults to unconstrained mode (plain separate streams, "
+            "no CU masking). Pass --disagg-constrained to enable "
+            "CU-masked streams + shm coordination.",
         )
         parser.add_argument(
             "--disagg-prefill-max-num-seqs",
@@ -189,6 +193,13 @@ class EngineArgs:
             default=None,
             help="Max sequences per prefill batch in disagg mode. "
             "Defaults to --max-num-seqs when not set.",
+        )
+        parser.add_argument(
+            "--disagg-constrained",
+            action="store_true",
+            help="With --enable-disagg, enable CU-masked streams and "
+            "shm-based prefill/decode coordination. Default (off) "
+            "uses plain separate streams with no CU masking.",
         )
 
         return parser

@@ -376,7 +376,7 @@ class CoreManager:
                     pass
 
         # Clean up dynamic CU partitioning shared memory (if created).
-        if hasattr(self, "_cu_shm"):
+        if getattr(self, "_cu_shm", None) is not None:
             try:
                 self._cu_shm.close()
                 self._cu_shm.unlink()
@@ -566,11 +566,17 @@ class DisaggCoreManager(CoreManager):
         # Shared memory for dynamic CU partitioning: 4 bytes (float32).
         # DecodeScheduler writes the chosen CU fraction; PrefillScheduler reads it.
         # 0.0 means no mask (None).
-        cu_shm_name = f"atom_cu_split_{os.getpid()}"
-        self._cu_shm = multiprocessing.shared_memory.SharedMemory(
-            name=cu_shm_name, create=True, size=4
-        )
-        self._cu_shm.buf[:4] = b"\x00" * 4
+        # Only created in constrained mode; unconstrained mode runs prefill
+        # and decode on plain separate streams with no CU coordination.
+        if config.disagg_constrained:
+            cu_shm_name = f"atom_cu_split_{os.getpid()}"
+            self._cu_shm = multiprocessing.shared_memory.SharedMemory(
+                name=cu_shm_name, create=True, size=4
+            )
+            self._cu_shm.buf[:4] = b"\x00" * 4
+        else:
+            cu_shm_name = ""
+            self._cu_shm = None
 
         # Build per-process configs.
         from atom.utils import get_open_port as _get_open_port

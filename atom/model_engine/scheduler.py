@@ -770,6 +770,8 @@ class PrefillScheduler:
 
     def postprocess(self, seqs, fwd_output, stream_output_queue=None) -> list:
         """No-op: prefill produces no sampled tokens."""
+        # for seq in seqs:
+        #     self.running.remove(seq)
         return []
 
     def get_next_batch_info(self) -> tuple:
@@ -866,6 +868,8 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
+            #logger.info("seq_id %d num_prompt_tokens %d num_tokens_computed %d new token %d", seq_id, seq.num_prompt_tokens, num_tokens_computed, sampled_token_id)
+            seq.first_token_time = time.time()
             self.prefill_done.append(seq)
 
     def schedule(self):
@@ -950,10 +954,10 @@ class DecodeScheduler(Scheduler):
 
         if self._cu_shm is not None:
             struct.pack_into("I", self._cu_shm.buf, 0, total_tokens_num_decode)
-        if prefill_finished:
-            pwait=int(self.prefill_waiting_tokens.load())
-            self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
-            logger.info("decode cu fraction %f", self.cu_fraction if self.cu_fraction else 0.0)
+            if prefill_finished:
+                pwait=int(self.prefill_waiting_tokens.load())
+                self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
+                logger.info("decode cu fraction %f", self.cu_fraction if self.cu_fraction else 0.0)
 
         
         return (

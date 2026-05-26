@@ -761,6 +761,10 @@ class Config:
     # Override max_num_seqs for the prefill process in disagg mode.
     # When None, prefill inherits the base max_num_seqs.
     disagg_prefill_max_num_seqs: Optional[int] = None
+    # When True (and enable_disagg=True), use CU-masked streams + shm
+    # coordination between prefill and decode. When False (default),
+    # use plain separate streams with no CU masking.
+    disagg_constrained: bool = False
 
     def _set_cudagraph_sizes(self):
         if self.compilation_config.cudagraph_capture_sizes:
