@@ -8,6 +8,7 @@ import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.config import get_current_atom_config
 from atom.model_ops.utils import _has_module
+from atom.utils import envs as _atom_envs
 from atom.utils.custom_register import direct_register_custom_op
 
 
@@ -165,7 +166,12 @@ def rocm_aiter_biased_grouped_topk_impl(
     num_fused_shared_experts: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
-    from aiter import biased_grouped_topk
+    if _atom_envs.ATOM_USE_TRITON_BIASED_GROUPED_TOPK:
+        from aiter.ops.triton.moe.biased_grouped_topk import (
+            biased_grouped_topk_triton as biased_grouped_topk,
+        )
+    else:
+        from aiter import biased_grouped_topk
 
     token = gating_output.shape[0]
     device = gating_output.device

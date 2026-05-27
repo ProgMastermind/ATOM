@@ -62,6 +62,15 @@ else:
     gemm_a8w8_blockscale_bpreshuffle_triton = None
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
+# Module-level import so dynamo does not graph-break when
+# TritonReplicatedLinear.forward calls it.
+try:
+    from aiter.ops.triton.gemm.basic.gemm_a16w16 import (
+        gemm_a16w16 as _triton_gemm_a16w16,
+    )
+except ImportError:  # pragma: no cover
+    _triton_gemm_a16w16 = None
+
 
 def divide(numerator, denominator):
     assert (
@@ -501,6 +510,51 @@ class ReplicatedLinear(LinearBase):
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):
         param_data = param.data
         param.weight_loader_process(param_data, loaded_weight)
+
+
+class TritonReplicatedLinear(ReplicatedLinear):
+    """ReplicatedLinear whose unquantized BF16/FP16 forward goes through
+    ``aiter.ops.triton.gemm.basic.gemm_a16w16`` instead of hipBLASLt
+    ``tgemm.mm``.
+
+    Used for MoE router gates so the routing GEMM stays in the Triton family
+    alongside the rest of the MoE pipeline (biased_grouped_topk, expert
+    GEMMs). For quantized layer_quant_dtype, falls back to the parent
+    ``LinearBase.forward`` unchanged.
+    """
+
+    @mark_trace
+    def forward(
+        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
+    ) -> torch.Tensor:
+        if self.quant_type.value != QuantType.No.value:
+            return super().forward(x, x_scale, otype)
+        x2d = x.view(-1, x.shape[-1])
+        y2d = _triton_gemm_a16w16(x2d, self.weight, self.bias, dtype=otype)
+        return y2d.view(*x.shape[:-1], y2d.shape[-1])
+
+
+class TorchReplicatedLinear(ReplicatedLinear):
+    """ReplicatedLinear whose unquantized BF16/FP16 forward goes through
+    ``torch.nn.functional.linear`` instead of hipBLASLt ``tgemm.mm``.
+
+    Used for MoE router gates when you want a plain PyTorch dispatch (e.g.
+    to compare against the tuned hipBLASLt path or the Triton path). For
+    quantized layer_quant_dtype, falls back to the parent
+    ``LinearBase.forward`` unchanged.
+    """
+
+    @mark_trace
+    def forward(
+        self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
+    ) -> torch.Tensor:
+        if self.quant_type.value != QuantType.No.value:
+            return super().forward(x, x_scale, otype)
+        # self.weight is (out, in); F.linear computes x @ weight.T + bias.
+        y = torch.nn.functional.linear(x, self.weight, self.bias)
+        if y.dtype != otype:
+            y = y.to(otype)
+        return y
 
 
 class ColumnParallelLinear(LinearBase):

@@ -55,6 +55,149 @@ from torch import nn
 from transformers import PretrainedConfig
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
 
+# Module-level imports for the aiter.ops.triton MoE path. Hoisted out of
+# ``Mxfp4MoEMethod._apply_aiter_triton_mxfp4`` because runtime imports inside
+# a dynamo-traced function force a hard graph break, which then re-enters the
+# single-use VllmBackend and trips its assertion. Guard imports so unrelated
+# builds that lack the Triton MoE module don't break at import time.
+try:
+    import triton.language as _tl
+    from aiter.ops.triton.moe.moe_op_gemm_a4w4 import (
+        moe_gemm_a4w4 as _moe_gemm_a4w4,
+        mxfp4_quant as _mxfp4_quant,
+    )
+    from aiter.ops.triton.moe.moe_routing.routing import (
+        ExptData as _ExptData,
+        RoutingData as _RoutingData,
+    )
+except ImportError:  # pragma: no cover
+    _tl = None
+    _moe_gemm_a4w4 = None
+    _mxfp4_quant = None
+    _ExptData = None
+    _RoutingData = None
+
+
+def _build_aiter_routing_data(
+    topk_weights: torch.Tensor,
+    topk_ids: torch.Tensor,
+    n_expts_tot: int,
+    n_expts_act: int,
+    block_m: int,
+):
+    """Construct an aiter ``RoutingData`` (with ``ExptData``) and
+    gather/scatter index tensors from ATOM's ``(topk_weights, topk_ids)``.
+
+    Mirrors ``aiter.ops.triton.moe.moe_routing.routing.compute_expt_data_torch``
+    and ``routing_torch`` but stays cudagraph-friendly: no ``.item()`` /
+    Python-controlled-by-GPU-data loops -- ``block_pid_map`` is computed via
+    a ``searchsorted`` over the cumulative-block boundaries.
+
+    Args:
+        topk_weights: ``(M, n_expts_act)`` fp32 routing weights.
+        topk_ids:     ``(M, n_expts_act)`` int32 expert ids.
+        n_expts_tot:  total number of experts visible to MoE (= weight E dim,
+                      includes the +1 for fused shared experts when enabled).
+        n_expts_act:  number of experts selected per token.
+        block_m:      kernel ``BLOCK_M`` used for ragged-batch tiling.
+
+    Returns:
+        ``(RoutingData, gather_indx, scatter_indx)`` ready to pass into
+        ``moe_gemm_a4w4``.
+    """
+    device = topk_ids.device
+    M = topk_ids.shape[0]
+    n_gates = M * n_expts_act
+
+    # Per-token sort so each token's selected experts are in ascending order;
+    # then flatten and globally sort by expert id so experts are contiguous.
+    expt_indx_sorted, sort_idx = torch.sort(topk_ids, dim=1, stable=True)
+    expt_scal_sorted = torch.gather(topk_weights, 1, sort_idx)
+    expt_indx_flat = expt_indx_sorted.reshape(-1)             # (n_gates,) int32
+    expt_scal_flat = expt_scal_sorted.reshape(-1)             # (n_gates,) fp32
+
+    topk_indx = torch.argsort(expt_indx_flat, stable=True).to(torch.int32)
+    gate_indx = torch.argsort(topk_indx, stable=True).to(torch.int32)
+    gate_scal = expt_scal_flat[topk_indx.long()]
+
+    # Histogram of tokens-per-expert.
+    # NOTE: torch.bincount is NOT CUDAGraph-safe (its output size depends on
+    # the input data, so the impl forces a host sync). Use scatter_add_ on a
+    # pre-allocated fixed-size buffer instead; semantically identical for our
+    # use because all expert ids are guaranteed to be in [0, n_expts_tot).
+    hist = torch.zeros(n_expts_tot, dtype=torch.int32, device=device)
+    hist.scatter_add_(
+        0,
+        expt_indx_flat.long(),
+        torch.ones_like(expt_indx_flat, dtype=torch.int32),
+    )
+
+    # token_offs_raw[e] = number of tokens routed to experts [0, e). Length E+1.
+    zero1 = torch.zeros(1, dtype=torch.int32, device=device)
+    token_offs_raw = torch.cat([zero1, torch.cumsum(hist, dim=0).to(torch.int32)])
+
+    # token_offs_pad[e] = cumulative number of TILES (matmul blocks) assigned
+    # to experts [0, e). Despite the doc-string in aiter's routing.py saying
+    # "first token routed", the actual semantics the kernel needs is a
+    # cumulative TILE count -- the kernel reads `token_offs_pad[-1]` as the
+    # total tile count and uses `padding_m = grid_m - that`. Multiplying by
+    # block_m here (as a previous version of this code did) inflates
+    # `unpadded_m` inside the kernel, which then computes an out-of-range
+    # `pid_m` and reads `ExptData` (= `block_pid_map`, length `max_n_tiles`)
+    # past its end, segfaulting the GPU.
+    n_blocks_per_expert = (hist + (block_m - 1)) // block_m            # int32
+    token_offs_pad = torch.cat(
+        [zero1, torch.cumsum(n_blocks_per_expert, dim=0).to(torch.int32)]
+    )
+
+    # block_pid_map: int32 of length max_n_tiles.
+    #   For each tile index b in [0, total_valid_tiles):
+    #       block_pid_map[b] = (block_in_expert << 16) | expert_id
+    #   For tile indices beyond the total valid tile count: -1 (sentinel).
+    if n_gates <= n_expts_tot:
+        max_n_tiles = n_gates
+    else:
+        max_n_tiles = n_expts_tot - 1 - ((n_expts_tot - n_gates - 1) // block_m)
+
+    # block_offsets[e] = first tile-index belonging to expert e.
+    block_offsets = (
+        torch.cumsum(n_blocks_per_expert, dim=0).to(torch.int32)
+        - n_blocks_per_expert
+    )  # (n_expts_tot,)
+
+    all_tiles = torch.arange(max_n_tiles, dtype=torch.int32, device=device)
+    # For each tile b, expert e is the largest index with block_offsets[e] <= b.
+    expert_per_tile = (
+        torch.searchsorted(block_offsets, all_tiles, right=True) - 1
+    ).clamp_min(0).to(torch.int32)
+    block_in_expert = all_tiles - block_offsets.index_select(
+        0, expert_per_tile.long()
+    )
+    valid = block_in_expert < n_blocks_per_expert.index_select(
+        0, expert_per_tile.long()
+    )
+    packed = (block_in_expert.to(torch.int32) << 16) | expert_per_tile.to(
+        torch.int32
+    )
+    neg1 = torch.full_like(packed, -1)
+    block_pid_map = torch.where(valid, packed, neg1).to(torch.int32)
+
+    expt_data = _ExptData(
+        hist=hist,
+        token_offs_raw=token_offs_raw,
+        token_offs_pad=token_offs_pad,
+        block_pid_map=block_pid_map,
+    )
+    routing_data = _RoutingData(
+        block_m=block_m,
+        gate_scal=gate_scal,
+        expt_hist=hist,
+        n_expts_tot=n_expts_tot,
+        n_expts_act=n_expts_act,
+        expt_data=expt_data,
+    )
+    return routing_data, topk_indx, gate_indx
+
 
 class FusedMoeWeightScaleSupported(Enum):
     """Supported quantization strategies for MoE weight scales."""
@@ -789,6 +932,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
+        if envs.ATOM_USE_AITER_TRITON_MOE:
+            # aiter.ops.triton.moe.fused_moe_mxfp4 consumes the raw torch
+            # mxfp4 layout that create_weights already produced
+            # (w13: (E, 2I, H//2) fp4x2, w13_scale: (E, 2I, H//32) uint8;
+            #  w2:  (E, H,  I//2) fp4x2, w2_scale:  (E, H,  I//32) uint8).
+            # No swizzle, no PrecisionConfig — leave weights in place.
+            return
+
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
             from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
@@ -890,6 +1041,165 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_scale=layer.w2_weight_scale,
         )
 
+    def _apply_aiter_triton_mxfp4(
+        self,
+        layer: torch.nn.Module,
+        x: torch.Tensor,
+        router_logits: torch.Tensor,
+        top_k: int,
+        renormalize: bool,
+        use_grouped_topk: bool,
+        topk_group: Optional[int],
+        num_expert_group: Optional[int],
+        global_num_experts: int,
+        expert_map: Optional[torch.Tensor],
+        custom_routing_function: Optional[Callable],
+        scoring_func: str,
+        e_score_correction_bias: Optional[torch.Tensor],
+        apply_router_weight_on_input: bool,
+        fused_shared_experts_scoring_func: Optional[str],
+        activation: ActivationType,
+    ) -> torch.Tensor:
+        """All-Triton MoE path via aiter.ops.triton.moe.moe_op_gemm_a4w4 (W=mxfp4,
+        A=mxfp4). Pipeline:
+
+          1. select_experts                                 (Triton biased_grouped_topk under flag)
+          2. _build_aiter_routing_data (torch ops)          (RoutingData/gather/scatter)
+          3. mxfp4_quant(x)                                 (Triton bf16 → mxfp4)
+          4. moe_gemm_a4w4(w13, gather)                     (Triton FP4 GEMM)
+          5. silu(gate) * up                                (Torch elementwise)
+          6. mxfp4_quant(intermediate)                      (Triton bf16 → mxfp4)
+          7. moe_gemm_a4w4(w2, scatter, gammas=gate_scal)   (Triton FP4 GEMM with routed weight)
+          8. reduce_grouped inside moe_gemm_a4w4            (sum slot outputs per token)
+        """
+        moe_gemm_a4w4 = _moe_gemm_a4w4
+        mxfp4_quant = _mxfp4_quant
+        RoutingData = _RoutingData
+
+        # ---- 1. routing ----------------------------------------------------
+        topk_weights, topk_ids = FusedMoE.select_experts(
+            hidden_states=x,
+            router_logits=router_logits,
+            use_grouped_topk=use_grouped_topk,
+            top_k=top_k,
+            renormalize=renormalize,
+            topk_group=topk_group,
+            num_expert_group=num_expert_group,
+            custom_routing_function=custom_routing_function,
+            scoring_func=scoring_func,
+            e_score_correction_bias=e_score_correction_bias,
+            num_routing_experts=global_num_experts,
+            num_fused_shared_experts=layer.num_fused_shared_experts,
+            fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+            routed_scaling_factor=layer.routed_scaling_factor,
+        )
+        topk_ids = topk_ids.to(torch.int32).contiguous()
+        topk_weights = topk_weights.to(torch.float32).contiguous()
+        M = x.shape[0]
+        n_expts_act = topk_ids.shape[1]
+        x_dtype = x.dtype
+        device = x.device
+
+        # ATOM stored mxfp4 weights are (E, N=2I, K=H//2) and (E, N=H, K=I//2)
+        # in row-major (stride(-1)==1).  moe_gemm_a4w4 requires BOTH the weight
+        # AND its mx scale to be column-major in their last two dims
+        # (stride(-2)==1) -- the kernel reads stride_w_*_k from .stride(1) and
+        # stride_w_*_n from .stride(2), so the physical layout must put the
+        # packed K dim along the second-to-last axis.  `.transpose(-2, -1)` is
+        # a stride-preserving view that swaps the labels without moving data.
+        # Forgetting to transpose the scales swaps stride_w_mx_k with
+        # stride_w_mx_n inside the kernel, which then reads scales as if N and
+        # K were transposed and walks off the end of the buffer -- segfaulting
+        # the GPU during cudagraph capture.
+        w13 = layer.w13_weight.view(torch.uint8).transpose(-2, -1)      # (E, H//2, 2I)
+        w2 = layer.w2_weight.view(torch.uint8).transpose(-2, -1)        # (E, I//2, H)
+        w13_scale = layer.w13_weight_scale.transpose(-2, -1)            # (E, H//32, 2I)
+        w2_scale = layer.w2_weight_scale.transpose(-2, -1)              # (E, I//32, H)
+        n_expts_tot = w13.shape[0]                                      # 257 with shared expert fusion
+
+        # ---- 2. RoutingData ------------------------------------------------
+        # block_m must match what moe_gemm_a4w4's get_kernel_config picks.
+        # Default block_m for small M is 16 (the kernel auto-tunes), so we
+        # pre-build expt_data with block_m=16.
+        block_m = 16
+        routing_data, gather_indx, scatter_indx = _build_aiter_routing_data(
+            topk_weights, topk_ids, n_expts_tot, n_expts_act, block_m
+        )
+
+        # ---- 3. quantize x -------------------------------------------------
+        x_fp4, x_mx_scale = mxfp4_quant(x)  # x: (M, H) bf16 → (M, H//2) uint8, (M, H//32) uint8
+
+        # ---- 4. stage-1 GEMM (gate_up) with gather --------------------------
+        intermediate13 = moe_gemm_a4w4(
+            x_fp4,
+            w13,
+            x_mx_scale,
+            w13_scale,
+            None,                      # x_static_scale
+            None,                      # quant_static_scale
+            layer.w13_bias,            # (E, 2I) fp32 or None
+            routing_data,
+            gather_indx=gather_indx,
+            scatter_indx=None,
+            gammas=None,
+            swizzle_mx_scale=None,
+            out_dtype=x_dtype,
+            apply_swiglu=False,
+            add_residual=True,
+            unpadded_N=None,
+            unpadded_K=None,
+        )
+        # intermediate13 shape: (n_gates_pad, 2I) bf16 -- one row per
+        # (token, slot) in expert-sorted order (no scatter applied yet).
+
+        # ---- 5. SiLU + Mul -------------------------------------------------
+        two_I = intermediate13.shape[-1]
+        I = two_I // 2
+        gate = intermediate13[..., :I]
+        up = intermediate13[..., I:]
+        if activation == ActivationType.Silu:
+            intermediate = torch.nn.functional.silu(gate) * up
+        elif activation == ActivationType.Gelu:
+            intermediate = torch.nn.functional.gelu(gate) * up
+        else:
+            raise NotImplementedError(
+                f"ATOM_USE_AITER_TRITON_MOE: activation {activation} not supported"
+            )
+        intermediate = intermediate.contiguous()
+
+        # ---- 6. quantize intermediate --------------------------------------
+        int_fp4, int_mx_scale = mxfp4_quant(intermediate)  # (n_gates_pad, I//2), (n_gates_pad, I//32)
+
+        # ---- 7. stage-2 GEMM (down_proj) with scatter + gammas -------------
+        gammas = (
+            None
+            if apply_router_weight_on_input
+            else routing_data.gate_scal
+        )
+        output = moe_gemm_a4w4(
+            int_fp4,
+            w2,
+            int_mx_scale,
+            w2_scale,
+            None,
+            None,
+            layer.w2_bias,
+            routing_data,
+            gather_indx=None,
+            scatter_indx=scatter_indx,
+            gammas=gammas,
+            swizzle_mx_scale=None,
+            out_dtype=x_dtype,
+            apply_swiglu=False,
+            add_residual=True,
+            unpadded_N=None,
+            unpadded_K=None,
+        )
+        # Output shape: (M, H) bf16 -- already reduced across slots inside
+        # reduce_grouped (called at the end of moe_gemm_a4w4 when
+        # scatter_indx is provided).
+        return output
+
     @mark_trace(prefix="mxfp4_moe", torch_compile=False)
     def apply(
         self,
@@ -910,6 +1220,26 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
+        if envs.ATOM_USE_AITER_TRITON_MOE:
+            return self._apply_aiter_triton_mxfp4(
+                layer,
+                x,
+                router_logits,
+                top_k=top_k,
+                renormalize=renormalize,
+                use_grouped_topk=use_grouped_topk,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                fused_shared_experts_scoring_func=fused_shared_experts_scoring_func,
+                activation=activation,
+            )
+
         if self.use_triton:
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_moe_forward,

@@ -34,6 +34,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     == "1",
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    # Use the aiter.ops.triton.* MoE stack (gate GEMM + biased_grouped_topk +
+    # fused_moe_mxfp4) on the MXFP4 MoE path instead of the mixed HIP/triton_kernels
+    # stack. Targets DeepSeek-R1-MXFP4 on gfx1250. Off by default.
+    "ATOM_USE_AITER_TRITON_MOE": lambda: os.getenv("ATOM_USE_AITER_TRITON_MOE", "0")
+    == "1",
+    # Use the Triton biased_grouped_topk kernel from aiter.ops.triton instead of
+    # the HIP/ASM aiter.biased_grouped_topk. Independent of the full MoE swap so
+    # it can be flipped on its own for A/B testing.
+    "ATOM_USE_TRITON_BIASED_GROUPED_TOPK": lambda: os.getenv(
+        "ATOM_USE_TRITON_BIASED_GROUPED_TOPK", "0"
+    )
+    == "1",
+    # Use aiter.ops.triton.gemm.basic.gemm_a16w16 for BF16/FP16 ReplicatedLinear
+    # (the MoE router gate). Independent flag so it can be flipped on its own.
+    "ATOM_USE_TRITON_GATE_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GATE_GEMM", "0")
+    == "1",
+    # Use torch.nn.functional.linear for BF16/FP16 ReplicatedLinear (the MoE
+    # router gate). Mutually exclusive with ATOM_USE_TRITON_GATE_GEMM; if both
+    # are set the triton flag wins.
+    "ATOM_USE_TORCH_GATE_GEMM": lambda: os.getenv("ATOM_USE_TORCH_GATE_GEMM", "0")
+    == "1",
     # Replace AITER HIP-backed kernels with AITER Triton equivalents at every
     # call site that has one. Off by default; turn on to validate Triton paths
     # on architectures where HIP/CK kernels are unavailable (e.g. gfx1250).

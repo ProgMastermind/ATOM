@@ -61,6 +61,8 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    TorchReplicatedLinear,
+    TritonReplicatedLinear,
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
@@ -823,7 +825,13 @@ class DeepseekV2MoE(nn.Module):
                 "Only silu is supported for now."
             )
 
-        self.gate = ReplicatedLinear(
+        if envs.ATOM_USE_TRITON_GATE_GEMM:
+            gate_cls = TritonReplicatedLinear
+        elif envs.ATOM_USE_TORCH_GATE_GEMM:
+            gate_cls = TorchReplicatedLinear
+        else:
+            gate_cls = ReplicatedLinear
+        self.gate = gate_cls(
             config.hidden_size,
             config.n_routed_experts,
             bias=False,
