@@ -36,7 +36,12 @@ from atom.utils import (
 )
 from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.utils.forward_context import get_kvconnector
-from atom.utils.tbo import UBatchWrapper, maybe_create_ubatch_slices
+from atom.utils.tbo import (
+    UBatchWrapper,
+    local_tbo_precompute,
+    maybe_create_ubatch_slices,
+    sync_dp_for_tbo,
+)
 from atom.utils.forward_context import (
     Context,
     DPMetadata,
@@ -1520,58 +1525,6 @@ class ModelRunner:
 
         return max_tokens_across_dp_cpu - num_tokens, num_tokens_across_dp
 
-    def _local_tbo_precompute(
-        self, batch, is_prefill: bool, num_scheduled_tokens: np.ndarray
-    ) -> tuple[bool, int, int]:
-        """Decide locally whether this rank could TBO-split into 2 ubatches,
-        and if so, what (ub0_tokens, ub1_tokens) the split would produce.
-
-        Returns (eligible, ub0_tokens, ub1_tokens). All zeros when ineligible.
-        These values are packed into the single DP all_reduce in
-        ``_preprocess`` so the collective decision (AND across ranks) and
-        ``UBatchWrapper`` 's per-ubatch token max (replaces a second
-        all_reduce) can both be derived from one round-trip.
-        """
-        if not self.config.enable_tbo:
-            return False, 0, 0
-        if is_prefill:
-            n_pref = batch.total_seqs_num_prefill
-            if n_pref < 2:
-                return False, 0, 0
-            # Mirror _split_prefill_balanced: pick boundary closest to
-            # total/2 so the packed value matches what
-            # maybe_create_ubatch_slices will produce post-decision.
-            toks = np.asarray(num_scheduled_tokens[:n_pref], dtype=np.int64)
-            total = int(toks.sum())
-            target = total // 2
-            cumsum = 0
-            split_idx = 1
-            for j in range(n_pref):
-                cumsum += int(toks[j])
-                if cumsum >= target:
-                    prev = cumsum - int(toks[j])
-                    if j > 0 and (target - prev) < (cumsum - target):
-                        split_idx = j
-                    else:
-                        split_idx = j + 1
-                    break
-            split_idx = max(1, min(split_idx, n_pref - 1))
-            ub0 = int(toks[:split_idx].sum())
-            ub1 = total - ub0
-            return True, ub0, ub1
-        # Decode path
-        if not self.config.enable_tbo_decode or batch.is_dummy_run:
-            return False, 0, 0
-        scheduled_bs = batch.total_seqs_num_decode
-        if scheduled_bs < 2:
-            return False, 0, 0
-        num_tokens = batch.total_tokens_num
-        tokens_per_req = num_tokens // scheduled_bs if scheduled_bs else 1
-        reqs_per_ub = scheduled_bs // 2
-        ub0 = reqs_per_ub * tokens_per_req
-        ub1 = num_tokens - ub0
-        return True, ub0, ub1
-
     def _maybe_create_tbo_slices(
         self,
         batch,
@@ -1608,93 +1561,63 @@ class ModelRunner:
         batch: ScheduledBatch,
         num_scheduled_tokens: Optional[np.ndarray] = None,
     ):
-        """Single packed DP all_reduce for token padding, prefill-fan-out,
-        and the cross-DP TBO decision.
+        """Per-step DP sync: token padding, prefill fan-out, TBO decision.
 
-        Pre-Plan-B this method issued up to 3 separate all_reduces per
-        forward (``get_dp_padding`` / ``sync_dp_for_tbo`` + ``prefill_flag``
-        + a third one inside ``UBatchWrapper._compute_ub_graph_bs`` for
-        per-ubatch token sizes). Plan B packs every per-rank scalar into
-        one int32 tensor of length ``5 * dp_size`` so SUM-reduce is
-        sufficient (each rank writes only its own slots; other slots are
-        0). The fields derived from that single reduce:
+        Thin wrapper over :func:`atom.utils.tbo.sync_dp_for_tbo` (the
+        actual collective) and :func:`atom.utils.tbo.local_tbo_precompute`
+        (the rank-local TBO eligibility / per-ubatch token split).
 
-          slot 0 : num_input_tokens_per_rank  -> num_tokens_across_dp
-          slot 1 : is_prefill_per_rank        -> any_rank_has_prefill
-          slot 2 : tbo_eligible_per_rank      -> all_ranks_tbo_eligible (AND)
-          slot 3 : ub0_tokens_per_rank        -> ub_max_tokens_across_dp[0]
-          slot 4 : ub1_tokens_per_rank        -> ub_max_tokens_across_dp[1]
-
-        Returns a 6-tuple:
-          (num_input_tokens, num_tokens_across_dp, dp_uniform_decode,
-           max_tokens, tbo_collective_active, ub_max_tokens_across_dp)
+        Returns:
+            (num_input_tokens, num_tokens_across_dp, dp_uniform_decode,
+             max_tokens, tbo_collective_active, ub_max_tokens_across_dp)
         """
         num_input_tokens = batch.total_tokens_num
         is_prefill = batch.total_tokens_num_prefill > 0
-
+        tbo_on = self.config.enable_tbo
         dp_size = self.config.parallel_config.data_parallel_size
-        dp_rank = self.config.parallel_config.data_parallel_rank
 
-        if dp_size <= 1:
-            # Single-rank TBO decision can be taken without any all_reduce.
+        # Rank-local TBO precompute (needed for both dp==1 fast path and
+        # the cross-DP packed gather below).
+        local_eligible, local_ub0, local_ub1 = False, 0, 0
+        if tbo_on:
             if num_scheduled_tokens is None:
                 num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-            eligible, _, _ = self._local_tbo_precompute(
-                batch, is_prefill, num_scheduled_tokens
+            local_eligible, local_ub0, local_ub1 = local_tbo_precompute(
+                self.config, batch, is_prefill, num_scheduled_tokens
             )
-            return num_input_tokens, None, False, None, eligible, None
 
-        if num_scheduled_tokens is None:
-            num_scheduled_tokens = np.asarray(batch.num_scheduled_tokens)
-        local_tbo_eligible, local_ub0, local_ub1 = self._local_tbo_precompute(
-            batch, is_prefill, num_scheduled_tokens
+        if dp_size <= 1:
+            # Single-rank: TBO decision is purely local; no collective needed.
+            return num_input_tokens, None, False, None, local_eligible, None
+
+        sync = sync_dp_for_tbo(
+            dp_group=get_dp_group().cpu_group,
+            dp_size=dp_size,
+            num_input_tokens=num_input_tokens,
+            is_prefill=is_prefill,
+            tbo_on=tbo_on,
+            local_tbo_eligible=local_eligible,
+            local_ub_tokens=(local_ub0, local_ub1),
         )
 
-        # Packed single all_reduce — 5 int32 slots per rank, SUM-reduce.
-        sync = torch.zeros(dp_size * 5, dtype=torch.int32, device="cpu")
-        sync[dp_rank] = num_input_tokens
-        sync[dp_size + dp_rank] = 1 if is_prefill else 0
-        sync[2 * dp_size + dp_rank] = 1 if local_tbo_eligible else 0
-        sync[3 * dp_size + dp_rank] = local_ub0
-        sync[4 * dp_size + dp_rank] = local_ub1
-        torch.distributed.all_reduce(sync, group=get_dp_group().cpu_group)
-
-        num_tokens_across_dp = sync[:dp_size]
-        any_rank_has_prefill = bool(sync[dp_size : 2 * dp_size].sum().item() > 0)
-        all_ranks_tbo_eligible = (
-            int(sync[2 * dp_size : 3 * dp_size].sum().item()) == dp_size
-        )
-        ub0_across_dp = sync[3 * dp_size : 4 * dp_size]
-        ub1_across_dp = sync[4 * dp_size : 5 * dp_size]
-
-        max_tokens = int(num_tokens_across_dp.max().item())
+        max_tokens = int(sync.num_tokens_across_dp.max().item())
         # vLLM-style flag: True iff this step is safe for the fixed-size
         # CUDAGraph path across DP ranks (no rank doing prefill, or DP off).
-        dp_uniform_decode = (not any_rank_has_prefill) or (
+        dp_uniform_decode = (not sync.any_rank_has_prefill) or (
             not self.config.enable_dp_attention
         )
         if dp_uniform_decode:
-            # CUDAGraph path: all ranks pad to same max for fixed-size all_gather
+            # CUDAGraph path: all ranks pad to the same max for fixed-size all_gather.
             num_input_tokens = max_tokens
-        # else: variable-length path — each rank keeps its own token count
-
-        tbo_collective_active = self.config.enable_tbo and all_ranks_tbo_eligible
-        ub_max_tokens_across_dp = None
-        if tbo_collective_active:
-            # Cross-DP MAX per ubatch — replaces the second all_reduce that
-            # used to live in UBatchWrapper._compute_ub_graph_bs (prefill).
-            ub_max_tokens_across_dp = (
-                int(ub0_across_dp.max().item()),
-                int(ub1_across_dp.max().item()),
-            )
+        # else: variable-length path — each rank keeps its own token count.
 
         return (
             num_input_tokens,
-            num_tokens_across_dp,
+            sync.num_tokens_across_dp,
             dp_uniform_decode,
             max_tokens,
-            tbo_collective_active,
-            ub_max_tokens_across_dp,
+            sync.tbo_collective_active,
+            sync.ub_max_tokens_across_dp,
         )
 
     def prepare_inputs(self, batch: ScheduledBatch, input_ids: torch.Tensor = None):

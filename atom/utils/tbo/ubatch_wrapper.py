@@ -80,9 +80,13 @@ class UBatchWrapper(nn.Module):
         # (b) every 50 fwds thereafter. Prefill-only TBO can total way less
         # than 200 fwds across a whole benchmark, so the old `% 200 == 0`
         # gate could silently never fire.
-        first_hit = ctx.ubatch_slices is not None and (
-            getattr(self, "_n_used_prefill", 0) + getattr(self, "_n_used_decode", 0)
-        ) == 1
+        first_hit = (
+            ctx.ubatch_slices is not None
+            and (
+                getattr(self, "_n_used_prefill", 0) + getattr(self, "_n_used_decode", 0)
+            )
+            == 1
+        )
         if first_hit or total % 50 == 0:
             logger.info(
                 "[TBO] used_p=%d skip_p=%d used_d=%d skip_d=%d (hit_p=%.1f%% hit_d=%.1f%%)",
@@ -167,7 +171,7 @@ class UBatchWrapper(nn.Module):
             assert ub_token_slice[0].numel() > 0, (
                 f"ubatch {i} produced an empty token slice "
                 f"(ts={ub_slice.token_slice}, rs={ub_slice.request_slice}); "
-                "check _local_tbo_precompute / maybe_create_ubatch_slices."
+                "check local_tbo_precompute / maybe_create_ubatch_slices."
             )
             ub_inputs.append(ub_token_slice)
 

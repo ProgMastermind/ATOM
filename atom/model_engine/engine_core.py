@@ -3,7 +3,6 @@
 
 import enum
 import logging
-import os
 import pickle
 import queue
 import threading

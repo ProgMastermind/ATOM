@@ -2,8 +2,10 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import threading
+from dataclasses import dataclass
 from typing import Callable, Optional
 
+import numpy as np
 import torch
 
 from atom.config import get_current_atom_config
@@ -20,11 +22,142 @@ def tbo_enabled() -> bool:
     return getattr(config, "enable_tbo", False)
 
 
-# NOTE: ``sync_dp_for_tbo`` was removed. The DP TBO-eligibility / token-count
-# synchronisation has been folded into the packed single all_reduce in
-# ``ModelRunner._preprocess`` (see Plan B). Two callers used to issue it
-# every step (one for tokens+reqs, one for the per-ubatch token MAX in
-# ``UBatchWrapper``); both are now derived from the packed reduce.
+# =====================================================================
+# DP-side TBO helpers (formerly ModelRunner._local_tbo_precompute and
+# the inline sync block inside ModelRunner._preprocess).
+# =====================================================================
+
+
+def local_tbo_precompute(
+    config,
+    batch,
+    is_prefill: bool,
+    num_scheduled_tokens: np.ndarray,
+) -> tuple[bool, int, int]:
+    """Decide locally whether this rank could TBO-split into 2 ubatches,
+    and if so what (ub0_tokens, ub1_tokens) the split would produce.
+
+    Returns ``(eligible, ub0_tokens, ub1_tokens)``. All zeros when
+    ineligible. The eligibility bit is later AND-reduced across DP ranks
+    by :func:`sync_dp_for_tbo`; the ub0/ub1 counts are MAX-reduced so
+    every rank picks the same per-ubatch CUDAGraph buffer size.
+    """
+    if not config.enable_tbo:
+        return False, 0, 0
+    if is_prefill:
+        n_pref = batch.total_seqs_num_prefill
+        if n_pref < 2:
+            return False, 0, 0
+        # Mirror _split_prefill_balanced: pick boundary closest to total/2
+        # so the packed value matches what maybe_create_ubatch_slices will
+        # produce post-decision.
+        toks = np.asarray(num_scheduled_tokens[:n_pref], dtype=np.int64)
+        total = int(toks.sum())
+        target = total // 2
+        cumsum = 0
+        split_idx = 1
+        for j in range(n_pref):
+            cumsum += int(toks[j])
+            if cumsum >= target:
+                prev = cumsum - int(toks[j])
+                if j > 0 and (target - prev) < (cumsum - target):
+                    split_idx = j
+                else:
+                    split_idx = j + 1
+                break
+        split_idx = max(1, min(split_idx, n_pref - 1))
+        ub0 = int(toks[:split_idx].sum())
+        ub1 = total - ub0
+        return True, ub0, ub1
+    # Decode path
+    if not config.enable_tbo_decode or batch.is_dummy_run:
+        return False, 0, 0
+    scheduled_bs = batch.total_seqs_num_decode
+    if scheduled_bs < 2:
+        return False, 0, 0
+    num_tokens = batch.total_tokens_num
+    tokens_per_req = num_tokens // scheduled_bs if scheduled_bs else 1
+    reqs_per_ub = scheduled_bs // 2
+    ub0 = reqs_per_ub * tokens_per_req
+    ub1 = num_tokens - ub0
+    return True, ub0, ub1
+
+
+@dataclass
+class DPSyncResult:
+    """Output of :func:`sync_dp_for_tbo`."""
+
+    # [dp_size] int32 CPU tensor — each rank's input token count.
+    num_tokens_across_dp: torch.Tensor
+    # True iff ANY rank has at least one prefill seq this step.
+    any_rank_has_prefill: bool
+    # True iff TBO is on AND every rank reported local_tbo_eligible.
+    tbo_collective_active: bool
+    # (ub0_max, ub1_max) across DP — only set when tbo_collective_active.
+    ub_max_tokens_across_dp: Optional[tuple[int, int]]
+
+
+def sync_dp_for_tbo(
+    *,
+    dp_group,
+    dp_size: int,
+    num_input_tokens: int,
+    is_prefill: bool,
+    tbo_on: bool,
+    local_tbo_eligible: bool = False,
+    local_ub_tokens: tuple[int, int] = (0, 0),
+) -> DPSyncResult:
+    """Single packed DP all_gather over the per-rank scalars needed to
+    decide DP padding, the prefill fan-out, and the cross-DP TBO gate.
+
+    Pre-Plan-B this required up to 3 separate all_reduces per step
+    (``get_dp_padding`` / ``sync_dp_for_tbo`` / a third inside
+    ``UBatchWrapper``). Now one all_gather of ``n_fields`` int32 values
+    per rank suffices. When TBO is off only the first 2 fields are
+    exchanged (saves 60 % payload + skips :func:`local_tbo_precompute`
+    at the call site).
+
+    Layout (``sync`` is ``[n_fields, dp_size]``):
+
+      row 0 : num_input_tokens         -> num_tokens_across_dp
+      row 1 : is_prefill (0/1)         -> any_rank_has_prefill (OR)
+      row 2 : tbo_eligible (0/1)       -> tbo_collective_active (AND)   [TBO only]
+      row 3 : ub0_tokens               -> ub_max_tokens_across_dp[0]    [TBO only]
+      row 4 : ub1_tokens               -> ub_max_tokens_across_dp[1]    [TBO only]
+    """
+    n_fields = 5 if tbo_on else 2
+    local = torch.zeros(n_fields, dtype=torch.int32, device="cpu")
+    local[0] = num_input_tokens
+    local[1] = 1 if is_prefill else 0
+    if tbo_on:
+        local[2] = 1 if local_tbo_eligible else 0
+        local[3] = local_ub_tokens[0]
+        local[4] = local_ub_tokens[1]
+
+    gathered = [
+        torch.empty(n_fields, dtype=torch.int32, device="cpu") for _ in range(dp_size)
+    ]
+    torch.distributed.all_gather(gathered, local, group=dp_group)
+    sync = torch.stack(gathered, dim=1)  # [n_fields, dp_size]
+
+    num_tokens_across_dp = sync[0]
+    any_rank_has_prefill = bool(sync[1].any().item())
+    tbo_collective_active = False
+    ub_max_tokens_across_dp: Optional[tuple[int, int]] = None
+    if tbo_on:
+        tbo_collective_active = bool(sync[2].all().item())
+        if tbo_collective_active:
+            ub_max_tokens_across_dp = (
+                int(sync[3].max().item()),
+                int(sync[4].max().item()),
+            )
+
+    return DPSyncResult(
+        num_tokens_across_dp=num_tokens_across_dp,
+        any_rank_has_prefill=any_rank_has_prefill,
+        tbo_collective_active=tbo_collective_active,
+        ub_max_tokens_across_dp=ub_max_tokens_across_dp,
+    )
 
 
 _THREAD_ID_TO_CONTEXT: dict[int, int] = {}
