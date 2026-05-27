@@ -34,6 +34,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     == "1",
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
+    # Replace AITER HIP-backed kernels with AITER Triton equivalents at every
+    # call site that has one. Off by default; turn on to validate Triton paths
+    # on architectures where HIP/CK kernels are unavailable (e.g. gfx1250).
+    "ATOM_REPLACE_HIP_WITH_TRITON": lambda: os.getenv(
+        "ATOM_REPLACE_HIP_WITH_TRITON", "0"
+    )
+    == "1",
     # --- Kernel Fusion Toggles ---
     # QK-norm-rope-cache-quant fusion for Qwen3-MoE; disabled by default.
     # Enable for Qwen3-MoE to get better performance.

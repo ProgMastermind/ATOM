@@ -8,6 +8,7 @@ import torch
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from atom.config import get_current_atom_config
 from atom.model_ops.utils import _has_module
+from atom.utils import envs as _atom_envs
 from atom.utils.custom_register import direct_register_custom_op
 
 
@@ -165,6 +166,40 @@ def rocm_aiter_biased_grouped_topk_impl(
     num_fused_shared_experts: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
 
+    if _atom_envs.ATOM_REPLACE_HIP_WITH_TRITON:
+        from aiter import biased_grouped_topk_torch
+
+        topk_weights, topk_ids = biased_grouped_topk_torch(
+            gating_output,
+            correction_bias,
+            topk,
+            need_renorm,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+        )
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * routed_scaling_factor
+        token = gating_output.shape[0]
+        fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
+        if fuse_shared_experts and num_fused_shared_experts > 0:
+            assert aiter_topK_meta_data is not None, (
+                "AITER topK meta data is not initialized. "
+                "Please ensure that init_aiter_topK_meta_data is called before this function."
+            )
+            total_topk_weights, total_topk_ids = aiter_topK_meta_data
+            total_topk_weights = total_topk_weights[:token]
+            total_topk_ids = total_topk_ids[:token]
+            tw, _ = torch.split(
+                total_topk_weights, [topk, total_topk_weights.shape[1] - topk], dim=1
+            )
+            ti, _ = torch.split(
+                total_topk_ids, [topk, total_topk_ids.shape[1] - topk], dim=1
+            )
+            tw.copy_(topk_weights)
+            ti.copy_(topk_ids)
+            return total_topk_weights, total_topk_ids
+        return topk_weights, topk_ids
+
     from aiter import biased_grouped_topk
 
     token = gating_output.shape[0]
@@ -267,6 +302,40 @@ def rocm_aiter_grouped_topk_impl(
     routed_scaling_factor: float = 1.0,  # mul to topk_weights
     num_fused_shared_experts: int = 0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
+
+    if _atom_envs.ATOM_REPLACE_HIP_WITH_TRITON:
+        from aiter import grouped_topk_torch
+
+        topk_weights, topk_ids = grouped_topk_torch(
+            gating_output,
+            topk,
+            need_renorm,
+            num_expert_group=num_expert_group,
+            topk_group=topk_group,
+            scoring_func=scoring_func,
+        )
+        if routed_scaling_factor != 1.0:
+            topk_weights = topk_weights * routed_scaling_factor
+        token = gating_output.shape[0]
+        fuse_shared_experts = is_rocm_aiter_fusion_shared_expert_enabled()
+        if fuse_shared_experts and num_fused_shared_experts > 0:
+            assert aiter_topK_meta_data is not None, (
+                "AITER topK meta data is not initialized. "
+                "Please ensure that init_aiter_topK_meta_data is called before this function."
+            )
+            total_topk_weights, total_topk_ids = aiter_topK_meta_data
+            total_topk_weights = total_topk_weights[:token]
+            total_topk_ids = total_topk_ids[:token]
+            tw, _ = torch.split(
+                total_topk_weights, [topk, total_topk_weights.shape[1] - topk], dim=1
+            )
+            ti, _ = torch.split(
+                total_topk_ids, [topk, total_topk_ids.shape[1] - topk], dim=1
+            )
+            tw.copy_(topk_weights)
+            ti.copy_(topk_ids)
+            return total_topk_weights, total_topk_ids
+        return topk_weights, topk_ids
 
     from aiter import grouped_topk
 
