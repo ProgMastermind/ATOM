@@ -968,11 +968,12 @@ class ModelRunner:
 
     def dummy_execution(self):
         """Execute dummy decode batch for DP synchronization."""
-        # num_tokens_original = 1
         mtp_factor = (self.drafter.mtp_k + 1) if hasattr(self, "drafter") else 1
         num_tokens_original = mtp_factor
 
-        seq = Sequence([0] * num_tokens_original, block_size=self.block_size)
+        # Use sentinel id=-1 so dummy seqs can never collide with real seq ids
+        # (real ids come from the main-process counter and are always >= 0).
+        seq = Sequence([0] * num_tokens_original, block_size=self.block_size, id=-1)
         seq.status = SequenceStatus.RUNNING
         seq.type = SequenceType.DECODE
         seq.block_table = [0]
