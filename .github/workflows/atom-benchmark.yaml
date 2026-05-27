@@ -520,7 +520,7 @@ jobs:
         model: ${{ fromJson(needs.load-pd-models.outputs.models_json) }}
 
     runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || 'atom-mi355-8gpu.predownload' }}
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     env:
       MODEL_PATH: ${{ matrix.model.path }}
@@ -713,7 +713,7 @@ jobs:
           done
 
       - name: Run PD benchmarks
-        timeout-minutes: 120
+        timeout-minutes: 180
         run: |
           if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
           else model_path="${{ env.MODEL_PATH }}"; fi
@@ -835,7 +835,7 @@ jobs:
         entry: ${{ fromJson(needs.load-pd-models.outputs.decode_matrix_json) }}
 
     runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || 'atom-mi355-8gpu.predownload' }}
-    timeout-minutes: 120
+    timeout-minutes: 180
 
     env:
       MODEL_PATH: ${{ matrix.entry.path }}
@@ -860,7 +860,7 @@ jobs:
 
       - name: Wait for previous model to complete
         if: matrix.entry.prev_model_prefix != ''
-        timeout-minutes: 120
+        timeout-minutes: 180
         uses: actions/github-script@v7
         with:
           script: |
