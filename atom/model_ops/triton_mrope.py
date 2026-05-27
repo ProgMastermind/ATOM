@@ -161,9 +161,7 @@ def _mrope_qk_tiled_kernel(
     pair_offsets_k = (
         rows[:, None] * k_stride_t + local_head * head_size + pair_d[None, :]
     )
-    pair_q = tl.load(q_ptr + pair_offsets_q, mask=mask & is_q, other=0.0).to(
-        tl.float32
-    )
+    pair_q = tl.load(q_ptr + pair_offsets_q, mask=mask & is_q, other=0.0).to(tl.float32)
     pair_k = tl.load(k_ptr + pair_offsets_k, mask=mask & ~is_q, other=0.0).to(
         tl.float32
     )
@@ -195,12 +193,8 @@ def _mrope_qk_tiled_kernel(
     rotated = tl.where(first_half[None, :], -pair, pair)
     out = tl.where(rot_mask[None, :], x * cos + rotated * sin, x)
 
-    out_offsets_q = (
-        rows[:, None] * q_out_stride_t + local_head * head_size + d[None, :]
-    )
-    out_offsets_k = (
-        rows[:, None] * k_out_stride_t + local_head * head_size + d[None, :]
-    )
+    out_offsets_q = rows[:, None] * q_out_stride_t + local_head * head_size + d[None, :]
+    out_offsets_k = rows[:, None] * k_out_stride_t + local_head * head_size + d[None, :]
     tl.store(q_out_ptr + out_offsets_q, out, mask=mask & is_q)
     tl.store(k_out_ptr + out_offsets_k, out, mask=mask & ~is_q)
 
