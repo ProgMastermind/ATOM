@@ -1612,8 +1612,6 @@ class ModelRunner:
         )
 
         max_tokens = int(sync.num_tokens_across_dp.max().item())
-        # vLLM-style flag: True iff this step is safe for the fixed-size
-        # CUDAGraph path across DP ranks (no rank doing prefill, or DP off).
         dp_uniform_decode = (not sync.any_rank_has_prefill) or (
             not self.config.enable_dp_attention
         )

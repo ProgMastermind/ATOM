@@ -465,16 +465,6 @@ class UBatchWrapper(nn.Module):
             dp_metadata=ctx.dp_metadata,  # shared across ubatches
             spec_decode_metadata=None,  # not supported with TBO
             ubatch_slices=None,  # prevent recursion
-            # Propagate parent's cached current_stream so downstream code
-            # (V4 dual-stream MoE / attention compressor / etc.) that reads
-            # `get_forward_context().main_stream` sees a real Stream rather
-            # than None. Without this the per-ubatch ForwardContext picks up
-            # the dataclass default (None) and the first `wait_stream(None)`
-            # crashes with `AttributeError: 'NoneType' has no record_event`.
-            # The TBO worker thread switches stream via TBOContext, so we
-            # use the parent's stream here (= the original compute stream),
-            # which is also the stream the worker resumes on after each
-            # comm→compute switch.
             main_stream=ctx.main_stream,
             in_hipgraph=ctx.in_hipgraph,
         )
