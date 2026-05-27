@@ -650,6 +650,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or gfx.startswith("gfx12")
                 or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
             )
+        self.use_triton = False
         if self.use_triton:
             from atom.model_ops.utils import has_triton_kernels
 

@@ -25,6 +25,20 @@ from aiter.ops.triton.fused_add_rmsnorm_pad import fused_add_rmsnorm_pad
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.gated_rmsnorm_fp8_group_quant import gated_rmsnorm_fp8_group_quant
 
+# AITER Triton equivalents used when ATOM_REPLACE_HIP_WITH_TRITON=1.
+# We import the low-level kernel-launch helpers rather than the autograd
+# Function wrappers (rms_norm / rmsnorm2d_fwd_with_add) because the latter's
+# `.apply()` machinery fault-faults when called from inside a torch.compile
+# custom op + cudagraph capture. The helpers below have the same kernel
+# semantics as the HIP path: _rmsnorm_forward returns a fresh `y`, and
+# _rmsnorm_forward_with_add writes `out`/`residual_out` in-place (see
+# aiter/ops/triton/normalization/rmsnorm.py:_rmsnorm_forward{,_with_add}).
+from aiter.ops.triton.normalization.rmsnorm import (
+    _rmsnorm_forward as _triton_rmsnorm_forward,
+    _rmsnorm_forward_with_add as _triton_rmsnorm_forward_with_add,
+)
+from atom.utils import envs as _atom_envs
+
 from aiter import (
     QuantType,
 )
@@ -55,16 +69,33 @@ def silu(input: Tensor, inplace: bool = False) -> Tensor:
     return torch._C._nn.silu(input)
 
 
-@torch_compile_guard()
+def rmsnorm2d_fwd_fake_tensors(
+    x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
+) -> torch.Tensor:
+    return torch.empty_like(x)
+
+
+@torch_compile_guard(gen_fake=rmsnorm2d_fwd_fake_tensors)
 def rmsnorm2d_fwd_(
     x: torch.Tensor, weight: torch.Tensor, eps: float, dim: int
 ) -> torch.Tensor:
     ori_shape = x.shape
     x = x.reshape(-1, dim)
-    return rmsnorm2d_fwd(x, weight, eps).view(ori_shape)
+    if _atom_envs.ATOM_REPLACE_HIP_WITH_TRITON:
+        # _rmsnorm_forward returns (y, rsigma); we only need y.
+        out, _ = _triton_rmsnorm_forward(x, weight, eps)
+    else:
+        out = rmsnorm2d_fwd(x, weight, eps)
+    return out.view(ori_shape)
 
 
-@torch_compile_guard()
+def rmsnorm2d_fwd_with_add_fake_tensors(
+    x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, eps: float, dim: int
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(x), torch.empty_like(x)
+
+
+@torch_compile_guard(gen_fake=rmsnorm2d_fwd_with_add_fake_tensors)
 def rmsnorm2d_fwd_with_add_(
     x: torch.Tensor, weight: torch.Tensor, residual: torch.Tensor, eps: float, dim: int
 ) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -72,7 +103,23 @@ def rmsnorm2d_fwd_with_add_(
     x = x.reshape(-1, dim)
     out = torch.empty_like(x)
     residual_out = torch.empty_like(x)
-    rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
+    if _atom_envs.ATOM_REPLACE_HIP_WITH_TRITON:
+        # The Triton _fused_add_rmsnorm_kernel only takes ONE input-side
+        # row-stride and reuses it for x, residual_in, residual_out. Force
+        # all input-side tensors to the same contiguous layout before launch
+        # so the shared stride is correct; otherwise the kernel computes
+        # invalid addresses and the GPU page-faults.
+        x = x.contiguous()
+        residual = residual.contiguous()
+        weight_c = weight.contiguous()
+        out = torch.empty_like(x)
+        residual_out = torch.empty_like(x)
+        rsigma = torch.empty((x.shape[0],), dtype=torch.float32, device=x.device)
+        _triton_rmsnorm_forward_with_add(
+            out, x, residual, residual_out, weight_c, rsigma, eps
+        )
+    else:
+        rmsnorm2d_fwd_with_add(out, x, residual, residual_out, weight, eps)
     return out.view(ori_shape), residual_out.view(ori_shape)
 
 

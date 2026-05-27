@@ -32,23 +32,26 @@ def generate_cuda_graph_sizes(max_size):
 
 
 def main():
-    prompts = [
-        "introduce yourself",
-        "list all prime numbers within 100",
-        "1+2+3=?",
-        "如何在一个月内增肌10公斤",
-    ]
     args = parser.parse_args()
-    # Generate power of 2 sizes for CUDA graph: [1, 2, 4, 8, ...]
-    args.cudagraph_capture_sizes = str(generate_cuda_graph_sizes(len(prompts)))
-
-    # Create engine from args
-    engine_args = EngineArgs.from_cli_args(args)
-    llm = engine_args.create_engine()
 
     tokenizer = AutoTokenizer.from_pretrained(args.model)
 
-    sampling_params = SamplingParams(temperature=args.temperature, max_tokens=256)
+    dummy_token = "hi "
+    dummy_tokens = tokenizer.encode(dummy_token, add_special_tokens=False)
+    target_len = 1024
+    repeat_count = target_len // len(dummy_tokens)
+    dummy_text = dummy_token * repeat_count
+    token_count = len(tokenizer.encode(dummy_text, add_special_tokens=False))
+    print(f"Input token count: {token_count}")
+
+    prompts_raw = [dummy_text]
+
+    args.cudagraph_capture_sizes = str(generate_cuda_graph_sizes(len(prompts_raw)))
+
+    engine_args = EngineArgs.from_cli_args(args)
+    llm = engine_args.create_engine()
+
+    sampling_params = SamplingParams(temperature=args.temperature, max_tokens=1024)
 
     prompts = [
         tokenizer.apply_chat_template(
@@ -57,9 +60,9 @@ def main():
             add_generation_prompt=True,
             enable_thinking=True,
         )
-        for prompt in prompts
+        for prompt in prompts_raw
     ]
-    print("This is prompts:", prompts)
+    print("This is prompts (truncated):", [p[:200] + "..." for p in prompts])
     # print("Warming up...")
     # _ = llm.generate(["warmup"], sampling_params)
     # print("Warm up done")
