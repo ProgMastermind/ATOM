@@ -1588,7 +1588,18 @@ class ModelRunner:
 
         if dp_size <= 1:
             # Single-rank: TBO decision is purely local; no collective needed.
-            return num_input_tokens, None, False, None, local_eligible, None
+            # dp_uniform_decode=True mirrors the DP-disabled case in the
+            # multi-rank branch (`not enable_dp_attention` => True) and the
+            # Context default — otherwise single-GPU/TP-only decode would
+            # be forced into eager and lose the CUDAGraph decode path.
+            return (
+                num_input_tokens,
+                None,
+                True,
+                num_input_tokens,
+                local_eligible,
+                None,
+            )
 
         sync = sync_dp_for_tbo(
             dp_group=get_dp_group().cpu_group,

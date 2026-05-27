@@ -233,6 +233,55 @@ def reduce_scatterv(x: torch.Tensor, sizes: list[int], group) -> torch.Tensor:
     return group.device_communicator.reduce_scatterv(x, dim=0, sizes=list(sizes))
 
 
+def dp_gather_hidden_and_router(
+    hidden_states: torch.Tensor,
+    router_logits: torch.Tensor,
+    dp_eager_mode: bool,
+    ctx,
+    dp_group,
+):
+    """All-gather ``hidden_states`` + ``router_logits`` across DP ranks.
+
+    - **Eager (variable-length) mode**: per-rank token counts may differ, so
+      we ``all_gatherv`` with per-rank sizes. Both tensors are concatenated
+      along the last dim and gathered in a single collective to avoid the
+      cost of two separate rounds (caller splits them back out).
+    - **Uniform mode** (DP-decode-only / CUDAGraph path): every rank has the
+      same token count, so a plain padded ``all_gather`` per tensor is
+      enough.
+
+    Returns ``(hidden_states, router_logits, original_hidden_size, sizes)``;
+    ``sizes`` is non-None only in eager mode (needed later for
+    ``reduce_scatterv``).
+    """
+    if dp_eager_mode:
+        sizes = ctx.dp_metadata.get_sizes_across_dp()
+        original_hidden_size = hidden_states.shape[0]
+        h_dim = hidden_states.shape[-1]
+        r_dim = router_logits.shape[-1]
+        r_dtype = router_logits.dtype
+        # Cast router_logits to hidden_states.dtype for the single fused
+        # gather; cast back after split. (all_gatherv requires uniform dtype.)
+        r_for_gather = (
+            router_logits
+            if r_dtype == hidden_states.dtype
+            else router_logits.to(hidden_states.dtype)
+        )
+        combined = torch.cat([hidden_states, r_for_gather], dim=-1)
+        combined = all_gatherv(combined, sizes, dp_group)
+        hidden_states, router_logits = combined.split([h_dim, r_dim], dim=-1)
+        hidden_states = hidden_states.contiguous()
+        if router_logits.dtype != r_dtype:
+            router_logits = router_logits.to(r_dtype)
+        else:
+            router_logits = router_logits.contiguous()
+        return hidden_states, router_logits, original_hidden_size, sizes
+
+    hidden_states, original_hidden_size = all_gather_with_padding(hidden_states)
+    router_logits, _ = all_gather_with_padding(router_logits)
+    return hidden_states, router_logits, original_hidden_size, None
+
+
 @torch_compile_guard()
 def get_max_tokens_across_dispatchers(input: torch.Tensor) -> int:
     return input.item()
@@ -2928,7 +2977,7 @@ class FusedMoE(torch.nn.Module):
         if use_dp_gather_scatter:
             ctx = get_forward_context()
             dp_group = get_dp_group()
-            dp_variable_len = not ctx.context.dp_uniform_decode
+            dp_eager_mode = not ctx.context.dp_uniform_decode
 
             from atom.utils.tbo.ubatching import tbo_active
 
@@ -2942,30 +2991,14 @@ class FusedMoE(torch.nn.Module):
 
                 tbo_yield_and_switch_from_compute_to_comm()
 
-            if dp_variable_len:
-                sizes = ctx.dp_metadata.get_sizes_across_dp()
-                original_hidden_size = hidden_states.shape[0]
-                _h_dim = hidden_states.shape[-1]
-                _r_dim = router_logits.shape[-1]
-                _r_dtype = router_logits.dtype
-                _r_for_gather = (
-                    router_logits
-                    if _r_dtype == hidden_states.dtype
-                    else router_logits.to(hidden_states.dtype)
-                )
-                _combined = torch.cat([hidden_states, _r_for_gather], dim=-1)
-                _combined = all_gatherv(_combined, sizes, dp_group)
-                hidden_states, router_logits = _combined.split([_h_dim, _r_dim], dim=-1)
-                hidden_states = hidden_states.contiguous()
-                if router_logits.dtype != _r_dtype:
-                    router_logits = router_logits.to(_r_dtype)
-                else:
-                    router_logits = router_logits.contiguous()
-            else:
-                hidden_states, original_hidden_size = all_gather_with_padding(
-                    hidden_states
-                )
-                router_logits, _ = all_gather_with_padding(router_logits)
+            (
+                hidden_states,
+                router_logits,
+                original_hidden_size,
+                sizes,
+            ) = dp_gather_hidden_and_router(
+                hidden_states, router_logits, dp_eager_mode, ctx, dp_group
+            )
 
             if _tbo:
                 tbo_switch_to_compute_sync()
@@ -2994,7 +3027,7 @@ class FusedMoE(torch.nn.Module):
         if use_dp_gather_scatter:
             if _tbo:
                 tbo_yield_and_switch_from_compute_to_comm()
-            if dp_variable_len:
+            if dp_eager_mode:
                 final_hidden_states = reduce_scatterv(
                     final_hidden_states, sizes, dp_group
                 )

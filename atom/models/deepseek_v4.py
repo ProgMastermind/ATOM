@@ -2003,10 +2003,10 @@ class MoE(nn.Module):
             from aiter.dist.parallel_state import get_dp_group as _get_dp_group
 
             ctx = get_forward_context()
-            dp_variable_len = (
+            dp_eager_mode = (
                 not ctx.context.dp_uniform_decode
             ) and ctx.dp_metadata is not None
-            if dp_variable_len:
+            if dp_eager_mode:
                 from atom.model_ops.moe import all_gatherv
 
                 sizes = ctx.dp_metadata.get_sizes_across_dp()
