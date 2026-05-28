@@ -461,10 +461,13 @@ class LinearBase(nn.Module):
             "quant_dtype": str(online_quant_dtype),
         }
 
-    def _maybe_preserve_unshuffled_mxfp4_kv_b_proj(self):
+    def _maybe_preserve_unshuffled_mxfp4_attention_proj(self):
         if (
             self.weight.dim() == 2
-            and ".self_attn.kv_b_proj" in self.prefix
+            and (
+                ".self_attn.kv_b_proj" in self.prefix
+                or ".self_attn.q_b_proj" in self.prefix
+            )
             and self.quant_type == QuantType.per_1x32
             and self.params_dtype == dtypes.fp4x2
             and self.source_quant_dtype is None
@@ -515,7 +518,7 @@ class LinearBase(nn.Module):
             # Qwen3-Next/Qwen3.5 GDN conv1d expands its weight to 3D, so FP8/blocked
             # quantized models must keep that tensor unshuffled here.
             if self.weight.dim() == 2:
-                self._maybe_preserve_unshuffled_mxfp4_kv_b_proj()
+                self._maybe_preserve_unshuffled_mxfp4_attention_proj()
                 shuffle_weights(self.weight)
             # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         else:
@@ -528,7 +531,7 @@ class LinearBase(nn.Module):
                 need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
             if need_shuffle:
                 if self.weight.dim() == 2:
-                    self._maybe_preserve_unshuffled_mxfp4_kv_b_proj()
+                    self._maybe_preserve_unshuffled_mxfp4_attention_proj()
                     shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
         # shuffle weight scale once so no reshuffling for every gemm
