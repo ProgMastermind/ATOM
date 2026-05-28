@@ -68,6 +68,7 @@ from atom.model_ops.linear import (
     MergedReplicatedLinear,
     ReplicatedLinear,
     RowParallelLinear,
+    use_fp4_triton_gemm,
     use_triton_gemm,
 )
 from atom.model_ops.moe import FusedMoE
@@ -1932,12 +1933,21 @@ class DeepseekV2DecoderLayer(nn.Module):
             else quant_config.get_layer_quant_config(prefix).quant_type.value
         )
         self.fuse_input_norm_quant = False
+        self.input_norm_quant_raw_scale = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
         if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
-            if (
-                self.quant_dtype == dtypes.fp8 or self.quant_dtype == dtypes.fp4x2
-            ) and use_triton_gemm():
+            can_fuse_input_norm_quant = (
+                self.quant_dtype == dtypes.fp8
+                and use_triton_gemm()
+            ) or (
+                self.quant_dtype == dtypes.fp4x2
+                and (use_triton_gemm() or use_fp4_triton_gemm())
+            )
+            if can_fuse_input_norm_quant:
                 self.fuse_input_norm_quant = True
+                self.input_norm_quant_raw_scale = (
+                    self.quant_dtype == dtypes.fp4x2 and use_fp4_triton_gemm()
+                )
                 if self.fuse_ar_input_norm:
                     self.fuse_ar_input_norm = False
                     if layer_idx == 0:
@@ -1999,6 +2009,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             assert self.quant_dtype is not None
             weight = self.input_layernorm.weight
             eps = self.input_layernorm.eps
+            shuffle_input_norm_quant = not self.input_norm_quant_raw_scale
             if residual is None:
                 residual = hidden_states
                 (hidden_states_quant, hidden_states_quant_scale), _, _, _ = (
@@ -2011,8 +2022,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                         None,
                         None,
                         dtype_quant=self.quant_dtype,
-                        shuffle=True,
-                        scale_shuffle_padding=True,
+                        shuffle=shuffle_input_norm_quant,
+                        scale_shuffle_padding=shuffle_input_norm_quant,
                         group_size=128,
                         quant_type=self.input_norm_quant_type,
                         output_unquantized_inp1=False,
@@ -2030,8 +2041,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                         None,
                         residual,
                         dtype_quant=self.quant_dtype,
-                        shuffle=True,
-                        scale_shuffle_padding=True,
+                        shuffle=shuffle_input_norm_quant,
+                        scale_shuffle_padding=shuffle_input_norm_quant,
                         group_size=128,
                         quant_type=self.input_norm_quant_type,
                         output_unquantized_inp1=False,
