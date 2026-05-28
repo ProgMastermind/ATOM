@@ -1266,7 +1266,7 @@ class ModelRunner:
         cudagraph_overhead = self._estimate_cudagraph_overhead()
 
         # Safety margin (2% of total)
-        safety_margin = int(total * 0.05)
+        safety_margin = int(total * 0.02)
 
         # Budget: this server may use up to gpu_memory_utilization * total.
         # Subtract our own PyTorch usage + CUDA graph estimate + safety.
@@ -1957,21 +1957,6 @@ class ModelRunner:
         )
         return words
 
-    @staticmethod
-    def _full_cu_mask() -> list[int]:
-        """Return CU mask bits for the given fraction.
-
-        For upper=False (prefill): CUs [0, split).
-        For upper=True  (decode):  CUs [split, total).
-        split = round(total * fraction).
-        """
-        total = torch.cuda.get_device_properties(
-            torch.cuda.current_device()
-        ).multi_processor_count
-        num_words = (total + 31) // 32
-        words = [0xFFFFFFFF] * num_words
-        return words
-
     # CU fractions for which we pre-create masked streams.
     _CU_POOL_FRACTIONS = [0.5]
 
@@ -1989,9 +1974,7 @@ class ModelRunner:
         if getattr(self.config, "disagg_constrained", False):
             for f in self._CU_POOL_FRACTIONS:
                 mask = self._cu_mask_for_fraction(f, upper=False)
-                #mask = self._full_cu_mask()
                 self._prefill_streams[f] = self._stream_with_cu_mask(mask)
-                #self._prefill_streams[f] = torch.cuda.Stream()
         # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
         self._prefill_streams[None] = torch.cuda.Stream()
         logger.info(
@@ -2012,12 +1995,9 @@ class ModelRunner:
         if getattr(self.config, "disagg_constrained", False):
             for f in self._CU_POOL_FRACTIONS:
                 mask = self._cu_mask_for_fraction(f, upper=True)
-                #mask = self._full_cu_mask()
                 self._decode_streams[f] = self._stream_with_cu_mask(mask)
-                #self._decode_streams[f] = torch.cuda.Stream()
         # Full-CU fallback (no mask) — always present, sole entry in unconstrained mode
         self._decode_streams[None] = torch.cuda.Stream()
-        #torch.cuda.set_stream(self._decode_streams[None])
         self._model_fwd_event = torch.cuda.Event()
         self._done_event = torch.cuda.Event()
         logger.info(
@@ -2047,8 +2027,6 @@ class ModelRunner:
             sampled_cpu = sampled.view(-1).tolist()
         # Synchronize so decode's default stream sees all KV writes.
         stream.synchronize()
-        # sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)
-        # sampled_cpu = sampled.view(-1).tolist()
         reset_forward_context()
         return sampled_cpu
     def gated_delta_net_state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
@@ -2472,7 +2450,6 @@ class ModelRunner:
                 logits, hidden_states = self.run_model(input_ids, batch)
             self._model_fwd_event.record(stream)
             torch.cuda.current_stream().wait_event(self._model_fwd_event)
-            #stream.synchronize()
         else:
             input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(batch)
             logits, hidden_states = self.run_model(input_ids, batch)
@@ -2487,7 +2464,7 @@ class ModelRunner:
             all_greedy,
             hidden_states,
         )
-        #self._done_event.record()
+
         reset_forward_context()
         return fwd_output
 

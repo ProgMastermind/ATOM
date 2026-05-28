@@ -214,7 +214,6 @@ def _optimal_cu_fraction(
     Returns None when CU masking provides no benefit (no pending prefill,
     tiny prefill).
     """
-    #return None
     assert prefill_waiting_tokens>=0
     if prefill_waiting_tokens==0 or decode_batch<64:
         return None
@@ -896,7 +895,7 @@ class PrefillScheduler:
         self.cache_stats = None
 
         # Shared memory for dynamic CU partitioning.
-        # Layout: [0:4] = prefill_tokens (uint32), [4:8] = decode_batch (uint32).
+        # Layout: [0:4] = decode_tokens (uint32)
         self._cu_shm = None
         if disagg_cu_shm_name:
             import multiprocessing.shared_memory
@@ -955,27 +954,14 @@ class PrefillScheduler:
         if not scheduled_seqs:
             return None, {}
 
-        # Read the CU fraction chosen by the DecodeScheduler via shared memory.
-        # 0.0 in shm means "no mask" → map to None (the stream pool key).
+        # Read the decode tokens from decode process via shared memory.
 
         cu_fraction = None
-        # if self._cu_shm is not None:
-        #     raw = struct.unpack_from("f", self._cu_shm.buf, 0)[0]
-        #     if raw > 0.0:
-        #         cu_fraction = raw
-        #     logger.info("received cu fraction")
 
         if self._cu_shm is not None:
             decode_tokens = struct.unpack_from("I", self._cu_shm.buf, 0)[0]
-            cu_fraction = _optimal_cu_fraction(decode_tokens+self.num_seq_done,num_batched_tokens)
-            logger.info("prefill cu fraction %f", cu_fraction if cu_fraction else 0.0)
+            cu_fraction = _optimal_cu_fraction(decode_tokens,num_batched_tokens)
 
-        self.num_seq_done=num_batched_tokens
-
-        # logger.info(
-        #     f"[PrefillScheduler] scheduled {num_seqs} seqs, "
-        #     f"{num_batched_tokens} tokens, req_ids: {tuple(scheduled_seqs.keys())}"
-        # )
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,
@@ -991,8 +977,6 @@ class PrefillScheduler:
 
     def postprocess(self, seqs, fwd_output, stream_output_queue=None) -> list:
         """No-op: prefill produces no sampled tokens."""
-        # for seq in seqs:
-        #     self.running.remove(seq)
         return []
 
     def get_next_batch_info(self) -> tuple:
@@ -1089,7 +1073,6 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
-            #logger.info("seq_id %d num_prompt_tokens %d num_tokens_computed %d new token %d", seq_id, seq.num_prompt_tokens, num_tokens_computed, sampled_token_id)
             seq.first_token_time = time.time()
             self.prefill_done.append(seq)
 
@@ -1145,9 +1128,6 @@ class DecodeScheduler(Scheduler):
                     seq.type = SequenceType.DECODE
                     num_scheduled_tokens.append(num_new_tokens)
 
-            # self.prefill_waiting_tokens = sum(
-            #     seq.num_tokens for seq in self.prefill_waiting.values()
-            # )
 
         if not scheduled_seqs:
             self.cu_fraction=None
@@ -1161,24 +1141,13 @@ class DecodeScheduler(Scheduler):
 
         # Dynamic CU partitioning: decode decides the fraction based on its
         # batch size and the total tokens queued for prefill, then writes the
-        # fraction to shared memory for PrefillScheduler to read.
-
-        
-        # if self._cu_shm is not None:
-        #     pwait=int(self.prefill_waiting_tokens.load())
-        #     #logger.info("prefill_waiting_tokens %d", pwait)
-        #     raw = _optimal_cu_fraction(total_tokens_num_decode, pwait)
-        #     # Stream pool is keyed by None (no mask) or a positive float.
-        #     self.cu_fraction = raw if raw and raw > 0.0 else None
-        #     # Write to shm for prefill to read. 0.0 means "no mask".
-        #     struct.pack_into("f", self._cu_shm.buf, 0, raw or 0.0)
+        # decode tokens to shared memory for PrefillScheduler to read.
 
         if self._cu_shm is not None:
             struct.pack_into("I", self._cu_shm.buf, 0, total_tokens_num_decode)
             if prefill_finished:
                 pwait=int(self.prefill_waiting_tokens.load())
                 self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
-                logger.info("decode cu fraction %f", self.cu_fraction if self.cu_fraction else 0.0)
 
         
         return (
@@ -1195,12 +1164,3 @@ class DecodeScheduler(Scheduler):
             ),
             scheduled_seqs,
         )
-
-    # def postprocess(
-    #     self,
-    #     seqs: list[Sequence],
-    #     fwd_output: ScheduledBatchOutput,
-    #     stream_output_queue=None,
-    # ) -> list[Sequence]:
-    #     with self._prefill_lock:
-    #         super().postprocess(seqs, fwd_output, stream_output_queue)
