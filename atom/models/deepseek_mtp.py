@@ -169,6 +169,7 @@ class DeepSeekMTP(nn.Module):
     def __init__(self, atom_config: Config, prefix: str = ""):
         super().__init__()
         self.config = atom_config.hf_config
+        self.use_local_nextn_layer_names = False
 
         # Several MTP checkpoints (DeepSeek R1/V3/V3.2 FP8 + the Quark mixed
         # MXFP4/FP8 variants) store eh_proj as BF16 with no weight_scale even
@@ -226,6 +227,18 @@ class DeepSeekMTP(nn.Module):
 
     def remap_mtp_weight_name(self, name: str) -> str | None:
         spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
+        if spec_layer is None and self.use_local_nextn_layer_names:
+            num_nextn_layers = getattr(self.config, "num_nextn_predict_layers", 0)
+            for local_idx in range(num_nextn_layers):
+                local_prefix = f"model.layers.{local_idx}."
+                if name.startswith(local_prefix):
+                    spec_layer = self.config.num_hidden_layers + local_idx
+                    name = name.replace(
+                        local_prefix,
+                        f"model.layers.{spec_layer}.",
+                        1,
+                    )
+                    break
         if spec_layer is None:
             return None
         return rewrite_spec_layer_name(spec_layer, name)
@@ -254,6 +267,11 @@ class DeepSeekMTP(nn.Module):
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         # Params for weights, fp8 weight scales, fp8 activation scales
         # (param_name, weight_name, expert_id, shard_id)
+        mtp_start_layer_idx = self.config.num_hidden_layers
+        shared_expert_prefix = (
+            f"model.layers.{mtp_start_layer_idx}.mtp_block.mlp.shared_experts"
+        )
+        routed_expert_prefix = f"model.layers.{mtp_start_layer_idx}.mtp_block.mlp.experts"
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="gate_proj",
             ckpt_down_proj_name="down_proj",
@@ -261,7 +279,10 @@ class DeepSeekMTP(nn.Module):
             num_experts=self.config.n_routed_experts
             + (
                 self.config.n_shared_experts
-                if is_rocm_aiter_fusion_shared_expert_enabled()
+                if is_rocm_aiter_fusion_shared_expert_enabled(
+                    shared_expert_prefix=shared_expert_prefix,
+                    routed_expert_prefix=routed_expert_prefix,
+                )
                 else 0
             ),
         )
