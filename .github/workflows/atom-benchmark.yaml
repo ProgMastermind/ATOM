@@ -422,6 +422,7 @@ jobs:
     outputs:
       models_json: ${{ steps.load.outputs.models_json }}
       decode_matrix_json: ${{ steps.load.outputs.decode_matrix_json }}
+      prefill_extra_matrix_json: ${{ steps.load.outputs.prefill_extra_matrix_json }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -446,11 +447,22 @@ jobs:
                   entry['consumer_port'] = 8004 + j
                   decode_entries.append(entry)
 
+          # Extra prefill nodes: index 0 is the coordinator (pd-prefill job),
+          # so only indices 1..num_prefill_nodes-1 get their own fan-out job.
+          prefill_extra_entries = []
+          for m in models:
+              num_prefill = m.get('num_prefill_nodes', 1)
+              for j in range(1, num_prefill):
+                  entry = dict(m)
+                  entry['prefill_index'] = j
+                  prefill_extra_entries.append(entry)
+
           with open(os.environ['GITHUB_OUTPUT'], 'a') as f:
               f.write(f"models_json={json.dumps(models)}\n")
               f.write(f"decode_matrix_json={json.dumps(decode_entries)}\n")
+              f.write(f"prefill_extra_matrix_json={json.dumps(prefill_extra_entries)}\n")
 
-          print(f"Loaded {len(models)} PD model(s), {len(decode_entries)} decode entries (sequential scheduling)")
+          print(f"Loaded {len(models)} PD model(s), {len(decode_entries)} decode entries, {len(prefill_extra_entries)} extra prefill entries (sequential scheduling)")
           PY
 
   # ── IP round-trip validation (2 runners, no GPU) ─────────────────
@@ -638,6 +650,8 @@ jobs:
             "sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null || true"
 
       - name: Start proxy and producer
+        env:
+          MODEL_ENV_VARS: ${{ matrix.model.env_vars }}
         run: |
           if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
           else model_path="${{ env.MODEL_PATH }}"; fi
@@ -645,7 +659,12 @@ jobs:
           PROXY_IP="${{ steps.proxy-ip.outputs.proxy_ip }}"
           echo "Prefill IP: ${PROXY_IP}"
 
-          docker exec atom-pd-prefill bash -lc "
+          # Write model env_vars to a file consumed via docker exec --env-file
+          # (avoids expression injection — newlines in env_vars would otherwise
+          # break the host bash). Empty file is fine for --env-file.
+          printenv MODEL_ENV_VARS 2>/dev/null | grep -v '^$' > /tmp/atom_pd_env.txt || true
+
+          docker exec --env-file /tmp/atom_pd_env.txt atom-pd-prefill bash -lc "
             set -euo pipefail
             PROXY_IP=${PROXY_IP}
             PROXY_PORT=10001
@@ -679,18 +698,43 @@ jobs:
           "
 
       - name: Wait for producer health
-        timeout-minutes: 45
+        timeout-minutes: 90
         run: |
           echo "Waiting for producer at http://localhost:8003/health ..."
-          for i in $(seq 1 45); do
+          for i in $(seq 1 90); do
             if curl -sf http://localhost:8003/health -o /dev/null --max-time 10 2>/dev/null; then
               echo "Producer healthy after $((i * 60))s"
               break
             fi
-            [ "$i" -eq 45 ] && echo "ERROR: Producer not healthy after 45min" && exit 1
-            echo "  Not ready ($i/45), retrying in 60s..."
+            [ "$i" -eq 90 ] && echo "ERROR: Producer not healthy after 90min" && exit 1
+            echo "  Not ready ($i/90), retrying in 60s..."
             sleep 60
           done
+
+      - name: Wait for extra prefill nodes to register
+        if: matrix.model.num_prefill_nodes && matrix.model.num_prefill_nodes > 1
+        timeout-minutes: 90
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const expected = ${{ matrix.model.num_prefill_nodes || 1 }} - 1;
+            const prefix = 'pd-prefill-ready-${{ matrix.model.prefix }}-';
+            core.info(`Waiting for ${expected} extra prefill node(s) to register...`);
+            for (let i = 0; i < 180; i++) {
+              try {
+                const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
+                });
+                const ready = data.artifacts.filter(a => a.name.startsWith(prefix)).length;
+                if (ready >= expected) {
+                  core.info(`All ${expected} extra prefill node(s) registered (after ${(i+1)*30}s)`);
+                  return;
+                }
+                core.info(`  ${ready}/${expected} extra prefill node(s) ready (${i+1}/180), retrying in 30s...`);
+              } catch (e) { core.debug(`Attempt ${i+1} error: ${e.message}`); }
+              if (i === 179) { core.setFailed('Timed out waiting for extra prefill nodes'); return; }
+              await new Promise(r => setTimeout(r, 30000));
+            }
 
       - name: Wait for consumer to connect and warmup
         timeout-minutes: 30
@@ -986,6 +1030,8 @@ jobs:
           done
 
       - name: Start consumer
+        env:
+          MODEL_ENV_VARS: ${{ matrix.entry.env_vars }}
         run: |
           if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
           else model_path="${{ env.MODEL_PATH }}"; fi
@@ -1002,7 +1048,11 @@ jobs:
           echo "========== Starting Consumer #${{ env.DECODE_INDEX }} on port ${{ env.CONSUMER_PORT }} =========="
           echo "Proxy IP: ${PROXY_IP}, Consumer IP: ${CONSUMER_IP}"
 
-          docker exec atom-pd-consumer-${{ env.DECODE_INDEX }} bash -lc "
+          # Write model env_vars to a file consumed via docker exec --env-file
+          # (avoids expression injection from newlines in env_vars).
+          printenv MODEL_ENV_VARS 2>/dev/null | grep -v '^$' > /tmp/atom_pd_env.txt || true
+
+          docker exec --env-file /tmp/atom_pd_env.txt atom-pd-consumer-${{ env.DECODE_INDEX }} bash -lc "
             rm -rf ~/.cache/atom/*
             ATOM_DISABLE_MMAP=true NCCL_SOCKET_IFNAME=lo AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
               python -m atom.entrypoints.openai_server \
@@ -1015,16 +1065,16 @@ jobs:
           "
 
       - name: Wait for consumer health
-        timeout-minutes: 45
+        timeout-minutes: 90
         run: |
           echo "Waiting for consumer #${{ env.DECODE_INDEX }} at http://localhost:${{ env.CONSUMER_PORT }}/health ..."
-          for i in $(seq 1 45); do
+          for i in $(seq 1 90); do
             if curl -sf http://localhost:${{ env.CONSUMER_PORT }}/health -o /dev/null --max-time 10 2>/dev/null; then
               echo "Consumer healthy after $((i * 60))s"
               break
             fi
-            [ "$i" -eq 45 ] && echo "ERROR: Consumer not healthy after 45min" && exit 1
-            echo "  Not ready ($i/45), retrying in 60s..."
+            [ "$i" -eq 90 ] && echo "ERROR: Consumer not healthy after 90min" && exit 1
+            echo "  Not ready ($i/90), retrying in 60s..."
             sleep 60
           done
 
@@ -1059,10 +1109,262 @@ jobs:
           docker stop atom-pd-consumer-${{ env.DECODE_INDEX }} 2>/dev/null || true
           docker rm atom-pd-consumer-${{ env.DECODE_INDEX }} 2>/dev/null || true
 
+  # ── Extra prefill node(s): producer #1..N-1 (true multi-P topology) ──
+  # Index 0 is the coordinator (pd-prefill job). Each extra prefill node
+  # launches only a producer that registers to the coordinator's proxy
+  # (the proxy round-robins over all registered prefill instances). After
+  # its server is healthy it uploads a ready signal that the coordinator
+  # waits on before running the benchmark.
+  pd-prefill-extra:
+    name: PD-Prefill-Extra ${{ matrix.entry.display }} #${{ matrix.entry.prefill_index }}
+    needs: [load-pd-models, pd-ip-verify]
+    if: needs.load-pd-models.outputs.prefill_extra_matrix_json != '[]'
+    strategy:
+      fail-fast: false
+      matrix:
+        entry: ${{ fromJson(needs.load-pd-models.outputs.prefill_extra_matrix_json) }}
+
+    runs-on: ${{ (github.event_name == 'workflow_dispatch' && inputs.runner != '' && inputs.runner) || 'atom-mi355-8gpu.predownload' }}
+    timeout-minutes: 180
+
+    env:
+      MODEL_PATH: ${{ matrix.entry.path }}
+      PREFILL_ARGS: ${{ matrix.entry.prefill_args }}
+      PREFILL_INDEX: ${{ matrix.entry.prefill_index }}
+      ATOM_DOCKER_IMAGE: ${{ inputs.image || 'rocm/atom-dev:latest' }}
+
+    steps:
+      - name: Clean up previous runs
+        run: |
+          echo "=== Extra prefill node: $(hostname) ==="
+          containers=$(docker ps -q)
+          [ -n "$containers" ] && docker kill $containers || true
+          docker run --rm -v "${GITHUB_WORKSPACE:-$PWD}":/workspace -w /workspace --privileged \
+            rocm/pytorch:latest bash -lc "find /workspace -mindepth 1 -delete" || true
+
+      - name: Checkout ATOM repo
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.atom_commit || github.ref }}
+
+      - name: Wait for previous model to complete
+        if: matrix.entry.prev_model_prefix != ''
+        timeout-minutes: 180
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifactName = 'pd-done-${{ matrix.entry.prev_model_prefix }}';
+            core.info(`Sequential scheduling: waiting for model '${{ matrix.entry.prev_model_prefix }}' to finish...`);
+            for (let i = 0; i < 240; i++) {
+              try {
+                const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
+                });
+                if (data.artifacts.find(a => a.name === artifactName)) {
+                  core.info(`Previous model completed (after ${(i+1)*30}s)`);
+                  return;
+                }
+              } catch (e) {}
+              if (i === 239) { core.setFailed('Timed out waiting for previous model'); return; }
+              core.info(`  Not done (${i+1}/240), retrying in 30s...`);
+              await new Promise(r => setTimeout(r, 30000));
+            }
+
+      - name: Wait for proxy IP artifact
+        timeout-minutes: 60
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const { execSync } = require('child_process');
+            const artifactName = 'pd-proxy-ip-${{ matrix.entry.prefix }}';
+            core.info(`Polling for proxy IP artifact (${artifactName})...`);
+            for (let i = 0; i < 360; i++) {
+              try {
+                const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
+                });
+                const artifact = data.artifacts.find(a => a.name === artifactName);
+                if (artifact) {
+                  const download = await github.rest.actions.downloadArtifact({
+                    owner: context.repo.owner, repo: context.repo.repo,
+                    artifact_id: artifact.id, archive_format: 'zip',
+                  });
+                  fs.mkdirSync('/tmp/proxy-ip', { recursive: true });
+                  fs.writeFileSync('/tmp/_proxy.zip', Buffer.from(download.data));
+                  execSync('unzip -qo /tmp/_proxy.zip -d /tmp/proxy-ip && rm -f /tmp/_proxy.zip');
+                  const ip = fs.readFileSync('/tmp/proxy-ip/pd_proxy_ip.txt', 'utf8').trim().split('\n')[0];
+                  core.info(`Got proxy IP: ${ip}`);
+                  fs.appendFileSync(process.env.GITHUB_ENV, `PROXY_IP=${ip}\n`);
+                  return;
+                }
+              } catch (e) { core.debug(`Attempt ${i+1} error: ${e.message}`); }
+              if (i === 359) { core.setFailed('Timed out waiting for proxy IP'); return; }
+              core.info(`  Artifact not ready (${i+1}/360), retrying in 10s...`);
+              await new Promise(r => setTimeout(r, 10000));
+            }
+
+      - name: Start extra prefill container
+        run: |
+          # Delegate to vendored .github/scripts/ci_run.sh for RDMA NIC
+          # detection + userspace driver bind-mounts (see ci_run.sh header
+          # for full rationale).
+          DEVICE_FLAG=$(cat /etc/podinfo/gha-render-devices 2>/dev/null || echo "")
+          MODEL_MOUNT=""
+          [ -d "/models" ] && MODEL_MOUNT="-v /models:/models"
+
+          bash .github/scripts/ci_run.sh \
+            -t \
+            $DEVICE_FLAG \
+            -v "${GITHUB_WORKSPACE:-$PWD}":/workspace $MODEL_MOUNT \
+            -w /workspace \
+            --shm-size=16G --cap-add=SYS_PTRACE \
+            --security-opt seccomp=unconfined \
+            --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
+            -e ATOM_DISABLE_MMAP=true \
+            -e NCCL_SOCKET_IFNAME=lo \
+            -e AITER_LOG_LEVEL=WARNING \
+            --name atom-pd-prefill-extra-${{ env.PREFILL_INDEX }} \
+            ${{ env.ATOM_DOCKER_IMAGE }}
+
+      - name: Check RDMA and network (extra prefill)
+        run: |
+          echo "=== Host RDMA ==="
+          ls -la /dev/infiniband/ 2>/dev/null || echo "No /dev/infiniband on host"
+          ls /sys/class/infiniband/ 2>/dev/null || echo "No /sys/class/infiniband on host"
+          echo "=== Container RDMA ==="
+          docker exec atom-pd-prefill-extra-${{ env.PREFILL_INDEX }} bash -c '
+            ls -la /dev/infiniband/ 2>/dev/null || echo "No /dev/infiniband"
+            ls /sys/class/infiniband/ 2>/dev/null || echo "No /sys/class/infiniband"
+            ibv_devices 2>/dev/null || echo "ibv_devices not available"
+          '
+          echo "=== hostname -I ==="
+          docker exec atom-pd-prefill-extra-${{ env.PREFILL_INDEX }} bash -c "hostname -I"
+
+      - name: Download model
+        run: |
+          if [ -d "/models" ]; then
+            docker exec -e HF_TOKEN=${{ secrets.AMD_HF_TOKEN }} atom-pd-prefill-extra-${{ env.PREFILL_INDEX }} bash -lc \
+              "hf download ${{ env.MODEL_PATH }} --local-dir /models/${{ env.MODEL_PATH }}" || exit 1
+          fi
+
+      - name: Install PD dependencies
+        run: |
+          docker exec atom-pd-prefill-extra-${{ env.PREFILL_INDEX }} bash -lc \
+            "pip install msgpack msgspec quart mooncake-transfer-engine"
+          docker exec atom-pd-prefill-extra-${{ env.PREFILL_INDEX }} bash -c \
+            "sysctl -w net.ipv4.tcp_tw_reuse=1 2>/dev/null || true"
+
+      - name: Check connectivity to proxy
+        run: |
+          PREFILL_IP=$(hostname -I | awk '{print $1}')
+          echo "Extra prefill runner: $(hostname), IP: ${PREFILL_IP}"
+          echo "Proxy IP: ${PROXY_IP}"
+          echo "--- Testing TCP connectivity to proxy ports ---"
+          for port in 10001 36367; do
+            if timeout 5 bash -c "echo >/dev/tcp/${PROXY_IP}/${port}" 2>/dev/null; then
+              echo "  Port ${port}: REACHABLE"
+            else
+              echo "  Port ${port}: UNREACHABLE (firewall or proxy not yet started)"
+            fi
+          done
+
+      - name: Start extra producer
+        env:
+          MODEL_ENV_VARS: ${{ matrix.entry.env_vars }}
+        run: |
+          if [ -d "/models" ]; then model_path="/models/${{ env.MODEL_PATH }}"
+          else model_path="${{ env.MODEL_PATH }}"; fi
+
+          KV_CONFIG="{
+            \"kv_role\": \"kv_producer\",
+            \"kv_connector\": \"mooncake\",
+            \"proxy_ip\": \"${PROXY_IP}\",
+            \"proxy_ping_port\": 36367,
+            \"http_port\": 8003
+          }"
+
+          PREFILL_IP=$(hostname -I | awk '{print $1}')
+          echo "========== Starting Extra Producer #${{ env.PREFILL_INDEX }} on port 8003 =========="
+          echo "Proxy IP: ${PROXY_IP}, Extra prefill IP: ${PREFILL_IP}"
+
+          # Write model env_vars to a file consumed via docker exec --env-file
+          # (avoids expression injection from newlines in env_vars).
+          printenv MODEL_ENV_VARS 2>/dev/null | grep -v '^$' > /tmp/atom_pd_env.txt || true
+
+          docker exec --env-file /tmp/atom_pd_env.txt atom-pd-prefill-extra-${{ env.PREFILL_INDEX }} bash -lc "
+            rm -rf ~/.cache/atom/*
+            ATOM_DISABLE_MMAP=true NCCL_SOCKET_IFNAME=lo AITER_LOG_LEVEL=WARNING PYTHONUNBUFFERED=1 \
+              python -m atom.entrypoints.openai_server \
+                --model $model_path \
+                --server-port 8003 \
+                --kv-transfer-config '${KV_CONFIG}' \
+                ${{ matrix.entry.prefill_args }} ${{ inputs.extra_args || '' }} \
+                > /tmp/atom_producer.log 2>&1 &
+            echo \$! > /tmp/atom_producer.pid
+          "
+
+      - name: Wait for extra producer health
+        timeout-minutes: 90
+        run: |
+          echo "Waiting for extra producer #${{ env.PREFILL_INDEX }} at http://localhost:8003/health ..."
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:8003/health -o /dev/null --max-time 10 2>/dev/null; then
+              echo "Extra producer healthy after $((i * 60))s"
+              break
+            fi
+            [ "$i" -eq 90 ] && echo "ERROR: Extra producer not healthy after 90min" && exit 1
+            echo "  Not ready ($i/90), retrying in 60s..."
+            sleep 60
+          done
+
+      - name: Signal extra prefill ready
+        run: |
+          mkdir -p /tmp/pd-ready
+          echo "${{ env.PREFILL_INDEX }}" > /tmp/pd-ready/ready.txt
+
+      - name: Upload extra prefill ready signal
+        uses: actions/upload-artifact@v7
+        with:
+          name: pd-prefill-ready-${{ matrix.entry.prefix }}-${{ env.PREFILL_INDEX }}
+          path: /tmp/pd-ready/ready.txt
+          overwrite: true
+
+      - name: Wait for prefill to finish benchmarks
+        timeout-minutes: 180
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const artifactName = 'pd-done-${{ matrix.entry.prefix }}';
+            core.info('Extra producer is running. Waiting for coordinator prefill job to complete...');
+            for (let i = 0; i < 360; i++) {
+              try {
+                const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+                  owner: context.repo.owner, repo: context.repo.repo, run_id: context.runId,
+                });
+                if (data.artifacts.find(a => a.name === artifactName)) {
+                  core.info(`Coordinator prefill job signaled done after ${(i+1)*30}s`);
+                  return;
+                }
+              } catch (e) {}
+              if (i === 359) { core.info('Timed out waiting for prefill, exiting'); return; }
+              await new Promise(r => setTimeout(r, 30000));
+            }
+
+      - name: Dump extra producer log
+        if: always()
+        run: docker exec atom-pd-prefill-extra-${{ env.PREFILL_INDEX }} cat /tmp/atom_producer.log 2>/dev/null || true
+
+      - name: Clean up
+        if: always()
+        run: |
+          docker stop atom-pd-prefill-extra-${{ env.PREFILL_INDEX }} 2>/dev/null || true
+          docker rm atom-pd-prefill-extra-${{ env.PREFILL_INDEX }} 2>/dev/null || true
+
   summarize-benchmark-result:
     if: always()
     name: Summarize benchmark result
-    needs: [benchmark, pd-prefill, pd-decode]
+    needs: [benchmark, pd-prefill, pd-prefill-extra, pd-decode]
     runs-on: ubuntu-latest
     outputs:
       has_regression: ${{ steps.check-regression.outputs.has_regression }}
