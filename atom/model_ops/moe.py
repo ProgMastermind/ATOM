@@ -49,7 +49,7 @@ from atom.model_ops.utils import (
     per_tensor_dequantize,
     shuffle_weights,
 )
-from atom.utils import envs
+from atom.utils import envs, logger
 from atom.utils.custom_register import direct_register_custom_op
 from atom.utils.forward_context import get_forward_context
 from atom.utils.decorators import mark_trace
@@ -57,6 +57,30 @@ from torch import nn
 from transformers import PretrainedConfig
 from atom.plugin.moe import FusedMoEDecoratorForPluginMode
 from atom.quantization.quark.utils import weight_dequant_fp8
+
+
+def _log_moe_shuffle(fn_name: str, **kwargs) -> None:
+    """ATOM log of a MoE weight/scale shuffle call.
+
+    Dumps the shuffle function name and every arg. Tensors are reduced to
+    (shape, dtype); scalars are printed as-is. The GU interleave mode
+    (is_guinterleave) and gate_up flag are the most important fields — they
+    decide the physical [gate|up] vs [gate,up] layout the aiter kernel reads.
+    """
+    parts = []
+    for key, val in kwargs.items():
+        if isinstance(val, torch.Tensor):
+            parts.append(f"{key}=Tensor(shape={tuple(val.shape)}, dtype={val.dtype})")
+        else:
+            parts.append(f"{key}={val!r}")
+    itlv = kwargs.get("is_guinterleave")
+    mode = "GU-INTERLEAVE" if itlv else "GU-SEPARATED" if itlv is not None else "?"
+    logger.info(
+        "[MoE-SHUFFLE] %s interleave_mode=%s | %s",
+        fn_name,
+        mode,
+        ", ".join(parts),
+    )
 
 
 class FusedMoeWeightScaleSupported(Enum):
@@ -757,6 +781,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or gfx.startswith("gfx12")
                 or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
             )
+        self.use_triton = False
         if self.use_triton:
             from atom.model_ops.utils import has_triton_kernels
 
@@ -883,6 +908,27 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer):
+        if os.environ.get("MOCK_MOE_WEIGHT"):
+            # Debug: discard the loaded weights and substitute known constants so
+            # the GEMM / layout / shuffle paths can be validated independently of
+            # the checkpoint. Runs before any clone / swizzle / shuffle below, so
+            # both the triton golden and aiter paths see the same mocked values.
+            #   weight: mxfp4 e2m1 1.0 = 0b0010 = 0x2  -> packed byte 0x22
+            #   scale : e8m0 1.0 (2^0)                  -> byte 127 (0x7f)
+            # Constant weights are layout-invariant, so interleave / GU mode does
+            # not affect the result — handy for isolating routing vs GEMM bugs.
+            for w in (layer.w13_weight, layer.w2_weight):
+                w.data.view(torch.uint8).fill_(0x22)
+            for s in (layer.w13_weight_scale, layer.w2_weight_scale):
+                s.data.view(torch.uint8).fill_(127)
+            logger.info(
+                "[MOCK_MOE_WEIGHT] layer=%s w13=%s w2=%s -> weight=1.0 (0x22), "
+                "scale=1.0 (e8m0 127)",
+                getattr(layer, "layer_name", "?"),
+                tuple(layer.w13_weight.shape),
+                tuple(layer.w2_weight.shape),
+            )
+
         if layer.w13_bias is not None:
             layer.w13_bias.data = layer.w13_bias.data.to(torch.float32)
         if layer.w2_bias is not None:
@@ -891,40 +937,81 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if os.environ.get("ATOM_V4_TORCH_MOE"):
             return
 
-        if self.use_triton:
-            from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
-            from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
+        # Compare-mode: build both triton-swizzled and aiter-shuffled weights
+        # so we can run both kernels in apply() and diff their outputs.
+        # IMPORTANT: _swizzle_mxfp4 with StridedLayout does NOT copy — it just
+        # wraps the underlying storage. The subsequent aiter shuffle_weight /
+        # shuffle_scale calls would then mutate that same storage and silently
+        # corrupt the triton path. Clone first so the two paths own disjoint
+        # buffers.
+        #
+        # IMPORTANT (layout): forcing use_triton=False made the *model-level*
+        # MLPBlock.process_weights_after_loading (which runs before this hook)
+        # take its non-triton branch and run _interleave_swiglu_weights, so
+        # layer.w13_weight / w13_weight_scale / w13_bias are now in the
+        # swiglu-INTERLEAVED layout the aiter kernel wants. triton matmul_ogs
+        # expects the NON-interleaved gate-up layout, so de-interleave a clone
+        # (invert _interleave_swiglu_weights) before swizzling for triton. w2
+        # (down-proj) is never interleaved, so it is cloned as-is.
+        from atom.model_ops.fused_moe_triton import _swizzle_mxfp4
+        from triton_kernels.matmul_ogs import FlexCtx, PrecisionConfig
 
-            w13_weight, w13_flex, w13_scale = _swizzle_mxfp4(
-                layer.w13_weight.view(torch.uint8),
-                layer.w13_weight_scale,
-            )
-            w2_weight, w2_flex, w2_scale = _swizzle_mxfp4(
-                layer.w2_weight.view(torch.uint8),
-                layer.w2_weight_scale,
-            )
+        w13_u8 = layer.w13_weight.view(torch.uint8).clone()
+        e, n, k = w13_u8.shape
+        w13_deint = (
+            w13_u8.view(e, 2, n // 2, k).permute(0, 2, 1, 3).contiguous().view(e, n, k)
+        )
+        w13_scale_deint = (
+            layer.w13_weight_scale.clone()
+            .view(e, 2, n // 2, -1)
+            .permute(0, 2, 1, 3)
+            .contiguous()
+            .view(e, n, -1)
+        )
+        w13_tri, w13_flex, w13_scale_tri = _swizzle_mxfp4(w13_deint, w13_scale_deint)
+        w2_tri, w2_flex, w2_scale_tri = _swizzle_mxfp4(
+            layer.w2_weight.view(torch.uint8).clone(),
+            layer.w2_weight_scale.clone(),
+        )
+        self.w13_precision_config = PrecisionConfig(
+            weight_scale=w13_scale_tri, flex_ctx=FlexCtx(rhs_data=w13_flex)
+        )
+        self.w2_precision_config = PrecisionConfig(
+            weight_scale=w2_scale_tri, flex_ctx=FlexCtx(rhs_data=w2_flex)
+        )
+        self._triton_w13_weight = w13_tri
+        self._triton_w2_weight = w2_tri
 
-            self.w13_precision_config = PrecisionConfig(
-                weight_scale=w13_scale, flex_ctx=FlexCtx(rhs_data=w13_flex)
+        # Triton needs its own de-interleaved w13 bias; aiter keeps the
+        # interleaved layer.w13_bias. w2 bias is never interleaved.
+        if layer.w13_bias is not None:
+            self._triton_w13_bias = (
+                layer.w13_bias.data.view(-1, 2, n // 2)
+                .permute(0, 2, 1)
+                .contiguous()
+                .view(-1, n)
             )
-            self.w2_precision_config = PrecisionConfig(
-                weight_scale=w2_scale, flex_ctx=FlexCtx(rhs_data=w2_flex)
-            )
-            del layer.w13_weight
-            del layer.w2_weight
-            del layer.w13_weight_scale
-            del layer.w2_weight_scale
-            layer.w13_weight = w13_weight
-            layer.w2_weight = w2_weight
-            layer.w13_weight_scale = None
-            layer.w2_weight_scale = None
-            return
+        else:
+            self._triton_w13_bias = None
+        self._triton_w2_bias = layer.w2_bias
 
-        # shuffle weight
+        # shuffle weight (aiter path; this mutates layer.w13_weight/w2_weight)
+        _log_moe_shuffle(
+            "shuffle_weight(w13)",
+            x=layer.w13_weight,
+            is_guinterleave=self.is_guinterleave,
+            gate_up=True,
+        )
         layer.w13_weight.data = shuffle_weight(
             layer.w13_weight,
             is_guinterleave=self.is_guinterleave,
             gate_up=True,
+        )
+        _log_moe_shuffle(
+            "shuffle_weight(w2)",
+            x=layer.w2_weight,
+            is_guinterleave=self.is_guinterleave,
+            gate_up=False,
         )
         layer.w2_weight.data = shuffle_weight(
             layer.w2_weight,
@@ -940,8 +1027,22 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         w2_scale_2d = layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1])
 
+        _log_moe_shuffle(
+            "shuffle_scale(w13)",
+            src=w13_scale_2d,
+            experts_cnt=self.num_experts,
+            is_guinterleave=self.is_guinterleave,
+            gate_up=True,
+        )
         shuffled_w13_scale = shuffle_scale(
             w13_scale_2d, self.num_experts, self.is_guinterleave, True
+        )
+        _log_moe_shuffle(
+            "shuffle_scale(w2)",
+            src=w2_scale_2d,
+            experts_cnt=self.num_experts,
+            is_guinterleave=self.is_guinterleave,
+            gate_up=False,
         )
         shuffled_w2_scale = shuffle_scale(
             w2_scale_2d, self.num_experts, self.is_guinterleave, False
@@ -957,6 +1058,100 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             w2_bias=layer.w2_bias,
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
+        )
+
+    def _apply_triton(
+        self,
+        layer,
+        x,
+        router_logits,
+        top_k,
+        renormalize,
+        use_grouped_topk,
+        topk_group,
+        num_expert_group,
+        global_num_experts,
+        expert_map,
+        custom_routing_function,
+        scoring_func,
+        e_score_correction_bias,
+        apply_router_weight_on_input,
+        fused_shared_experts_scoring_func,
+        activation,
+    ):
+        from atom.model_ops.fused_moe_triton import (
+            triton_kernel_moe_forward,
+            triton_kernel_fused_experts,
+            fused_routing_from_topk_triton,
+        )
+
+        needs_custom_routing = (
+            use_grouped_topk
+            or scoring_func != "softmax"
+            or e_score_correction_bias is not None
+            or custom_routing_function is not None
+        )
+        if needs_custom_routing:
+            topk_weights, topk_ids = FusedMoE.select_experts(
+                hidden_states=x,
+                router_logits=router_logits,
+                use_grouped_topk=use_grouped_topk,
+                top_k=top_k,
+                renormalize=renormalize,
+                topk_group=topk_group,
+                num_expert_group=num_expert_group,
+                custom_routing_function=custom_routing_function,
+                scoring_func=scoring_func,
+                e_score_correction_bias=e_score_correction_bias,
+                num_fused_shared_experts=layer.num_fused_shared_experts,
+                routed_scaling_factor=layer.routed_scaling_factor,
+            )
+            n_expts_act = topk_weights.shape[1]
+            n_expts_tot = router_logits.shape[-1]
+            if global_num_experts > 0:
+                n_expts_tot = global_num_experts
+            n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
+            routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
+                topk_weights, topk_ids, n_expts_tot
+            )
+            output = torch.empty_like(x)
+            return triton_kernel_fused_experts(
+                output,
+                x,
+                self._triton_w13_weight,
+                self._triton_w2_weight,
+                routing_data,
+                gather_idx,
+                scatter_idx,
+                topk=n_expts_act,
+                activation=activation,
+                w13_precision_config=self.w13_precision_config,
+                w2_precision_config=self.w2_precision_config,
+                w1_bias=self._triton_w13_bias,
+                w2_bias=self._triton_w2_bias,
+                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
+                apply_router_weight_on_input=layer.apply_router_weight_on_input,
+                global_num_experts=n_expts_tot,
+                expert_map=expert_map,
+            )
+        assert (
+            fused_shared_experts_scoring_func is None
+        ), "triton kernel does not support fused shared experts func"
+        return triton_kernel_moe_forward(
+            x,
+            self._triton_w13_weight,
+            self._triton_w2_weight,
+            router_logits,
+            topk=top_k,
+            renormalize=renormalize,
+            activation=activation,
+            w13_precision_config=self.w13_precision_config,
+            w2_precision_config=self.w2_precision_config,
+            w1_bias=self._triton_w13_bias,
+            w2_bias=self._triton_w2_bias,
+            expert_map=expert_map,
+            apply_router_weight_on_input=layer.apply_router_weight_on_input,
+            global_num_experts=global_num_experts,
         )
 
     @mark_trace(prefix="mxfp4_moe", torch_compile=False)
@@ -979,76 +1174,45 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
+        if os.environ.get("MOCK_MOE_HIDDEN"):
+            # Debug: replace the MoE input hidden states with all-1.0 bf16 so the
+            # aiter and triton golden paths run on identical, known input. Set
+            # before any routing / GEMM so both paths (and select_experts) see it.
+            x = torch.ones_like(x, dtype=torch.bfloat16)
+            logger.info("[MOCK_MOE_HIDDEN] x -> ones(bf16) shape=%s", tuple(x.shape))
+
         if self.use_triton:
+            # NOTE: compare-mode change moved the swizzled triton tensors off
+            # layer.w13_weight (now aiter-shuffled) onto self._triton_w13_weight.
+            # Route through the shared helper so this branch uses the right
+            # buffers.
+            return self._apply_triton(
+                layer,
+                x,
+                router_logits,
+                top_k,
+                renormalize,
+                use_grouped_topk,
+                topk_group,
+                num_expert_group,
+                global_num_experts,
+                expert_map,
+                custom_routing_function,
+                scoring_func,
+                e_score_correction_bias,
+                apply_router_weight_on_input,
+                fused_shared_experts_scoring_func,
+                activation,
+            )
+
+        # Dead code below (kept for reference, can be deleted): original
+        # use_triton branch that read layer.w13_weight directly.
+        if False:
             from atom.model_ops.fused_moe_triton import (
                 triton_kernel_moe_forward,
                 triton_kernel_fused_experts,
                 fused_routing_from_topk_triton,
             )
-
-            # Check if the model needs custom routing that triton routing()
-            # does not support (grouped topk, sigmoid scoring, bias correction).
-            needs_custom_routing = (
-                use_grouped_topk
-                or scoring_func != "softmax"
-                or e_score_correction_bias is not None
-                or custom_routing_function is not None
-            )
-
-            if needs_custom_routing:
-                # Use ATOM's full-featured select_experts for routing,
-                # then triton matmul_ogs for the actual MoE computation.
-                topk_weights, topk_ids = FusedMoE.select_experts(
-                    hidden_states=x,
-                    router_logits=router_logits,
-                    use_grouped_topk=use_grouped_topk,
-                    top_k=top_k,
-                    renormalize=renormalize,
-                    topk_group=topk_group,
-                    num_expert_group=num_expert_group,
-                    custom_routing_function=custom_routing_function,
-                    scoring_func=scoring_func,
-                    e_score_correction_bias=e_score_correction_bias,
-                    num_fused_shared_experts=layer.num_fused_shared_experts,
-                    routed_scaling_factor=layer.routed_scaling_factor,
-                )
-                n_expts_act = topk_weights.shape[1]
-
-                # Convert to triton routing data structures
-                n_expts_tot = router_logits.shape[-1]
-                if global_num_experts > 0:
-                    n_expts_tot = global_num_experts
-                n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
-
-                routing_data, gather_idx, scatter_idx = fused_routing_from_topk_triton(
-                    topk_weights, topk_ids, n_expts_tot
-                )
-
-                output = torch.empty_like(x)
-                _moe_result = triton_kernel_fused_experts(
-                    output,
-                    x,
-                    layer.w13_weight,
-                    layer.w2_weight,
-                    routing_data,
-                    gather_idx,
-                    scatter_idx,
-                    topk=n_expts_act,
-                    activation=activation,
-                    w13_precision_config=self.w13_precision_config,
-                    w2_precision_config=self.w2_precision_config,
-                    w1_bias=layer.w13_bias,
-                    w2_bias=layer.w2_bias,
-                    swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
-                    apply_router_weight_on_input=layer.apply_router_weight_on_input,
-                    global_num_experts=n_expts_tot,
-                    expert_map=expert_map,
-                )
-                return _moe_result
-
-            assert (
-                fused_shared_experts_scoring_func is None
-            ), "triton kernel does not support fused shared experts func"
 
             return triton_kernel_moe_forward(
                 x,
@@ -1086,7 +1250,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         a1_scale = getattr(layer, "w13_input_scale", None)
         a2_scale = getattr(layer, "w2_input_scale", None)
         if self.fused_experts is None:
-            return fused_moe(
+            aiter_out = fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -1111,27 +1275,129 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     else GateMode.SEPARATED.value
                 ),
             )
-        return self.fused_experts(
-            hidden_states=x,
-            w1=layer.w13_weight,
-            w2=layer.w2_weight,
-            topk_weights=topk_weights,
-            topk_ids=topk_ids,
-            inplace=False,
-            activation=activation,
-            quant_type=self.quant_type,
-            apply_router_weight_on_input=apply_router_weight_on_input,
-            global_num_experts=global_num_experts,
-            expert_map=expert_map,
-            w1_scale=layer.w13_weight_scale,
-            w2_scale=layer.w2_weight_scale,
-            a1_scale=a1_scale,
-            a2_scale=a2_scale,
-            bias1=layer.w13_bias,
-            bias2=layer.w2_bias,
-            hidden_pad=self.hidden_pad,
-            intermediate_pad=self.intermediate_pad,
+        else:
+            aiter_out = self.fused_experts(
+                hidden_states=x,
+                w1=layer.w13_weight,
+                w2=layer.w2_weight,
+                topk_weights=topk_weights,
+                topk_ids=topk_ids,
+                inplace=False,
+                activation=activation,
+                quant_type=self.quant_type,
+                apply_router_weight_on_input=apply_router_weight_on_input,
+                global_num_experts=global_num_experts,
+                expert_map=expert_map,
+                w1_scale=layer.w13_weight_scale,
+                w2_scale=layer.w2_weight_scale,
+                a1_scale=a1_scale,
+                a2_scale=a2_scale,
+                bias1=layer.w13_bias,
+                bias2=layer.w2_bias,
+                hidden_pad=self.hidden_pad,
+                intermediate_pad=self.intermediate_pad,
+            )
+
+        # Golden = triton (use_triton=True). Compare aiter against it and
+        # return the golden so downstream layers see the use_triton=True numerics.
+        golden = self._apply_triton(
+            layer,
+            x,
+            router_logits,
+            top_k,
+            renormalize,
+            use_grouped_topk,
+            topk_group,
+            num_expert_group,
+            global_num_experts,
+            expert_map,
+            custom_routing_function,
+            scoring_func,
+            e_score_correction_bias,
+            apply_router_weight_on_input,
+            fused_shared_experts_scoring_func,
+            activation,
         )
+
+        layer_name = getattr(layer, "layer_name", "?")
+
+        # ---- Top-k comparison --------------------------------------------------
+        # aiter topk: (topk_weights, topk_ids) already computed above.
+        # triton topk: when use_grouped_topk/custom routing is off, the triton
+        # path uses triton_kernels.routing() = softmax-then-topk on router_logits.
+        # Reproduce the same selection with torch so we can diff against aiter.
+        needs_custom_routing = (
+            use_grouped_topk
+            or scoring_func != "softmax"
+            or e_score_correction_bias is not None
+            or custom_routing_function is not None
+        )
+        if needs_custom_routing:
+            # Both paths share select_experts() — topk is identical by construction.
+            tri_ids = topk_ids
+            tri_w = topk_weights
+        else:
+            scores = torch.softmax(router_logits.float(), dim=-1)
+            tri_w, tri_ids = torch.topk(scores, top_k, dim=-1)
+            if renormalize:
+                tri_w = tri_w / tri_w.sum(dim=-1, keepdim=True)
+            tri_w = tri_w.to(topk_weights.dtype)
+            tri_ids = tri_ids.to(topk_ids.dtype)
+
+        # Sort each row so order-of-tie differences don't trigger false alarms.
+        a_ids_sorted, a_perm = torch.sort(topk_ids.int(), dim=-1)
+        t_ids_sorted, t_perm = torch.sort(tri_ids.int(), dim=-1)
+        ids_match = torch.equal(a_ids_sorted, t_ids_sorted)
+        n_tokens = topk_ids.shape[0]
+        n_mismatch_rows = (
+            (a_ids_sorted != t_ids_sorted).any(dim=-1).sum().item()
+            if not ids_match
+            else 0
+        )
+        a_w_sorted = torch.gather(topk_weights, 1, a_perm.long())
+        t_w_sorted = torch.gather(tri_w, 1, t_perm.long())
+        w_diff = (a_w_sorted.float() - t_w_sorted.float()).abs()
+
+        # ---- Output (logits) diff ---------------------------------------------
+        g_flat = golden.reshape(-1)
+        a_flat = aiter_out.reshape(-1)
+        n = min(10, g_flat.numel())
+        out_diff = (g_flat.float() - a_flat.float()).abs()
+
+        print(
+            f"[MoE-DIFF] layer={layer_name} shape={tuple(golden.shape)}\n"
+            f"  output  golden_triton[:10]={g_flat[:n].tolist()}\n"
+            f"  output  aiter        [:10]={a_flat[:n].tolist()}\n"
+            f"  output  max_abs_diff={out_diff.max().item():.6e} "
+            f"mean_abs_diff={out_diff.mean().item():.6e}\n"
+            f"  topk    aiter_ids[:10]={topk_ids.reshape(-1)[:10].tolist()}\n"
+            f"  topk    triton_ids[:10]={tri_ids.reshape(-1)[:10].tolist()}\n"
+            f"  topk    aiter_w  [:10]={topk_weights.reshape(-1)[:10].tolist()}\n"
+            f"  topk    triton_w [:10]={tri_w.reshape(-1)[:10].tolist()}\n"
+            f"  topk    weight_max_diff={w_diff.max().item():.6e} "
+            f"weight_mean_diff={w_diff.mean().item():.6e}",
+            flush=True,
+        )
+        if not ids_match:
+            # Strong hint: top-k expert selection diverged. This guarantees
+            # the MoE outputs disagree no matter how good the GEMM kernels are.
+            print(
+                "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                f"  !!! TOPK MISMATCH on layer {layer_name}: "
+                f"{n_mismatch_rows}/{n_tokens} tokens picked different experts.\n"
+                "  !!! Root-cause hints:\n"
+                "  !!!   - aiter uses select_experts() (sigmoid/softmax + grouped_topk path),\n"
+                "  !!!     triton uses triton_kernels.routing() (softmax + topk on raw logits).\n"
+                "  !!!   - renormalize / scoring_func / e_score_correction_bias / "
+                "use_grouped_topk\n"
+                "  !!!     parameters may be applied differently between the two paths.\n"
+                "  !!!   - Tie-breaking on near-equal logits will diverge between impls.\n"
+                "  !!!   - Verify router_logits dtype (bf16 vs fp32) and softmax precision.\n"
+                "  !!! Any downstream output diff is dominated by this — fix topk first.\n"
+                "  !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!",
+                flush=True,
+            )
+        return golden
 
 
 # Refer to CompressedTensorsW8A8Fp8MoEMethod in vllm
