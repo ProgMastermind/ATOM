@@ -71,7 +71,7 @@ export ROCM_DEBUG_AGENT_OPTIONS="--save-code-objects"
 export AITER_LOG_LEVEL="${AITER_LOG_LEVEL:-WARNING}"
 
 # 5) launch (model-specific env like ATOM_USE_TRITON_MOE must come from caller)
-SCRIPT_DIR="$(dirname "$0")"
+SCRIPT_DIR=/workspace/ATOM/scripts
 if [ "$MODE" = "server" ]; then
   exec bash "$SCRIPT_DIR/start_atom_server.sh" \
     "$MODEL" "$TP" "$PORT" "$@"

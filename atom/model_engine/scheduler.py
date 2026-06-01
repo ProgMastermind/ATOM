@@ -1260,6 +1260,7 @@ class PrefillScheduler:
             )
             logger.info("initialized shared memory")
         self.num_seq_done=0
+        self._pending_lock=threading.Lock()
 
     def is_finished(self) -> bool:
         return not self.waiting and not self.running
@@ -1288,23 +1289,24 @@ class PrefillScheduler:
         num_batched_tokens = 0
         num_seqs = 0
 
-        # Collect ready sequences (have received BlockAssignment from decode)
-        ready = [s for s in self.waiting if s.block_table]
+        with self._pending_lock:
+            # Collect ready sequences (have received BlockAssignment from decode)
+            ready = [s for s in self.waiting if s.block_table]
 
-        for seq in ready:
-            if num_seqs >= self.max_num_seqs:
-                break
-            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
-            if num_batched_tokens + num_new_tokens > self.max_num_batched_tokens:
-                break
-            self.waiting.remove(seq)
-            seq.status = SequenceStatus.RUNNING
-            seq.type = SequenceType.PREFILL
-            self.running.append(seq)
-            scheduled_seqs[seq.id] = seq
-            num_scheduled_tokens.append(num_new_tokens)
-            num_batched_tokens += num_new_tokens
-            num_seqs += 1
+            for seq in ready:
+                if num_seqs >= self.max_num_seqs:
+                    break
+                num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+                if num_batched_tokens + num_new_tokens > self.max_num_batched_tokens:
+                    break
+                self.waiting.remove(seq)
+                seq.status = SequenceStatus.RUNNING
+                seq.type = SequenceType.PREFILL
+                self.running.append(seq)
+                scheduled_seqs[seq.id] = seq
+                num_scheduled_tokens.append(num_new_tokens)
+                num_batched_tokens += num_new_tokens
+                num_seqs += 1
 
         if not scheduled_seqs:
             return None, {}
@@ -1402,7 +1404,8 @@ class DecodeScheduler(Scheduler):
         while self.waiting:
             seq = self.waiting[0]
             with self._prefill_lock:
-                if not self.block_manager.can_allocate(seq):
+                if self.block_manager.can_allocate(seq) < 0:
+                    logger.warning("Cannot allocate prefill")
                     break
                 self.block_manager.allocate(seq)
             self.waiting.popleft()
@@ -1467,8 +1470,11 @@ class DecodeScheduler(Scheduler):
         with self._prefill_lock:
             while self.running and len(scheduled_seqs) < self.max_num_seqs:
                 seq = self.running.popleft()
+                # logger.warning("decode state: waiting=%d prefill_waiting=%d prefill_done=%d running=%d free_blocks=%d",
+                #     len(self.waiting), len(self.prefill_waiting), len(self.prefill_done),
+                #     len(self.running), len(self.block_manager.free_block_ids_set))
                 while not self.block_manager.can_append(seq, self.mtp_k + 1):
-                    logger.info("Cannot allocate")
+                    logger.warning("Cannot allocate")
                     if self.running:
                         self.preempt(self.running.pop())
                     else:

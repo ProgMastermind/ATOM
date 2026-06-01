@@ -1244,7 +1244,7 @@ class ModelRunner:
         cudagraph_overhead = self._estimate_cudagraph_overhead()
 
         # Safety margin (2% of total)
-        safety_margin = int(total * 0.02)
+        safety_margin = int(total * 0.05)
 
         # Budget: this server may use up to gpu_memory_utilization * total.
         # Subtract our own PyTorch usage + CUDA graph estimate + safety.
@@ -1903,9 +1903,14 @@ class ModelRunner:
         """
         stream = self._prefill_streams[batch.cu_stream_fraction]
         with torch.cuda.stream(stream):
-            input_ids, temperatures, top_ks, top_ps, all_greedy = self.prepare_model(
-                batch
-            )
+            (
+                input_ids,
+                temperatures,
+                top_ks,
+                top_ps,
+                all_greedy,
+                needs_independent_noise,
+            ) = self.prepare_model(batch)
             logits, _ = self.run_model(input_ids, batch)
             # Sample the first generated token from each sequence's last logit
             sampled = self.sampler(logits, temperatures, top_ks, top_ps, all_greedy)

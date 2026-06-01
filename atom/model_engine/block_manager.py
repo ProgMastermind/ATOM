@@ -8,6 +8,9 @@ import xxhash
 from atom.config import Config
 from atom.model_engine.sequence import Sequence
 
+import logging
+logger = logging.getLogger("atom")
+
 
 class Block:
 
