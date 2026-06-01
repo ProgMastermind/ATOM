@@ -48,6 +48,7 @@ from sglang.srt.models.deepseek_common.utils import (
 from sglang.srt.layers.quantization.rocm_mxfp4_utils import (
     batched_gemm_afp4wfp4_pre_quant,
 )
+from aiter.utility.fp4_utils import e8m0_to_f32, mxfp4_to_f32
 from aiter.ops.triton.batched_gemm_afp4wfp4_pre_quant import (
     batched_gemm_a16wfp4,
 )
@@ -1192,8 +1193,15 @@ def _split_and_assign_kc_vc(
         and getattr(layer_quant_config.quant_type, "name", None) == "per_1x32"
     )
     if _use_aiter_gfx95 and (is_quark_quant_method or is_quark_mxfp4_linear):
+        quark_weight = w
+        weight_scale = getattr(attn.kv_b_proj, "_mxfp4_unshuffled_weight_scale", None)
+        if is_quark_mxfp4_linear and weight_scale is not None:
+            quark_weight = mxfp4_to_f32(w.view(torch.uint8)).to(torch.bfloat16)
+            quark_weight = quark_weight * e8m0_to_f32(
+                weight_scale.repeat_interleave(32, dim=-1)
+            ).to(torch.bfloat16)
         w_kc, attn.w_scale_k, w_vc, attn.w_scale_v = quark_post_load_weights(
-            attn, w, "mxfp4"
+            attn, quark_weight, "mxfp4"
         )
 
     if not use_deep_gemm_bmm:
@@ -1245,6 +1253,9 @@ def process_mla_kv_b_proj_after_loading(attn: DeepseekV2MLAAttention) -> None:
     Orchestrates reading, quantization handling, and splitting of
     kv_b_proj into absorbed w_kc / w_vc weights.
     """
+    if not getattr(attn.kv_b_proj, "_sgl_mxfp4_process_done", False):
+        attn.kv_b_proj.process_weights_after_loading()
+
     w = _read_kv_b_proj_weight(attn)
     weight_block_size = _get_weight_block_size(attn)
 
@@ -1274,6 +1285,9 @@ def _patch_kv_b_proj_for_sglang_mxfp4(attn: DeepseekV2MLAAttention) -> None:
     orig_process_weights_after_loading = kv_b_proj.process_weights_after_loading
 
     def process_weights_after_loading_with_mxfp4_preserve():
+        if getattr(kv_b_proj, "_sgl_mxfp4_process_done", False):
+            return
+
         layer_quant_config = getattr(kv_b_proj, "layer_quant_config", None)
         is_quark_static_mxfp4 = (
             kv_b_proj.weight.dim() == 2
@@ -1289,6 +1303,7 @@ def _patch_kv_b_proj_for_sglang_mxfp4(attn: DeepseekV2MLAAttention) -> None:
                 kv_b_proj.weight_scale.detach().clone()
             )
         orig_process_weights_after_loading()
+        kv_b_proj._sgl_mxfp4_process_done = True
 
     kv_b_proj.process_weights_after_loading = (
         process_weights_after_loading_with_mxfp4_preserve
