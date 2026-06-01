@@ -1719,6 +1719,23 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         assert self.quant_config.is_dynamic
         self._normalize_weights_and_scales(layer)
 
+        # [W8-T109 host fix — wave-closing root fix for nopad K=160 collapse]
+        # The fused shared expert(s) are appended as the last
+        # ``num_fused_shared_experts`` slots (e.g. expert 288 for qwen3.5 tp=8).
+        # In the checkpoint they are plain bf16 (no weight_scale_inv), so the
+        # MoE weight_loader cast them straight into the fp8 fused tensor while
+        # leaving the per-128x128 block scale at its default. After the
+        # e4m3fn->fnuz normalize above that default scale becomes 2.0 and the
+        # stored fp8 values collapse to ~0.047 (vs ~224 for properly quantized
+        # routed experts) — fp8 dynamic range is wasted. The padded K=256
+        # stage2 kernel tolerates this degenerate (large-scale / tiny-fp8)
+        # layout, but the nopad K=160 stage2 kernel drops the expert's GEMM
+        # contribution to ~0, collapsing the shared-expert output (W8-T107 root
+        # cause). Fix: re-quantize these experts with a proper per-128x128
+        # efficient block scale so fp8 uses its full range and both kernels
+        # behave identically.
+        self._requant_fused_shared_experts(layer)
+
         # Inter-dim padding for block-quantized FP8 (mirrors BF16 approach in
         # UnquantizedFusedMoEMethod.process_weights_after_loading).
         # When inter_dim is not a multiple of block_n (e.g. tp=4: 320 % 128 ≠ 0),
@@ -1734,6 +1751,32 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # tp=8 inter=160 → 256 (3×128→no, ceil(160/128)*128=256); tp=4 inter=320 → 384.
         align = block_n
         inter_pad = (inter_dim + align - 1) // align * align
+        # Un-padded ("nopad") MoE path env-gate for TP=8 / inter_dim=160.
+        #
+        # Setting ATOM_FP8_MOE_DISABLE_PAD=1 enables the un-padded NPerBlock=32
+        # stage2 path for per-1x128 FP8 MoE when inter_dim % 32 == 0 and
+        # inter_dim < 256. inter_pad is forced to inter_dim so the downstream
+        # `if inter_pad != inter_dim` is False (padding skipped) and the caller
+        # (aiter ck_moe_stage1) receives un-padded weights, dispatching the
+        # NPerBlock=32 kernel instead of padding inter to a multiple of 128.
+        #
+        # This path's numerical correctness depends on two companion fixes in
+        # this method: the shared-expert per-128x128 requant
+        # (_requant_fused_shared_experts, applied above) and the §A stage2
+        # (32,16) weight pre-shuffle (applied below).
+        #
+        # Default (env unset / "0") keeps the padded NPerBlock=128 path and is
+        # unchanged. The inter_dim < 256 guard keeps inter=320 (tp=4) on the
+        # padded path.
+        import os  # local import: module top has no `import os`
+        _w4_nopad = (
+            os.environ.get("ATOM_FP8_MOE_DISABLE_PAD", "0") == "1"
+            and self.quant_type == QuantType.per_1x128
+            and inter_dim % 32 == 0
+            and inter_dim < 256
+        )
+        if _w4_nopad:
+            inter_pad = inter_dim
         if inter_pad != inter_dim:
             E = layer.w13_weight.shape[0]
             hidden = layer.w13_weight.shape[-1]
@@ -1758,7 +1801,129 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             layer.w2_weight = atom_parameter(layer.w2_weight.data)
             layer.w2_weight_scale = atom_parameter(layer.w2_weight_scale.data)
 
-        shuffle_weights(layer.w13_weight, layer.w2_weight)
+        if _w4_nopad:
+            # nopad stage2 (K=inter, gfx942 mfma_f32_32x32x16f8f8 -> NLane=32) 需 w2 以 BN=32 预洗;
+            # stage1 (mfma_16x16x32f8f8 -> NLane=16) 的 w13 保持 BN=16。  [W8-T64 §A]
+            shuffle_weights(layer.w13_weight, layout=(16, 16))
+            shuffle_weights(layer.w2_weight, layout=(32, 16))
+        else:
+            shuffle_weights(layer.w13_weight, layer.w2_weight)
+
+    def _requant_fused_shared_experts(self, layer: nn.Module) -> None:
+        """Re-quantize any block whose per-128x128 scale was never loaded
+        (i.e. the fused shared expert, stored as bf16 in the checkpoint) with
+        an efficient amax-based block scale. See ``_process_block_quant`` for
+        the full rationale (W8-T109 root fix).
+
+        Detection is signature-based rather than relying on
+        ``num_fused_shared_experts``: a properly fp8-block-quantized expert has
+        per-block-varying amax, so its scale tensor is non-uniform, whereas the
+        bf16-loaded shared expert was cast straight into fp8 leaving its scale
+        at the constant ``torch.ones`` default (-> 2.0 after the e4m3fn->fnuz
+        normalize). Only those uniform-scale regions are rewritten; routed
+        experts are left untouched. No-op when the layer is not per-1x128 block
+        quantized. Runs after normalize and before inter-dim padding / weight
+        shuffling so it stays purely in the (fnuz) fp8 space the kernels
+        consume.
+        """
+        if self.quant_type != QuantType.per_1x128:
+            return
+        import sys
+
+        block = 128
+        w13 = layer.w13_weight.data
+        w13_s = layer.w13_weight_scale.data
+        w2 = layer.w2_weight.data
+        w2_s = layer.w2_weight_scale.data
+        E = w2.shape[0]
+        inter = w2.shape[2]  # intermediate_size_per_partition
+        n_inter = (inter + block - 1) // block
+
+        def needs_requant(w_region: torch.Tensor, s_region: torch.Tensor) -> bool:
+            # Target precisely the bf16-loaded shared expert region:
+            #  (1) scale is uniform  -> never loaded a real per-block scale
+            #      (a never-loaded scale stays the constant init, optionally
+            #       scaled uniformly by normalize, so amax == amin to the bit);
+            #  (2) weight is non-zero -> skip empty / not-yet-loaded / no-op
+            #      regions (their requant would be a harmless zero->zero, but we
+            #      avoid touching them so the fix only ever rewrites real data);
+            #  (3) current fp8 magnitude is far below the fp8 max -> the
+            #      degraded direct-cast signature (~0.047 vs ~240). A properly
+            #      block-quantized routed expert fails (1) anyway; this is an
+            #      extra guard so we never disturb an already-efficient expert.
+            if not bool((s_region.amax() == s_region.amin()).item()):
+                return False
+            fp8_max = torch.finfo(w_region.dtype).max
+            # fp8 (e4m3fnuz) has no abs kernel -> cast to float first.
+            cur = w_region.float().abs().max().item()
+            return cur > 0.0 and cur < 0.5 * fp8_max
+
+        def requant(w_region: torch.Tensor, s_region: torch.Tensor):
+            # Dequantize using the current (degraded) block scale, then
+            # re-quantize per-128x128 with an efficient amax-based scale.
+            fp8_dtype = w_region.dtype
+            fp8_max = torch.finfo(fp8_dtype).max
+            N, K = w_region.shape
+            nN, nK = s_region.shape
+            s_full = (
+                s_region.repeat_interleave(block, 0)[:N]
+                .repeat_interleave(block, 1)[:, :K]
+            )
+            deq = w_region.float() * s_full
+            pN, pK = nN * block, nK * block
+            wp = torch.zeros(pN, pK, device=deq.device, dtype=torch.float32)
+            wp[:N, :K] = deq
+            blk = wp.view(nN, block, nK, block)
+            amax = blk.abs().amax((1, 3), keepdim=True).clamp(min=1e-8)
+            new_s = amax / fp8_max
+            new_q = (blk / new_s).to(fp8_dtype).view(pN, pK)[:N, :K].contiguous()
+            return new_q, new_s.view(nN, nK)
+
+        fixed = []
+        for e in range(E):
+            touched = False
+            # w2 (down_proj): one block-quantized region [hidden, inter].
+            if needs_requant(w2[e], w2_s[e]):
+                q, s = requant(w2[e], w2_s[e])
+                w2[e].copy_(q)
+                w2_s[e].copy_(s)
+                touched = True
+            # w13 (gate_proj || up_proj): gate and up rows are each block
+            # quantized independently (scale holds 2*ceil(inter/128) row
+            # blocks), so quantize the two halves separately to keep blocks
+            # from straddling the gate/up boundary.
+            if needs_requant(w13[e][:inter], w13_s[e][:n_inter]):
+                qg, sg = requant(w13[e][:inter], w13_s[e][:n_inter])
+                w13[e][:inter].copy_(qg)
+                w13_s[e][:n_inter].copy_(sg)
+                touched = True
+            if needs_requant(
+                w13[e][inter : 2 * inter], w13_s[e][n_inter : 2 * n_inter]
+            ):
+                qu, su = requant(
+                    w13[e][inter : 2 * inter], w13_s[e][n_inter : 2 * n_inter]
+                )
+                w13[e][inter : 2 * inter].copy_(qu)
+                w13_s[e][n_inter : 2 * n_inter].copy_(su)
+                touched = True
+            if touched:
+                fixed.append(e)
+                print(
+                    f"[W8-T109 requant] expert={e}: "
+                    f"w2 fp8_absmax={w2[e].float().abs().max().item():.2f} "
+                    f"scale_absmax={w2_s[e].max().item():.6f} | "
+                    f"w13 fp8_absmax={w13[e].float().abs().max().item():.2f} "
+                    f"scale_absmax={w13_s[e].max().item():.6f}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+        if fixed:
+            print(
+                f"[W8-T109 requant] re-quantized {len(fixed)} shared/degraded "
+                f"expert(s) out of {E}: {fixed}",
+                file=sys.stderr,
+                flush=True,
+            )
 
     def _process_channel_quant(self, layer: nn.Module) -> None:
         """PTPTC"""
