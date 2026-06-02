@@ -1031,10 +1031,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     routing_a8w4,
                 )  # grouped topk included
 
+                block_m = 64 if x.shape[-2] >= 256 else 16
+
                 routing_data, gather_idx, scatter_idx = routing_a8w4(
                     router_logits,
                     n_expts_act,
-                    16,  # hardcode block m for now TODO change back
+                    block_m,
                     score_mode=scoring_func,
                     bias=(
                         e_score_correction_bias.to(torch.float32)
