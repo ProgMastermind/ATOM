@@ -19,24 +19,16 @@
 # limitations under the License.
 
 import torch
-from typing import Any
 import logging
 from math import prod
 from aiter import ActivationType
 from aiter.jit.utils.chip_info import get_gfx
-from aiter.ops.triton.fusions.fused_routing_from_topk import (
-    fused_routing_from_topk as _aiter_fused_routing_from_topk,
-)
 from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 from atom.model_ops.moe_utils import (
     check_and_swizzle_scales,
 )
 from atom.utils import envs
 
-from triton import next_power_of_2
-
-
-logger = logging.getLogger("atom")
 
 if envs.ATOM_USE_TRITON_GEMM:
     from aiter.ops.triton.moe.moe_routing.routing import routing
@@ -75,46 +67,6 @@ if envs.ATOM_USE_TRITON_GEMM:
     from aiter.ops.triton.moe.quant_moe import downcast_to_static_fp8
 
 
-# amd_smem_safe_tile is no longer needed as atom now uses aiter kernels rather than triton_kernels matmul_ogs
-# @contextmanager
-# def _amd_smem_safe_tile():
-#     """Cap matmul_ogs tile size on AMD CDNA4 to fit MI355X's 160 KiB LDS.
-
-#     triton_kernels' AMD opt_flags has a special-case
-#     `if cdna4 and block_m == 128: block_n = 512`, which makes BLOCK_M*BLOCK_N
-#     = 64K FP32 entries — large enough that triton 3.6+/3.7+ spills the
-#     accumulator into LDS and overflows the 160 KiB budget (observed 269 KiB
-#     on V4-Pro FP8 MoE). triton 3.5 happened to keep more of the acc in
-#     registers and slipped under the limit, hence the version-dependent OOM.
-
-#     Pin block_n ≤ ATOM_TRITON_MOE_MAX_BLOCK_N (default 256) so BLOCK_M*BLOCK_N
-#     stays at 32K. Default block_n in compute_block_nk is already capped at
-#     256 except for that single cdna4 branch, so this only sidesteps the bad
-#     path on gfx950.
-#     """
-#     if get_gfx() != "gfx950":
-#         yield
-#         return
-#     try:
-#         from triton_kernels.matmul_ogs_details.opt_flags import (
-#             update_opt_flags_constraints,
-#             reset_opt_flags_constraints,
-#         )
-#     except ImportError:
-#         yield
-#         return
-#     # Defaults chosen so BLOCK_M*BLOCK_N stays ≤ 16384 entries (64 KiB FP32
-#     # acc), comfortably fitting MI355X's register file. Override via env if
-#     # a future compiler/kernel update relaxes the budget.
-#     block_m = int(os.getenv("ATOM_TRITON_MOE_BLOCK_M", "32"))
-#     block_n = int(os.getenv("ATOM_TRITON_MOE_BLOCK_N", "256"))
-#     update_opt_flags_constraints({"block_m": block_m, "block_n": block_n})
-#     try:
-#         yield
-#     finally:
-#         reset_opt_flags_constraints()
-
-
 def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1):
     """weight swizzle for mxfp4 moe, used for aiter triton weight mxfp4 moe method/kernels"""
 
@@ -133,152 +85,6 @@ def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1
     )
     
     return w1_triton_layout, w1_scale_triton_layout, w1_swizzle_layout, w2_triton_layout, w2_scale_triton_layout, w2_swizzle_layout
-
-
-def fused_routing_from_topk_triton(topk_weights, topk_ids, n_expts_tot, num_tokens, bitmatrix=None):
-    """Build matmul_ogs routing data via the AITER fused-routing kernel.
-
-    Thin bridge over ``aiter.ops.triton.fused_routing_from_topk``: invokes
-    the single-CTA counting-sort kernel for small NK and packages the
-    resulting indices into the ``RoutingData`` / ``GatherIndx`` /
-    ``ScatterIndx`` structures consumed by
-    ``triton_kernels.matmul_ogs``. For ``NK = n_tokens * n_expts_act``
-    above the kernel's single-CTA budget (prefill-shaped inputs), falls
-    back to the multi-kernel ``routing_from_topk`` reference defined
-    below — that path does the per-row sort + global stable argsort in
-    plain torch and is correctness-stable at any NK.
-
-    Equivalence vs reference: the fused kernel skips the per-row sort,
-    so ``topk_indx`` / ``gate_indx`` differ at intra-expert ordering.
-    ``hist`` and the per-(token, expert, weight) bucket assignments
-    match exactly; ``matmul_ogs`` is commutative over per-expert slices
-    so the MoE output is unchanged (up to FP non-associativity).
-    """
-    # if not has_triton_kernels():
-    #     return routing_from_topk(topk_weights, topk_ids, n_expts_tot)
-
-    n_tokens, n_expts_act = topk_weights.shape
-    n_gates_pad = n_tokens * n_expts_act
-
-    if n_gates_pad > 4096:
-        # Single-CTA design exceeded; fall back rather than degrading
-        # silently. Typically only hit during prefill.
-        assert (
-            bitmatrix != None
-        ), "fallback to routing from topk in triton only implemented for bitmatrix included in routing call"
-        return routing_from_topk(topk_weights, topk_ids, n_expts_tot, bitmatrix, num_tokens)
-
-    hist, topk_indx, gate_indx, gate_scal = _aiter_fused_routing_from_topk(
-        topk_weights, topk_ids, n_expts_tot
-    )
-
-    from aiter.ops.triton.moe.moe_routing.routing import (
-        routing,
-        RoutingData,
-    )
-
-    from atom.model_ops.moe_utils import compute_expt_data
-    from triton import next_power_of_2
-
-    m = n_tokens * n_expts_act
-    tokens_per_expt = max(1, m // n_expts_tot)
-    block_m = max(16, min(next_power_of_2(tokens_per_expt), 128))
-    expt_data = compute_expt_data(hist, n_expts_tot, n_gates_pad, block_m)
-
-    routing_data = RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data)
-    return routing_data, topk_indx, gate_indx #topk_indx = gather_indx, gate_indx = scatter_indx
-
-
-def routing_from_topk(
-    topk_weights, topk_ids, n_expts_tot, expert_map: torch.Tensor | None = None
-):
-    """Convert FusedMoE.select_experts output to triton routing data structures.
-
-    This bridges the gap between ATOM's grouped topk / sigmoid routing
-    (which triton_kernels routing() does not support) and the triton
-    matmul_ogs compute kernels.
-
-    Args:
-        topk_weights: (n_tokens, n_expts_act) routing weights from select_experts
-        topk_ids: (n_tokens, n_expts_act) expert indices from select_experts
-        n_expts_tot: total number of experts (global, before EP)
-
-    Returns:
-        (RoutingData, tensor, tensor) compatible with triton_kernel_fused_experts
-    """
-    from aiter.ops.triton.moe.moe_routing.routing import (
-        routing,
-        routing_a8w4,
-        RoutingData,
-        ExptData,
-    )
-
-    from atom.model_ops.moe_utils import compute_expt_data
-
-    n_tokens, n_expts_act = topk_weights.shape
-    n_gates_pad = n_tokens * n_expts_act
-
-    if expert_map is not None:
-        local_ids = expert_map[topk_ids.long()]
-        invalid = local_ids < 0
-        topk_weights = topk_weights.masked_fill(invalid, 0.0)
-        topk_ids = local_ids.masked_fill(invalid, 0).to(torch.int32)
-
-    # Sort each token's selected experts by expert_id (required by triton kernels)
-    expt_indx_sorted, sort_indices = torch.sort(topk_ids.int(), dim=1)
-    expt_scal_sorted = torch.gather(topk_weights, 1, sort_indices.long())
-
-    # Flatten to 1D
-    expt_scal = expt_scal_sorted.reshape(-1).to(topk_weights.dtype)
-    expt_indx = expt_indx_sorted.reshape(-1).to(torch.int32)
-
-    # Sort by expert_id globally so experts are contiguous for the matmul
-    topk_indx = torch.argsort(expt_indx, stable=True).int()
-    gate_indx = torch.argsort(topk_indx, stable=True).int()
-    gate_scal = expt_scal[topk_indx.long()].to(torch.bfloat16)
-
-    # Histogram of tokens over experts
-    hist = torch.histc(expt_indx.float(), bins=n_expts_tot, max=n_expts_tot - 1).int()
-
-    # Build routing data structures using triton-accelerated compute_expt_data
-    m = n_tokens * n_expts_act
-    tokens_per_expt = max(1, m // n_expts_tot)
-    block_m = max(16, min(triton.next_power_of_2(tokens_per_expt), 128))
-    if num_tokens <= 16:
-        HIST_BLOCK_M = triton.next_power_of_2(num_tokens)
-        (
-            hist,
-            topk_indx,
-            gate_indx,
-            gate_scal,
-            token_offs_raw,
-            token_offs_pad,
-            block_pid_map,
-        ) = sort_tokens_fused(
-            topk_weights, topk_ids, n_expts_tot, bitmatrix, block_m, HIST_BLOCK_M
-        )
-    else:
-        (
-            hist,
-            topk_indx,
-            gate_indx,
-            gate_scal,
-            token_offs_raw,
-            token_offs_pad,
-            block_pid_map,
-        ) = sort_tokens(
-            topk_weights, topk_ids, n_expts_tot, bitmatrix, block_m, 32 # hardcoded HIST_BLOCK_M for now
-        )
-    expt_data = ExptData(hist, token_offs_raw, token_offs_pad, block_pid_map)
-
-    # pack the matmul data structure
-    gather_indx = topk_indx
-    scatter_indx = gate_indx
-    return (
-        RoutingData(block_m, gate_scal, hist, n_expts_tot, n_expts_act, expt_data),
-        gather_indx,
-        scatter_indx,
-    )
 
 
 def _resize_cache(x: torch.Tensor, v: tuple[int, ...]) -> torch.Tensor:
@@ -384,12 +190,9 @@ def triton_kernel_fused_experts(
     # Shape check
     # Changes to weight handling before this function, therefore shape check change
     assert hidden_states.ndim == 2
-    # assert hidden_states.shape[-1] == w1.shape[-2] * 2 
-    # assert w2.shape[-1] == w1.shape[-2]  * 2
 
-    # unecessary since aiter kernels expect 2d inputs/outputs
-    # batch_dim = 1
-    M, K = hidden_states.shape[-2:] # 
+    # aiter kernels expect 2d inputs/outputs
+    M, K = hidden_states.shape[-2:] 
     E, _, N = w1.shape 
 
     if global_num_experts == -1:
@@ -412,12 +215,6 @@ def triton_kernel_fused_experts(
     output_tensor = _resize_cache(output_tensor, (M, K))
 
     gammas = routing_data.gate_scal if routing_data else None
-
-    # raw_intermediate = torch.empty(
-    #     (M * topk, N),
-    #     device=hidden_states.device,
-    #     dtype=hidden_states.dtype,
-    # )
 
     if activation == ActivationType.Swiglu:
         # SwiGLU (GPT OSS): fused activation with interleaved [gate, up] layout
@@ -523,19 +320,6 @@ def triton_kernel_fused_experts(
             activation="silu",
             dtype_quant=None,
         )
-
-        # logger.warning("intermediate cache")
-        # logger.warning(intermediate_cache.view(M * topk, half_N))
-        # logger.warning(intermediate_cache.shape)
-
-        # logger.warning("swizzle layouts")
-        # logger.warning(w13_swizzle_layout)
-        # logger.warning(w2_swizzle_layout)
-
-        # logger.warning("numerics")
-        # logger.warning(M * topk)
-        # logger.warning(half_N)
-        # logger.warning(N)
 
         output_tensor = moe_gemm_a16w4(
             intermediate_cache,
