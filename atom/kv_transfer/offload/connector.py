@@ -132,13 +132,19 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self._rank = rank
 
         cfg = offcfg.build_lmcache_config()
-        offcfg.apply_extra_overrides(cfg, getattr(self._config, "kv_transfer_config", None))
+        offcfg.apply_extra_overrides(
+            cfg, getattr(self._config, "kv_transfer_config", None)
+        )
         meta = offcfg.build_lmcache_metadata(self._config, cfg, world, rank)
         self.chunk_size = int(cfg.chunk_size)
 
         self._engine = LMCacheEngineBuilder.get_or_create(
-            f"atom-offload-{rank}", cfg, meta, _UnusedGPUConnector(),
-            lambda t, s: None, lambda o, s: o,
+            f"atom-offload-{rank}",
+            cfg,
+            meta,
+            _UnusedGPUConnector(),
+            lambda t, s: None,
+            lambda o, s: o,
         )
         self._engine.post_init()
         self._sm = self._engine.storage_manager
@@ -149,18 +155,26 @@ class LMCacheOffloadConnector(KVConnectorBase):
         # lookup_server makes on behalf of the scheduler) — args + result.
         _orig_lookup = self._engine.lookup
         _rk = rank
+
         def _logged_lookup(*a, **k):
             r = _orig_lookup(*a, **k)
             h = k.get("hashes")
-            logger.debug("[ENGINE.LOOKUP] rank=%s lookup_id=%s nhashes=%s first3=%s -> %s",
-                         _rk, k.get("lookup_id"), (len(h) if h is not None else None),
-                         (list(h[:3]) if h else None), r)
+            logger.debug(
+                "[ENGINE.LOOKUP] rank=%s lookup_id=%s nhashes=%s first3=%s -> %s",
+                _rk,
+                k.get("lookup_id"),
+                (len(h) if h is not None else None),
+                (list(h[:3]) if h else None),
+                r,
+            )
             return r
+
         self._engine.lookup = _logged_lookup
 
         # ZMQ lookup server so the scheduler process can query our hit counts.
         try:
             from lmcache.v1.lookup_client.factory import LookupClientFactory
+
             self._lookup_server = LookupClientFactory.create_lookup_server(
                 self._engine, meta
             )
@@ -170,8 +184,12 @@ class LMCacheOffloadConnector(KVConnectorBase):
         logger.info(
             "LMCache offload worker rank=%d: bytes_per_block=%d chunk=%d "
             "codec_layout=%s save=%s load=%s",
-            rank, self._codec.bytes_per_block, self.chunk_size, self._codec.layout,
-            self._do_save, self._do_load,
+            rank,
+            self._codec.bytes_per_block,
+            self.chunk_size,
+            self._codec.layout,
+            self._do_save,
+            self._do_load,
         )
 
     # -- per-step (RPC thread): only enqueue, never copy ------------------
@@ -210,7 +228,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
         try:
             fn(req)
         except Exception:
-            logger.exception("LMCache offload: %s failed for %s", fn.__name__, req.req_id)
+            logger.exception(
+                "LMCache offload: %s failed for %s", fn.__name__, req.req_id
+            )
             if kind == "load":
                 self._lookup_unpin(req.req_id)
             with self._lock:
@@ -385,16 +405,22 @@ class LMCacheOffloadConnector(KVConnectorBase):
         t0 = time.perf_counter()
         chunks = list(self._tdb.process_tokens(torch.tensor(toks), mask=mask))
         process_ms = (time.perf_counter() - t0) * 1000
-        logger.debug("offload _do_load req=%s hbm=%d lmc=%d chunks=%d",
-                     req.req_id, hbm, ls.lmcache_cached_tokens, len(chunks))
+        logger.debug(
+            "offload _do_load req=%s hbm=%d lmc=%d chunks=%d",
+            req.req_id,
+            hbm,
+            ls.lmcache_cached_tokens,
+            len(chunks),
+        )
 
         # All-or-nothing above the HBM prefix: a partial load would let attention
         # read uninitialized blocks, and a chunk that overlaps an HBM-cache hit
         # could overwrite shared prefix-cache blocks. In either case the seq
         # wakes and re-prefills from its HBM floor.
         if not chunks:
-            logger.warning("LMCache offload: no loadable chunks req=%s; re-prefill",
-                           req.req_id)
+            logger.warning(
+                "LMCache offload: no loadable chunks req=%s; re-prefill", req.req_id
+            )
             self._lookup_unpin(req.req_id)
             with self._lock:
                 self._failed_load.add(req.req_id)
@@ -406,12 +432,14 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 total_ms=f"{(time.perf_counter() - t_total0) * 1000:.2f}",
             )
             return
-        for (s, _e, _key) in chunks:
+        for s, _e, _key in chunks:
             if s < hbm:
                 logger.warning(
                     "LMCache offload: chunk overlaps HBM prefix req=%s hbm=%d "
                     "chunk_start=%d; re-prefill",
-                    req.req_id, hbm, s,
+                    req.req_id,
+                    hbm,
+                    s,
                 )
                 self._lookup_unpin(req.req_id)
                 with self._lock:
@@ -513,11 +541,13 @@ class LMCacheOffloadConnector(KVConnectorBase):
                     if req_mo is not None:
                         req_mo.ref_count_down()
 
-        for (_s, _e, key) in chunks:
+        for _s, _e, key in chunks:
             t0 = time.perf_counter()
             if not self._sm.contains(key):
                 contains_ms += (time.perf_counter() - t0) * 1000
-                logger.warning("LMCache offload: load miss req=%s; re-prefill", req.req_id)
+                logger.warning(
+                    "LMCache offload: load miss req=%s; re-prefill", req.req_id
+                )
                 self._lookup_unpin(req.req_id)
                 with self._lock:
                     self._failed_load.add(req.req_id)
@@ -533,7 +563,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
             contains_ms += (time.perf_counter() - t0) * 1000
 
         try:
-            for (s, e, key) in chunks:
+            for s, e, key in chunks:
                 t0 = time.perf_counter()
                 mo = self._sm.get(key)
                 get_ms += (time.perf_counter() - t0) * 1000
@@ -701,7 +731,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
         copy_calls = 0
         chunk_bids: list[list[int]] = []
         try:
-            for (s, e, key) in chunks:
+            for s, e, key in chunks:
                 self._pause_save_for_load(stream)
                 t0 = time.perf_counter()
                 if self._sm.contains(key):  # already offloaded → skip wasted D2H
@@ -712,8 +742,9 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 bids = self._block_ids(req, s, e)
                 chunk_nbytes = len(bids) * self._codec.bytes_per_block
                 t0 = time.perf_counter()
-                mo = self._sm.allocate(torch.Size((chunk_nbytes,)), torch.uint8,
-                                       fmt=MemoryFormat.KV_2LTD)
+                mo = self._sm.allocate(
+                    torch.Size((chunk_nbytes,)), torch.uint8, fmt=MemoryFormat.KV_2LTD
+                )
                 alloc_ms += (time.perf_counter() - t0) * 1000
                 if mo is None:  # pool under pressure; stop here
                     break
@@ -842,10 +873,18 @@ class LMCacheOffloadConnector(KVConnectorBase):
         if logger.isEnabledFor(logging.DEBUG):
             _kh = [getattr(k, "chunk_hash", None) for k in keys[:2]]
             _contains = [bool(self._sm.contains(k)) for k in keys[:2]]
-            logger.debug("[OFFLOAD-SAVE] rank=%s req=%s toks=%d chunks=%d stored=%d already=%d "
-                         "chunkhash2=%s contains=%s",
-                         self._rank, req.req_id, len(toks), len(chunks), len(keys),
-                         already, _kh, _contains)
+            logger.debug(
+                "[OFFLOAD-SAVE] rank=%s req=%s toks=%d chunks=%d stored=%d already=%d "
+                "chunkhash2=%s contains=%s",
+                self._rank,
+                req.req_id,
+                len(toks),
+                len(chunks),
+                len(keys),
+                already,
+                _kh,
+                _contains,
+            )
 
     # -- per-step (RPC thread, post-forward): poll completions ------------
     def get_finished(self) -> KVConnectorOutput:
@@ -931,11 +970,14 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             offcfg.apply_extra_overrides(cfg, kvc)
             self.chunk_size = int(cfg.chunk_size)
             from lmcache.v1.lookup_client.factory import LookupClientFactory
+
             world = int(getattr(config, "tensor_parallel_size", 1) or 1)
             meta = offcfg.build_lmcache_metadata(config, cfg, world, 0)
             self._lookup_client = LookupClientFactory.create_lookup_client(cfg, meta)
         except Exception as e:
-            logger.warning("LMCache offload scheduler: lookup client unavailable: %s", e)
+            logger.warning(
+                "LMCache offload scheduler: lookup client unavailable: %s", e
+            )
 
     # -- match: how many extra tokens can come from CPU/NVMe -------------
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
@@ -967,12 +1009,22 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             try:
                 tdb = getattr(self._lookup_client, "token_database", None)
                 if tdb is not None:
-                    _lh = [k for (_s, _e, k) in list(
-                        tdb.process_tokens(token_ids, make_key=False))[:3]]
+                    _lh = [
+                        k
+                        for (_s, _e, k) in list(
+                            tdb.process_tokens(token_ids, make_key=False)
+                        )[:3]
+                    ]
             except Exception as e:
                 _lh = f"err:{e}"
-            logger.debug("[OFFLOAD-LOOKUP] seq=%s num_prompt=%d hbm_cached=%d hit=%s lookuphash3=%s",
-                         seq.id, num_prompt, int(seq.num_cached_tokens), hit, _lh)
+            logger.debug(
+                "[OFFLOAD-LOOKUP] seq=%s num_prompt=%d hbm_cached=%d hit=%s lookuphash3=%s",
+                seq.id,
+                num_prompt,
+                int(seq.num_cached_tokens),
+                hit,
+                _lh,
+            )
         if not hit:
             offload_trace(
                 "scheduler_lookup_done",
@@ -1022,8 +1074,12 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
     def update_state_after_alloc(self, seq) -> None:
         sid = str(seq.id)
         ls = self._load_specs.get(sid)
-        logger.debug("[OFFLOAD-ALLOC] seq=%s ls_found=%s num_cached_now=%s",
-                     seq.id, ls is not None, int(getattr(seq, "num_cached_tokens", -1)))
+        logger.debug(
+            "[OFFLOAD-ALLOC] seq=%s ls_found=%s num_cached_now=%s",
+            seq.id,
+            ls is not None,
+            int(getattr(seq, "num_cached_tokens", -1)),
+        )
         if ls is not None:
             ls.can_load = True
             self._reqs_need_recv[sid] = seq
@@ -1221,10 +1277,13 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         ls = self._load_specs.get(sid)
         if ls is None:
             return False
-        should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(seq, ls)
+        should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(
+            seq, ls
+        )
         if not should_load:
-            if reason == "unaligned_hbm_prefill" and self._maybe_start_unaligned_handoff(
-                seq, ls, hbm, lmc, chunk
+            if (
+                reason == "unaligned_hbm_prefill"
+                and self._maybe_start_unaligned_handoff(seq, ls, hbm, lmc, chunk)
             ):
                 return False
             self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
@@ -1242,8 +1301,12 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
         for sid, seq in list(self._reqs_need_recv.items()):
             ls = self._load_specs.pop(sid, None)
             if ls is None or not ls.can_load:
-                logger.debug("[OFFLOAD-LOAD-SKIP] seq=%s ls=%s can_load=%s",
-                             sid, ls is not None, getattr(ls, "can_load", None))
+                logger.debug(
+                    "[OFFLOAD-LOAD-SKIP] seq=%s ls=%s can_load=%s",
+                    sid,
+                    ls is not None,
+                    getattr(ls, "can_load", None),
+                )
                 continue
             # ★ Use the REAL HBM-cached count as the load floor.
             # get_num_new_matched_tokens runs BEFORE the prefix-cache match in
@@ -1252,7 +1315,9 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
             # true HBM hit. Loading below this floor would overwrite HBM
             # prefix-cache blocks (possibly shared with other seqs) -> output
             # corruption. So load only [hbm_cached, offload_hit).
-            should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(seq, ls)
+            should_load, reason, hbm, lmc, need, chunk = self._decide_load_after_alloc(
+                seq, ls
+            )
             if not should_load:
                 self._mark_load_skip(seq, reason, hbm, lmc, need, chunk)
                 self._clear_pending_load(sid)
@@ -1284,12 +1349,14 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                 blocks=len(list(seq.block_table)),
             )
             loading_sids.add(sid)
-            meta.add_request(LMCacheReqMeta(
-                req_id=seq.id,
-                token_ids=list(seq.token_ids[: lmc]),
-                block_ids=list(seq.block_table),
-                load_spec=ls,
-            ))
+            meta.add_request(
+                LMCacheReqMeta(
+                    req_id=seq.id,
+                    token_ids=list(seq.token_ids[:lmc]),
+                    block_ids=list(seq.block_table),
+                    load_spec=ls,
+                )
+            )
         meta.lookup_requests_in_step = self._lookup_in_step
         self._lookup_in_step = []
         # Saves: store fully computed prompt chunks. Under scheduler-side
@@ -1327,13 +1394,15 @@ class LMCacheOffloadConnectorScheduler(KVConnectorSchedulerBase):
                 saved=saved,
                 blocks=len(seq.block_table),
             )
-            meta.add_request(LMCacheReqMeta(
-                req_id=seq.id,
-                token_ids=list(seq.token_ids[:aligned]),
-                block_ids=list(seq.block_table),
-                save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
-                is_last_prefill=is_last_prefill,
-            ))
+            meta.add_request(
+                LMCacheReqMeta(
+                    req_id=seq.id,
+                    token_ids=list(seq.token_ids[:aligned]),
+                    block_ids=list(seq.block_table),
+                    save_spec=SaveSpec(skip_leading_tokens=saved, can_save=True),
+                    is_last_prefill=is_last_prefill,
+                )
+            )
             entry[1] = aligned
             self._save_inflight.add(sid)
         self._reqs_need_recv.clear()

@@ -110,7 +110,10 @@ class KVOutputAggregator:
         for rid in recv_ids:
             done_workers = self._seen_recving.get(rid, set())
             failed_workers = self._seen_recv_failed.get(rid, set())
-            if failed_workers and len(done_workers | failed_workers) >= self._world_size:
+            if (
+                failed_workers
+                and len(done_workers | failed_workers) >= self._world_size
+            ):
                 failed_recving.add(rid)
         done_recving = {
             rid

@@ -14,7 +14,6 @@ from pathlib import Path
 
 from torch.utils.cpp_extension import load
 
-
 _EXT = None
 
 
@@ -35,7 +34,9 @@ def load_extension() -> None:
     _load_ext()
 
 
-def stitch_chunk_buffers(dst, chunk_buffers, chunk_block_counts, seg_block_bytes) -> None:
+def stitch_chunk_buffers(
+    dst, chunk_buffers, chunk_block_counts, seg_block_bytes
+) -> None:
     _load_ext().stitch_chunk_buffers(
         dst,
         chunk_buffers,
@@ -44,7 +45,9 @@ def stitch_chunk_buffers(dst, chunk_buffers, chunk_block_counts, seg_block_bytes
     )
 
 
-def split_request_buffer(src, chunk_buffers, chunk_block_counts, seg_block_bytes) -> None:
+def split_request_buffer(
+    src, chunk_buffers, chunk_block_counts, seg_block_bytes
+) -> None:
     _load_ext().split_request_buffer(
         src,
         chunk_buffers,

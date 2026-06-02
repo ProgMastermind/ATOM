@@ -13,10 +13,7 @@ force ``use_gds=False`` (cufile GDS init hangs without NVMe-GDS hardware).
 
 from __future__ import annotations
 
-import os
 from typing import Any
-
-import torch
 
 
 def build_lmcache_config():
@@ -72,10 +69,14 @@ def build_lmcache_metadata(config, cfg, world_size: int, worker_id: int):
 
     hf = config.hf_config
     num_layers = int(getattr(hf, "num_hidden_layers"))
-    num_kv_heads = int(getattr(hf, "num_key_value_heads", getattr(hf, "num_attention_heads")))
+    num_kv_heads = int(
+        getattr(hf, "num_key_value_heads", getattr(hf, "num_attention_heads"))
+    )
     tp = int(getattr(config, "tensor_parallel_size", world_size) or 1)
     num_kv_heads_local = max(1, num_kv_heads // tp)
-    head_dim = int(getattr(hf, "head_dim", 0) or (hf.hidden_size // hf.num_attention_heads))
+    head_dim = int(
+        getattr(hf, "head_dim", 0) or (hf.hidden_size // hf.num_attention_heads)
+    )
     kv_dtype = dtypes.d_dtypes[config.kv_cache_dtype]
     model_name = str(getattr(config, "model", "atom-model"))
 

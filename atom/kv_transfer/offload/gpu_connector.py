@@ -91,11 +91,9 @@ class ATOMKVByteCodec:
         self._tls = threading.local()
         self._native_stitch = None
         self._native_split = None
-        if (
-            self.layout == "segment_indexed"
-            and os.environ.get("OFFLOAD_NATIVE_STITCH", "0").lower()
-            not in ("0", "false", "no", "off")
-        ):
+        if self.layout == "segment_indexed" and os.environ.get(
+            "OFFLOAD_NATIVE_STITCH", "0"
+        ).lower() not in ("0", "false", "no", "off"):
             try:
                 from atom.kv_transfer.offload import native_stitch
 
@@ -237,13 +235,9 @@ class ATOMKVByteCodec:
         src_bases_by_chunk = [
             self._segment_bases(nblocks) for nblocks in chunk_block_counts
         ]
-        for seg_idx, (dst_base, nb) in enumerate(
-            zip(dst_bases, self._seg_block_bytes)
-        ):
+        for seg_idx, (dst_base, nb) in enumerate(zip(dst_bases, self._seg_block_bytes)):
             parts = [
-                src[
-                    bases[seg_idx] : bases[seg_idx] + nblocks * nb
-                ]
+                src[bases[seg_idx] : bases[seg_idx] + nblocks * nb]
                 for src, bases, nblocks in zip(
                     chunk_buffers, src_bases_by_chunk, chunk_block_counts
                 )
@@ -279,18 +273,14 @@ class ATOMKVByteCodec:
         dst_bases_by_chunk = [
             self._segment_bases(nblocks) for nblocks in chunk_block_counts
         ]
-        for seg_idx, (src_base, nb) in enumerate(
-            zip(src_bases, self._seg_block_bytes)
-        ):
+        for seg_idx, (src_base, nb) in enumerate(zip(src_bases, self._seg_block_bytes)):
             logical_block_start = 0
             for dst, bases, nblocks in zip(
                 chunk_buffers, dst_bases_by_chunk, chunk_block_counts
             ):
                 nbytes = nblocks * nb
                 if nbytes:
-                    dst[
-                        bases[seg_idx] : bases[seg_idx] + nbytes
-                    ].copy_(
+                    dst[bases[seg_idx] : bases[seg_idx] + nbytes].copy_(
                         src[
                             src_base
                             + logical_block_start * nb : src_base
@@ -336,9 +326,7 @@ class ATOMKVByteCodec:
             stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
             with stream_ctx:
                 if self.layout == "segment_indexed":
-                    idx = torch.tensor(
-                        block_ids, dtype=torch.long, device=self._device
-                    )
+                    idx = torch.tensor(block_ids, dtype=torch.long, device=self._device)
                     bases = self._segment_bases(len(block_ids))
                     for seg, base, nb in zip(
                         self._segments, bases, self._seg_block_bytes
@@ -391,9 +379,7 @@ class ATOMKVByteCodec:
             stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
             with stream_ctx:
                 if self.layout == "segment_indexed":
-                    idx = torch.tensor(
-                        block_ids, dtype=torch.long, device=self._device
-                    )
+                    idx = torch.tensor(block_ids, dtype=torch.long, device=self._device)
                     bases = self._segment_bases(len(block_ids))
                     for seg, base, nb in zip(
                         self._segments, bases, self._seg_block_bytes

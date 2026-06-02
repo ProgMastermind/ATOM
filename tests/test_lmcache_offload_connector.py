@@ -60,6 +60,7 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
 @pytest.mark.parametrize("layout", ["segment", "segment_indexed"])
 def test_segment_major_codec_roundtrip_noncontiguous_blocks(monkeypatch, layout):
     import torch
+
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
@@ -120,6 +121,7 @@ def test_segment_major_codec_roundtrip_noncontiguous_blocks(monkeypatch, layout)
 
 def test_segment_indexed_stitches_chunk_buffers(monkeypatch):
     import torch
+
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
@@ -165,6 +167,7 @@ def test_segment_indexed_stitches_chunk_buffers(monkeypatch):
 @pytest.mark.parametrize("method_name", ["gpu_to_host", "host_to_gpu"])
 def test_codec_rejects_invalid_block_ids_before_copy(monkeypatch, layout, method_name):
     import torch
+
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
@@ -190,6 +193,7 @@ def test_codec_rejects_invalid_block_ids_before_copy(monkeypatch, layout, method
 
 def test_codec_rejects_short_host_buffer(monkeypatch):
     import torch
+
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
@@ -211,6 +215,7 @@ def test_codec_rejects_short_host_buffer(monkeypatch):
 
 def test_copy_stream_is_cached_per_codec_device(monkeypatch):
     import torch
+
     if not hasattr(torch, "device") or not hasattr(torch, "cuda"):
         pytest.skip("torch cuda API is unavailable")
 
