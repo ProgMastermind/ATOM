@@ -824,64 +824,88 @@ class Scheduler:
                         self.waiting.appendleft(seq)
                         break
                     chunk = num_new_tokens
+
+                assert chunk > 0, (
+                    f"chunk must be positive: {chunk=}, "
+                    f"{num_new_tokens=}, {budget_remaining=}"
+                )
+                num_seqs_prefill += 1
+                if self.cache_stats:
+                    self.cache_stats.update(seq.num_cached_tokens, seq.num_tokens)
+                num_batched_tokens += chunk
+                seq.status = SequenceStatus.RUNNING
+                seq.type = SequenceType.PREFILL
+                self.running.append(seq)
+                scheduled_seqs[seq.id] = seq
+                num_scheduled_tokens.append(chunk)
+                offload_trace(
+                    "scheduler_prefill_scheduled",
+                    req=seq.id,
+                    new_tokens=chunk,
+                    cached=seq.num_cached_tokens,
+                    prompt=seq.num_prompt_tokens,
+                    offload_loaded=getattr(seq, "offload_loaded", False),
+                    load_failed=getattr(seq, "offload_load_failed", False),
+                )
+                continue
+
+            # Probe cache hits FIRST so budget check sees the real
+            # (post-prefix-cache) remaining token count.
+            num_cached_blocks = self.block_manager.can_allocate(seq)
+            if num_cached_blocks < 0:
+                self.waiting.appendleft(seq)
+                break
+
+            num_new_tokens = (
+                seq.num_prompt_tokens
+                - num_cached_blocks * self.block_manager.block_size
+            )
+            budget_remaining = self.max_num_batched_tokens - num_batched_tokens
+            if self.enable_chunked_prefill:
+                chunk = min(num_new_tokens, budget_remaining)
             else:
-                # Probe cache hits FIRST so budget check sees the real
-                # (post-prefix-cache) remaining token count.
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks < 0:
+                if num_new_tokens > budget_remaining and num_batched_tokens > 0:
                     self.waiting.appendleft(seq)
                     break
+                chunk = num_new_tokens
+            t_alloc0 = time.perf_counter()
+            self.block_manager.allocate(seq, num_cached_blocks)
+            offload_trace(
+                "scheduler_alloc_done",
+                req=seq.id,
+                cached_blocks=num_cached_blocks,
+                cached_tokens=seq.num_cached_tokens,
+                blocks=len(seq.block_table),
+                alloc_ms=f"{(time.perf_counter() - t_alloc0) * 1000:.2f}",
+            )
 
-                num_new_tokens = (
-                    seq.num_prompt_tokens
-                    - num_cached_blocks * self.block_manager.block_size
-                )
-                budget_remaining = self.max_num_batched_tokens - num_batched_tokens
-                if self.enable_chunked_prefill:
-                    chunk = min(num_new_tokens, budget_remaining)
-                else:
-                    if num_new_tokens > budget_remaining and num_batched_tokens > 0:
-                        self.waiting.appendleft(seq)
-                        break
-                    chunk = num_new_tokens
-                t_alloc0 = time.perf_counter()
-                self.block_manager.allocate(seq, num_cached_blocks)
+            if self.kv_connector is not None:
+                self.kv_connector.update_state_after_alloc(seq)
+
+            if need_to_remove_to_load_kv_async_queue:
+                if hasattr(self.kv_connector, "should_park_for_load_after_alloc"):
+                    need_to_remove_to_load_kv_async_queue = (
+                        self.kv_connector.should_park_for_load_after_alloc(seq)
+                    )
+
+            if need_to_remove_to_load_kv_async_queue:
                 offload_trace(
-                    "scheduler_alloc_done",
+                    "scheduler_park_for_load",
                     req=seq.id,
-                    cached_blocks=num_cached_blocks,
-                    cached_tokens=seq.num_cached_tokens,
+                    cached=seq.num_cached_tokens,
+                    prompt=seq.num_prompt_tokens,
                     blocks=len(seq.block_table),
-                    alloc_ms=f"{(time.perf_counter() - t_alloc0) * 1000:.2f}",
                 )
+                skipped_waiting_requests.append(seq)
+                seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
+                continue
 
-                if self.kv_connector is not None:
-                    self.kv_connector.update_state_after_alloc(seq)
-
-                if need_to_remove_to_load_kv_async_queue:
-                    if hasattr(self.kv_connector, "should_park_for_load_after_alloc"):
-                        need_to_remove_to_load_kv_async_queue = (
-                            self.kv_connector.should_park_for_load_after_alloc(seq)
-                        )
-
-                if need_to_remove_to_load_kv_async_queue:
-                    offload_trace(
-                        "scheduler_park_for_load",
-                        req=seq.id,
-                        cached=seq.num_cached_tokens,
-                        prompt=seq.num_prompt_tokens,
-                        blocks=len(seq.block_table),
-                    )
-                    skipped_waiting_requests.append(seq)
-                    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
-                    continue
-
-                if self.kv_connector is not None and hasattr(
-                    self.kv_connector, "adjust_prefill_chunk_after_alloc"
-                ):
-                    chunk = self.kv_connector.adjust_prefill_chunk_after_alloc(
-                        seq, chunk
-                    )
+            if self.kv_connector is not None and hasattr(
+                self.kv_connector, "adjust_prefill_chunk_after_alloc"
+            ):
+                chunk = self.kv_connector.adjust_prefill_chunk_after_alloc(
+                    seq, chunk
+                )
 
             assert chunk > 0, (
                 f"chunk must be positive: {chunk=}, "
