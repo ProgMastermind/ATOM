@@ -26,10 +26,12 @@ if TYPE_CHECKING:
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
     envs.ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION
 )
+ATOM_USE_GLUON_PA_DECODE = envs.ATOM_USE_GLUON_PA_DECODE
 
 _PARTITION_SIZE_ROCM = 256
 _CP_TOKENS_PER_ITER_ROCM = 32 * 1024
 _QWEN_GLUON_PA_DECODE_BS = 64
+_GLM47_GLUON_PA_DECODE_BS = 32
 _NO_PS_FIXED_SPLITS = 64  # covers up to 64 * 256 = 16384 context length
 
 
@@ -333,7 +335,6 @@ class PagedAttentionImplPluginModeMethods:
         k_scale: torch.Tensor,
         v_scale: torch.Tensor,
         num_decodes: int,
-        num_decode_tokens: int,
         attn_metadata: "AttentionMetaData",
         out: torch.Tensor,
     ):
@@ -354,7 +355,7 @@ class PagedAttentionImplPluginModeMethods:
             max_qlen=max_qlen,
             K_QScale=k_scale,
             V_QScale=v_scale,
-            out_=out[:num_decode_tokens],
+            out_=out,
             qo_indptr=qo_indptr,
             high_precision=0,
         )
@@ -566,6 +567,15 @@ class PagedAttentionImplPluginModeMethods:
             return False
         return True
 
+    def _dispatch_decode_backend(self, num_decodes):
+        if self.use_triton_attn or num_decodes == _QWEN_GLUON_PA_DECODE_BS:
+            return self.paged_attention_triton_plugin_mode
+        else:
+            if ATOM_USE_GLUON_PA_DECODE and num_decodes <= _GLM47_GLUON_PA_DECODE_BS:
+                return self.paged_attention_triton_plugin_mode
+            else:
+                return self.paged_attention_asm_plugin_mode
+
     def forward_impl_plugin_mode(
         self,
         layer: torch.nn.Module,
@@ -756,42 +766,18 @@ class PagedAttentionImplPluginModeMethods:
         if num_decodes > 0:
             assert attn_metadata.plugin_metadata.decode_metadata is not None
 
-            if self.use_triton_attn:
-                self.paged_attention_triton_plugin_mode(
-                    q=query[:num_decode_tokens],
-                    k_cache=new_key_cache,
-                    v_cache=new_value_cache,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                    num_decodes=num_decodes,
-                    out=output_actual_tokens[:num_decode_tokens],
-                    attn_metadata=attn_metadata,
-                )
-            else:
-                # Qwen only uses gluon pa decode when bs=64
-                if num_decodes == _QWEN_GLUON_PA_DECODE_BS:
-                    self.paged_attention_triton_plugin_mode(
-                        q=query[:num_decode_tokens],
-                        k_cache=new_key_cache,
-                        v_cache=new_value_cache,
-                        k_scale=k_scale,
-                        v_scale=v_scale,
-                        num_decodes=num_decodes,
-                        out=output_actual_tokens[:num_decode_tokens],
-                        attn_metadata=attn_metadata,
-                    )
-                else:
-                    self.paged_attention_asm_plugin_mode(
-                        q=query[:num_decode_tokens],
-                        k_cache=new_key_cache,
-                        v_cache=new_value_cache,
-                        k_scale=k_scale,
-                        v_scale=v_scale,
-                        num_decodes=num_decodes,
-                        num_decode_tokens=num_decode_tokens,
-                        out=output_actual_tokens[:num_decode_tokens],
-                        attn_metadata=attn_metadata,
-                    )
+            decode_backend_func = self._dispatch_decode_backend(num_decodes)
+
+            decode_backend_func(
+                q=query[:num_decode_tokens],
+                k_cache=new_key_cache,
+                v_cache=new_value_cache,
+                k_scale=k_scale,
+                v_scale=v_scale,
+                num_decodes=num_decodes,
+                out=output_actual_tokens[:num_decode_tokens],
+                attn_metadata=attn_metadata,
+            )
 
         output = output.view(-1, self.num_heads * self.head_dim)
 
@@ -808,6 +794,7 @@ def PagedAttentionImplDecoratorForPluginMode(cls):
         "extend_forward",
         "forward_impl_plugin_mode",
         "adopt_persistent_kernel",
+        "_dispatch_decode_backend",
     ]
 
     logger.info(
