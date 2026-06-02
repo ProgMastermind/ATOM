@@ -758,10 +758,6 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 or gfx.startswith("gfx12")
                 or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
             )
-        if self.use_triton:
-            from atom.model_ops.utils import has_triton_kernels
-
-            assert has_triton_kernels(), "triton_kernels is not installed"
 
         self.use_triton_backend = None
         if self.use_triton:
@@ -770,6 +766,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 "matmul_ogs",
                 "a8w4",
             ), f"ATOM_MOE_BACKEND={self.use_triton_backend} is not supported in Mxfp4MoEMethod, set ATOM_MOE_BACKEND to matmul_ogs or a8w4"
+            if self.use_triton_backend == "matmul_ogs":
+                from atom.model_ops.utils import has_triton_kernels
+
+                assert has_triton_kernels(), "triton_kernels is not installed"
 
     def create_weights(
         self,
