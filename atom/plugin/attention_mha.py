@@ -94,6 +94,7 @@ class PagedAttentionImplPluginModeMethods:
         # and the origin kv cache layout in fwd_args is not flash
 
         attn_metadata = attention_metadata
+        slot_mapping = attn_metadata.slot_mapping[: q.shape[0]]
 
         use_triton_attn = self.sliding_window != -1 or self.head_dim != 128
         # use_triton_attn = True
@@ -133,7 +134,7 @@ class PagedAttentionImplPluginModeMethods:
                     v_cache=new_value_cache,
                     k_scale=k_scale,
                     v_scale=v_scale,
-                    slot_mapping=attn_metadata.slot_mapping,
+                    slot_mapping=slot_mapping,
                     kv_cache_dtype=self.kv_cache_dtype,
                 )
                 # Reshape q, k for attention: [T, num_heads, head_dim]
@@ -158,7 +159,7 @@ class PagedAttentionImplPluginModeMethods:
                     pos_ids=position,
                     k_cache=new_key_cache,
                     v_cache=new_value_cache,
-                    slot_mapping=attn_metadata.slot_mapping,
+                    slot_mapping=slot_mapping,
                     kv_cache_dtype=(
                         "auto" if self.kv_cache_dtype == "bf16" else self.kv_cache_dtype
                     ),
@@ -174,7 +175,7 @@ class PagedAttentionImplPluginModeMethods:
                 v,
                 new_key_cache,
                 new_value_cache,
-                attn_metadata.slot_mapping,
+                slot_mapping,
                 position,
                 self.rotary_emb.cos_cache,
                 self.rotary_emb.sin_cache,
@@ -211,7 +212,7 @@ class PagedAttentionImplPluginModeMethods:
                     new_value_cache,
                     k_scale,
                     v_scale,
-                    attn_metadata.slot_mapping,
+                    slot_mapping,
                     asm_layout=asm_layout,
                 )
             else:
@@ -220,7 +221,7 @@ class PagedAttentionImplPluginModeMethods:
                     v,
                     new_key_cache,
                     new_value_cache,
-                    attn_metadata.slot_mapping,
+                    slot_mapping,
                     kv_cache_dtype="auto",
                     k_scale=None,
                     v_scale=None,
