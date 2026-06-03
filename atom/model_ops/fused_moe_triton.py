@@ -258,7 +258,7 @@ def triton_kernel_fused_experts(
                 apply_swiglu=True,
                 alpha=1.702,  # gpt-oss
                 limit=7.0,  # gpt-oss
-                add_residual=True,  # gpt-oss `(up + 1)`
+                swiglu_add_residual=True,  # gpt-oss `(up + 1)`
             )
             output_tensor = moe_gemm_a16w4(
                 interm_cache,

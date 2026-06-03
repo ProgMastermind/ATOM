@@ -1061,7 +1061,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
                 x_q_dtype = (
                     self.moe.a_quant_dtype
-                    if self.moe.a_quant_dtype == "fp8_e4m3"
+                    if self.moe.a_quant_dtype != "bf16"
                     else None
                 )
 
