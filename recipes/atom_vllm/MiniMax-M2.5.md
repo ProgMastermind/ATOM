@@ -19,7 +19,7 @@ The following matches the vLLM-ATOM OOT benchmark entry in `.github/benchmark/oo
 ```bash
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1
-
+export ATOM_USE_GLUON_PA_DECODE=1
 vllm serve MiniMaxAI/MiniMax-M2.5 \
     --host localhost \
     --port 8000 \
