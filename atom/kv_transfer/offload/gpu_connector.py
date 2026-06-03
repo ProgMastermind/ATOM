@@ -91,6 +91,7 @@ class ATOMKVByteCodec:
         self._tls = threading.local()
         self._native_stitch = None
         self._native_split = None
+        self._native_kv_staging = None
         if self.layout == "segment_indexed" and os.environ.get(
             "OFFLOAD_NATIVE_STITCH", "0"
         ).lower() not in ("0", "false", "no", "off"):
@@ -105,6 +106,20 @@ class ATOMKVByteCodec:
                     "ATOMKVByteCodec: native stitch unavailable; using torch stitch",
                     exc_info=True,
                 )
+        if self._device.type == "cuda" and os.environ.get(
+            "OFFLOAD_NATIVE_KV_STAGING", "0"
+        ).lower() not in ("0", "false", "no", "off"):
+            try:
+                from atom.kv_transfer.offload import native_kv_staging
+
+                native_kv_staging.load_extension()
+                self._native_kv_staging = native_kv_staging
+            except Exception:
+                logger.warning(
+                    "ATOMKVByteCodec: native KV staging unavailable; "
+                    "using chunk fallback",
+                    exc_info=True,
+                )
 
     @property
     def segments_per_block(self) -> int:
@@ -113,6 +128,10 @@ class ATOMKVByteCodec:
     @property
     def device(self) -> torch.device:
         return self._device
+
+    @property
+    def has_native_chunk_major_staging(self) -> bool:
+        return self._native_kv_staging is not None
 
     def copy_calls_for_blocks(self, nblocks: int) -> int:
         return int(nblocks) * len(self._segments)
@@ -197,6 +216,20 @@ class ATOMKVByteCodec:
                 f"[0, {self.num_blocks}); min={min_bid} max={max_bid}"
             )
         return normalized
+
+    def _normalize_block_id_groups(
+        self,
+        block_id_groups: list[list[int]],
+        *,
+        reject_repeated: bool,
+    ) -> tuple[list[list[int]], list[int], list[int]]:
+        groups = [
+            self._normalize_block_ids(list(block_ids)) for block_ids in block_id_groups
+        ]
+        flat = [bid for block_ids in groups for bid in block_ids]
+        if reject_repeated and len(set(flat)) != len(flat):
+            raise ValueError("ATOMKVByteCodec: duplicate block ids are not supported")
+        return groups, flat, [len(block_ids) for block_ids in groups]
 
     def _validate_host_buf(self, host_buf: torch.Tensor, nblocks: int) -> None:
         if host_buf.dtype != torch.uint8:
@@ -457,13 +490,11 @@ class ATOMKVByteCodec:
             with stream_ctx:
                 idx = torch.tensor(block_ids, dtype=torch.long, device=self._device)
                 bases = self._segment_bases(len(block_ids))
-                for seg, base, nb in zip(
-                    self._segments, bases, self._seg_block_bytes
-                ):
+                for seg, base, nb in zip(self._segments, bases, self._seg_block_bytes):
                     mat = self._segment_bytes_matrix(seg)
-                    dst = device_buf[
-                        base : base + len(block_ids) * nb
-                    ].reshape(len(block_ids), nb)
+                    dst = device_buf[base : base + len(block_ids) * nb].reshape(
+                        len(block_ids), nb
+                    )
                     torch.index_select(mat, 0, idx, out=dst)
 
     def device_buffer_to_gpu(
@@ -482,14 +513,94 @@ class ATOMKVByteCodec:
             with stream_ctx:
                 idx = torch.tensor(block_ids, dtype=torch.long, device=self._device)
                 bases = self._segment_bases(len(block_ids))
-                for seg, base, nb in zip(
-                    self._segments, bases, self._seg_block_bytes
-                ):
+                for seg, base, nb in zip(self._segments, bases, self._seg_block_bytes):
                     mat = self._segment_bytes_matrix(seg)
-                    src = device_buf[
-                        base : base + len(block_ids) * nb
-                    ].reshape(len(block_ids), nb)
+                    src = device_buf[base : base + len(block_ids) * nb].reshape(
+                        len(block_ids), nb
+                    )
                     mat.index_copy_(0, idx, src)
+
+    def gpu_to_chunk_major_device_buffer(
+        self,
+        device_buf: torch.Tensor,
+        block_id_groups: list[list[int]],
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Gather ATOM KV blocks into a chunk-major device staging buffer.
+
+        Layout is MemoryObj-compatible:
+        ``[chunk0: seg0 blocks | seg1 blocks | ...][chunk1: ...]``.
+        Native fused staging is used when available; otherwise this method
+        provides a reference implementation for tests and CPU fallback.
+        """
+        groups, flat_block_ids, chunk_block_counts = self._normalize_block_id_groups(
+            block_id_groups,
+            reject_repeated=True,
+        )
+        self._validate_device_buf(device_buf, len(flat_block_ids))
+        if not flat_block_ids:
+            return
+        with self._device_ctx():
+            stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
+            with stream_ctx:
+                if self._native_kv_staging is not None:
+                    self._native_kv_staging.fused_pack_chunk_major(
+                        self._segments,
+                        self._seg_block_bytes,
+                        chunk_block_counts,
+                        flat_block_ids,
+                        device_buf,
+                    )
+                    return
+
+                offset = 0
+                for block_ids in groups:
+                    nblocks = len(block_ids)
+                    chunk_nbytes = nblocks * self.bytes_per_block
+                    self.gpu_to_device_buffer(
+                        device_buf[offset : offset + chunk_nbytes],
+                        block_ids,
+                        stream=stream,
+                    )
+                    offset += chunk_nbytes
+
+    def chunk_major_device_buffer_to_gpu(
+        self,
+        device_buf: torch.Tensor,
+        block_id_groups: list[list[int]],
+        stream: torch.cuda.Stream | None = None,
+    ) -> None:
+        """Scatter a chunk-major device staging buffer into ATOM KV blocks."""
+        groups, flat_block_ids, chunk_block_counts = self._normalize_block_id_groups(
+            block_id_groups,
+            reject_repeated=True,
+        )
+        self._validate_device_buf(device_buf, len(flat_block_ids))
+        if not flat_block_ids:
+            return
+        with self._device_ctx():
+            stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
+            with stream_ctx:
+                if self._native_kv_staging is not None:
+                    self._native_kv_staging.fused_unpack_chunk_major(
+                        device_buf,
+                        self._segments,
+                        self._seg_block_bytes,
+                        chunk_block_counts,
+                        flat_block_ids,
+                    )
+                    return
+
+                offset = 0
+                for block_ids in groups:
+                    nblocks = len(block_ids)
+                    chunk_nbytes = nblocks * self.bytes_per_block
+                    self.device_buffer_to_gpu(
+                        device_buf[offset : offset + chunk_nbytes],
+                        block_ids,
+                        stream=stream,
+                    )
+                    offset += chunk_nbytes
 
 
 class _nullctx:

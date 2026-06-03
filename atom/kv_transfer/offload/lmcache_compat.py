@@ -129,6 +129,15 @@ class ATOMLMCacheGPUConnector:
         self.device = torch.device(codec.device)
         self._tls = threading.local()
 
+    def _set_last_fastpath(self, value: str) -> None:
+        self._tls.last_fastpath = value
+
+    def reset_fastpath(self) -> None:
+        self._set_last_fastpath("none")
+
+    def last_fastpath(self) -> str:
+        return getattr(self._tls, "last_fastpath", "unknown")
+
     def _use_cuda(self) -> bool:
         return self.device.type == "cuda"
 
@@ -180,6 +189,9 @@ class ATOMLMCacheGPUConnector:
                 state.host_tmp = torch.empty((nbytes,), dtype=torch.uint8)
         return state.host_tmp[:nbytes]
 
+    def _can_use_fused_chunk_major(self) -> bool:
+        return self._use_cuda() and self.codec.has_native_chunk_major_staging
+
     def _memory_tensor(self, memory_obj: Any, nbytes: int) -> torch.Tensor:
         tensor = getattr(memory_obj, "tensor", None)
         if tensor is None and hasattr(memory_obj, "get_tensor"):
@@ -192,7 +204,9 @@ class ATOMLMCacheGPUConnector:
                 f"got {tensor.dtype}"
             )
         if not tensor.is_contiguous():
-            raise RuntimeError("ATOM LMCache connector: MemoryObj tensor not contiguous")
+            raise RuntimeError(
+                "ATOM LMCache connector: MemoryObj tensor not contiguous"
+            )
         flat = tensor.reshape(-1)
         if int(flat.numel()) < int(nbytes):
             raise ValueError(
@@ -275,7 +289,6 @@ class ATOMLMCacheGPUConnector:
 
         slot = self._next_slot(state)
         device_buf = self._ensure_slot(slot, total_nbytes)
-        host_buf = self._ensure_host_tmp(state, total_nbytes)
         dst_tensors = [
             self._memory_tensor(
                 memory_obj,
@@ -288,6 +301,38 @@ class ATOMLMCacheGPUConnector:
             )
         ]
 
+        if self._can_use_fused_chunk_major():
+            self._set_last_fastpath("fused_chunk")
+            if slot.free_event_valid:
+                state.pack_stream.wait_event(slot.free_event)
+            with state.stream_ctx(state.pack_stream):
+                self.codec.gpu_to_chunk_major_device_buffer(
+                    device_buf,
+                    block_id_groups,
+                    stream=state.pack_stream,
+                )
+            slot.ready_event.record(state.pack_stream)
+            state.copy_stream.wait_event(slot.ready_event)
+            with state.stream_ctx(state.copy_stream):
+                offset = 0
+                for dst, block_count in zip(
+                    dst_tensors,
+                    chunk_block_counts,
+                    strict=True,
+                ):
+                    nbytes = block_count * self.codec.bytes_per_block
+                    dst.copy_(
+                        device_buf[offset : offset + nbytes],
+                        non_blocking=True,
+                    )
+                    offset += nbytes
+            slot.free_event.record(state.copy_stream)
+            slot.free_event_valid = True
+            state.copy_stream.synchronize()
+            return
+
+        self._set_last_fastpath("chunk")
+        host_buf = self._ensure_host_tmp(state, total_nbytes)
         if use_cuda:
             if slot.free_event_valid:
                 state.pack_stream.wait_event(slot.free_event)
@@ -338,7 +383,6 @@ class ATOMLMCacheGPUConnector:
 
         slot = self._next_slot(state)
         device_buf = self._ensure_slot(slot, total_nbytes)
-        host_buf = self._ensure_host_tmp(state, total_nbytes)
         src_tensors = [
             self._memory_tensor(
                 memory_obj,
@@ -350,8 +394,40 @@ class ATOMLMCacheGPUConnector:
                 strict=True,
             )
         ]
-        self.codec.stitch_chunk_buffers(host_buf, src_tensors, chunk_block_counts)
 
+        if self._can_use_fused_chunk_major():
+            self._set_last_fastpath("fused_chunk")
+            if slot.free_event_valid:
+                state.copy_stream.wait_event(slot.free_event)
+            with state.stream_ctx(state.copy_stream):
+                offset = 0
+                for src, block_count in zip(
+                    src_tensors,
+                    chunk_block_counts,
+                    strict=True,
+                ):
+                    nbytes = block_count * self.codec.bytes_per_block
+                    device_buf[offset : offset + nbytes].copy_(
+                        src,
+                        non_blocking=True,
+                    )
+                    offset += nbytes
+            slot.ready_event.record(state.copy_stream)
+            state.pack_stream.wait_event(slot.ready_event)
+            with state.stream_ctx(state.pack_stream):
+                self.codec.chunk_major_device_buffer_to_gpu(
+                    device_buf,
+                    block_id_groups,
+                    stream=state.pack_stream,
+                )
+            slot.free_event.record(state.pack_stream)
+            slot.free_event_valid = True
+            state.pack_stream.synchronize()
+            return
+
+        self._set_last_fastpath("chunk")
+        host_buf = self._ensure_host_tmp(state, total_nbytes)
+        self.codec.stitch_chunk_buffers(host_buf, src_tensors, chunk_block_counts)
         if use_cuda:
             if slot.free_event_valid:
                 state.copy_stream.wait_event(slot.free_event)

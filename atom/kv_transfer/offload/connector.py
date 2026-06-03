@@ -267,6 +267,24 @@ class LMCacheOffloadConnector(KVConnectorBase):
             "off",
         )
 
+    def _last_gpu_connector_fastpath(self) -> str:
+        gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
+        if gpu_connector is None or not hasattr(gpu_connector, "last_fastpath"):
+            return "unknown"
+        try:
+            return str(gpu_connector.last_fastpath())
+        except Exception:
+            return "unknown"
+
+    def _reset_gpu_connector_fastpath(self) -> None:
+        gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
+        if gpu_connector is None or not hasattr(gpu_connector, "reset_fastpath"):
+            return
+        try:
+            gpu_connector.reset_fastpath()
+        except Exception:
+            pass
+
     # -- copy daemon thread ----------------------------------------------
     def _do_load_req(self, req: LMCacheReqMeta) -> None:
         ls = req.load_spec
@@ -323,6 +341,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
         mask[:hbm] = False
 
         t_retrieve0 = time.perf_counter()
+        self._reset_gpu_connector_fastpath()
         ret_mask = self._engine.retrieve(
             torch.tensor(toks),
             mask=mask,
@@ -330,6 +349,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
             req_id=str(req.req_id),
         )
         retrieve_ms = (time.perf_counter() - t_retrieve0) * 1000
+        fastpath = self._last_gpu_connector_fastpath()
         self._lookup_unpin(req.req_id)
         loaded = bool(ret_mask[hbm:lmc].all().item()) if lmc > hbm else True
         with self._lock:
@@ -346,19 +366,22 @@ class LMCacheOffloadConnector(KVConnectorBase):
             hbm=hbm,
             lmc=lmc,
             retrieved=int(ret_mask.sum().item()),
+            fastpath=fastpath,
             retrieve_ms=f"{retrieve_ms:.2f}",
             total_ms=f"{total_ms:.2f}",
         )
         if self._profile_enabled():
             logger.info(
                 "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d "
-                "retrieved=%d status=%s retrieve_ms=%.2f total_ms=%.2f",
+                "retrieved=%d status=%s fastpath=%s retrieve_ms=%.2f "
+                "total_ms=%.2f",
                 getattr(self, "_rank", "?"),
                 req.req_id,
                 hbm,
                 lmc,
                 int(ret_mask.sum().item()),
                 "ok" if loaded else "miss",
+                fastpath,
                 retrieve_ms,
                 total_ms,
             )
@@ -396,6 +419,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
         mask[:skip] = False
 
         t_store0 = time.perf_counter()
+        self._reset_gpu_connector_fastpath()
         self._engine.store(
             torch.tensor(toks),
             mask=mask,
@@ -403,6 +427,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
             req_id=str(req.req_id),
         )
         store_ms = (time.perf_counter() - t_store0) * 1000
+        fastpath = self._last_gpu_connector_fastpath()
         with self._lock:
             self._done_save.add(req.req_id)
         total_ms = (time.perf_counter() - t_total0) * 1000
@@ -413,17 +438,19 @@ class LMCacheOffloadConnector(KVConnectorBase):
             status="ok",
             toks=len(toks),
             skip=skip,
+            fastpath=fastpath,
             store_ms=f"{store_ms:.2f}",
             total_ms=f"{total_ms:.2f}",
         )
         if self._profile_enabled():
             logger.info(
                 "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d skip=%d "
-                "store_ms=%.2f total_ms=%.2f",
+                "fastpath=%s store_ms=%.2f total_ms=%.2f",
                 getattr(self, "_rank", "?"),
                 req.req_id,
                 len(toks),
                 skip,
+                fastpath,
                 store_ms,
                 total_ms,
             )
