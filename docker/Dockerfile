@@ -360,8 +360,8 @@ RUN DEBIAN_FRONTEND=noninteractive dpkg -i --force-all /tmp/rccl/*.deb && \
 # (pip install -e creates egg-link automatically, no need to COPY them)
 COPY --from=build_aiter /app/aiter-test /app/aiter-test
 RUN cd /app/aiter-test && pip install -e . --no-build-isolation && \
-    pip show amd-aiter
-    pip show triton || true
+    pip show amd-aiter \
+    pip show triton || true \
     pip show amd-triton || true
 
 # RTL (rocm-trace-lite): lightweight GPU kernel profiler (~250KB, no build deps)
