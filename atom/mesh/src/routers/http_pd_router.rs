@@ -994,6 +994,7 @@ impl PDRouter {
                 error!(
                     decode_url = %decode.url(),
                     error = %e,
+                    error_debug = ?e,
                     "ATOM decode request failed"
                 );
                 decode.record_outcome(false);
