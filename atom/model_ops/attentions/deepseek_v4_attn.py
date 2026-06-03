@@ -1122,6 +1122,15 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         ss_buf = var["v4_meta_state_slot_groups"]
         ss_buf.np[:scheduled_bs] = state_slot_np
 
+        # CUDAGraph pad rows [scheduled_bs, bs): swa_write is captured with grid
+        # baked at bucket size `bs` and reads cu_seqlens_q/slot unmasked, so pad
+        # rows must be valid in the persistent GPU buffer (not just rows [0,
+        # scheduled_bs)). Flat-fill cu_seqlens_q (tok_n == 0 → kernel bails) and
+        # zero slot; the H2D below pushes the full [0, bs) extent.
+        if bs > scheduled_bs:
+            var["cu_seqlens_q"].np[scheduled_bs + 1 : bs + 1] = cu_seqlens_q_np[-1]
+            ss_buf.np[scheduled_bs:bs] = 0
+
         # ---- fire H2D on prep_stream ----
         # NB: this runs inside attn_metadata_builder.build(), BEFORE
         # set_forward_context() — can't read main_stream from the context yet.
@@ -1130,10 +1139,12 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         prep_stream.wait_stream(current_stream)
         with torch.cuda.stream(prep_stream):
             positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
-            cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(scheduled_bs + 1)
+            cu_seqlens_q_gpu = var["cu_seqlens_q"].copy_to_gpu(bs + 1)[
+                : scheduled_bs + 1
+            ]
             context_lens_gpu = var["context_lens"].copy_to_gpu(scheduled_bs)
             block_tables_gpu = var["block_tables"].copy_to_gpu(scheduled_bs)
-            state_slot_gpu = ss_buf.copy_to_gpu(scheduled_bs)
+            state_slot_gpu = ss_buf.copy_to_gpu(bs)[:scheduled_bs]
 
         # ---- CPU numpy work, overlapped with prep_stream H2D ----
         extend_lens_np = np.full(scheduled_bs, max_seqlen_q, dtype=np.int32)
