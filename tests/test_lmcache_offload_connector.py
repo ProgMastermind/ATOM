@@ -20,7 +20,6 @@ from atom.kv_transfer.offload.connector import (
     LMCacheOffloadConnector,
     LMCacheOffloadConnectorScheduler,
 )
-from atom.kv_transfer.offload import connector as offload_connector_mod
 from atom.kv_transfer.offload.gpu_connector import ATOMKVByteCodec
 from atom.kv_transfer.offload.lmcache_compat import (
     ATOMLMCacheGPUConnector,
@@ -63,112 +62,6 @@ def _scheduler() -> LMCacheOffloadConnectorScheduler:
     return sched
 
 
-@pytest.mark.parametrize("layout", ["segment", "segment_indexed"])
-def test_segment_major_codec_roundtrip_noncontiguous_blocks(monkeypatch, layout):
-    import torch
-
-    if not hasattr(torch, "arange"):
-        pytest.skip("real torch is unavailable")
-
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", layout)
-
-    original = {
-        "l0": SimpleNamespace(
-            k_cache=torch.arange(8 * 2 * 3, dtype=torch.uint8).reshape(8, 2, 3),
-            v_cache=(torch.arange(8 * 4, dtype=torch.uint8).reshape(8, 4) + 51),
-            k_scale=torch.arange(8, dtype=torch.uint8).reshape(8, 1) + 101,
-            v_scale=torch.arange(8, dtype=torch.uint8).reshape(8, 1) + 151,
-        ),
-        "l1": SimpleNamespace(
-            k_cache=(torch.arange(8 * 3, dtype=torch.uint8).reshape(8, 3) + 201),
-            v_cache=(torch.arange(8 * 2, dtype=torch.uint8).reshape(8, 2) + 31),
-            k_scale=None,
-            v_scale=None,
-        ),
-    }
-    kv_caches = {
-        name: SimpleNamespace(
-            k_cache=layer.k_cache.clone(),
-            v_cache=layer.v_cache.clone(),
-            k_scale=layer.k_scale.clone() if layer.k_scale is not None else None,
-            v_scale=layer.v_scale.clone() if layer.v_scale is not None else None,
-        )
-        for name, layer in original.items()
-    }
-
-    codec = ATOMKVByteCodec(kv_caches)
-    block_ids = [1, 2, 4, 6, 7]
-    host = torch.empty(len(block_ids) * codec.bytes_per_block, dtype=torch.uint8)
-
-    codec.gpu_to_host(host, block_ids)
-    expected_calls = codec.segments_per_block * (3 if layout == "segment" else 2)
-    assert codec.copy_calls_for_block_ids(block_ids) == expected_calls
-
-    for layer in kv_caches.values():
-        layer.k_cache.zero_()
-        layer.v_cache.zero_()
-        if layer.k_scale is not None:
-            layer.k_scale.zero_()
-        if layer.v_scale is not None:
-            layer.v_scale.zero_()
-
-    codec.host_to_gpu(host, block_ids)
-
-    for name, layer in kv_caches.items():
-        src = original[name]
-        for bid in block_ids:
-            assert torch.equal(layer.k_cache[bid], src.k_cache[bid])
-            assert torch.equal(layer.v_cache[bid], src.v_cache[bid])
-            if layer.k_scale is not None:
-                assert torch.equal(layer.k_scale[bid], src.k_scale[bid])
-            if layer.v_scale is not None:
-                assert torch.equal(layer.v_scale[bid], src.v_scale[bid])
-
-
-def test_segment_indexed_stitches_chunk_buffers(monkeypatch):
-    import torch
-
-    if not hasattr(torch, "arange"):
-        pytest.skip("real torch is unavailable")
-
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
-    kv_caches = {
-        "l0": SimpleNamespace(
-            k_cache=torch.arange(8 * 2 * 3, dtype=torch.uint8).reshape(8, 2, 3),
-            v_cache=(torch.arange(8 * 4, dtype=torch.uint8).reshape(8, 4) + 51),
-            k_scale=torch.arange(8, dtype=torch.uint8).reshape(8, 1) + 101,
-            v_scale=torch.arange(8, dtype=torch.uint8).reshape(8, 1) + 151,
-        ),
-        "l1": SimpleNamespace(
-            k_cache=(torch.arange(8 * 3, dtype=torch.uint8).reshape(8, 3) + 201),
-            v_cache=(torch.arange(8 * 2, dtype=torch.uint8).reshape(8, 2) + 31),
-            k_scale=None,
-            v_scale=None,
-        ),
-    }
-    codec = ATOMKVByteCodec(kv_caches)
-    chunks = [[1, 2], [4], [6, 7]]
-    flat_ids = [bid for bids in chunks for bid in bids]
-    direct = torch.empty(len(flat_ids) * codec.bytes_per_block, dtype=torch.uint8)
-    codec.gpu_to_host(direct, flat_ids)
-
-    chunk_buffers = []
-    for bids in chunks:
-        host = torch.empty(len(bids) * codec.bytes_per_block, dtype=torch.uint8)
-        codec.gpu_to_host(host, bids)
-        chunk_buffers.append(host)
-
-    stitched = torch.empty_like(direct)
-    codec.stitch_chunk_buffers(stitched, chunk_buffers, [len(b) for b in chunks])
-
-    assert torch.equal(stitched, direct)
-
-    split_buffers = [torch.empty_like(buf) for buf in chunk_buffers]
-    codec.split_request_buffer(stitched, split_buffers, [len(b) for b in chunks])
-    for actual, expected in zip(split_buffers, chunk_buffers):
-        assert torch.equal(actual, expected)
-
-
 def test_raw_bytes_metadata_shapes_are_block_rounded():
     import torch
 
@@ -205,13 +98,12 @@ def test_raw_bytes_metadata_rejects_unaligned_chunk_size():
         )
 
 
-def test_codec_device_buffer_roundtrip_noncontiguous_blocks(monkeypatch):
+def test_codec_device_buffer_roundtrip_noncontiguous_blocks():
     import torch
 
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "block")
     original = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(8 * 2 * 3, dtype=torch.uint8).reshape(8, 2, 3),
@@ -257,13 +149,12 @@ def test_codec_device_buffer_roundtrip_noncontiguous_blocks(monkeypatch):
             assert torch.equal(layer.v_cache[bid], src.v_cache[bid])
 
 
-def test_lmcache_connector_maps_token_ranges_to_block_ids(monkeypatch):
+def test_lmcache_connector_maps_token_ranges_to_block_ids():
     import torch
 
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "block")
     original = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
@@ -317,7 +208,6 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "2")
     original = {
         "l0": SimpleNamespace(
@@ -477,7 +367,6 @@ def test_lmcache_connector_fallback_staging_is_chunk_bounded(monkeypatch):
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
     original = {
         "l0": SimpleNamespace(
@@ -564,7 +453,6 @@ def test_lmcache_connector_release_covers_fallback_chunks(monkeypatch):
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
     monkeypatch.setenv("OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER", "1")
     kv_caches = {
@@ -599,13 +487,12 @@ def test_lmcache_connector_release_covers_fallback_chunks(monkeypatch):
     assert all(slot.tensor is None for slot in state.slots)
 
 
-def test_lmcache_connector_rejects_oversized_memory_obj(monkeypatch):
+def test_lmcache_connector_rejects_oversized_memory_obj():
     import torch
 
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
     kv_caches = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
@@ -635,7 +522,6 @@ def test_lmcache_connector_respects_staging_slot_env(monkeypatch):
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_SLOTS", "2")
     monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "3")
     kv_caches = {
@@ -661,7 +547,6 @@ def test_lmcache_connector_default_staging_group_chunks_is_two(monkeypatch):
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
     monkeypatch.delenv("OFFLOAD_GPU_STAGING_CHUNKS", raising=False)
     monkeypatch.delenv("OFFLOAD_GPU_STAGING_MAX_BYTES", raising=False)
     kv_caches = {
@@ -679,13 +564,12 @@ def test_lmcache_connector_default_staging_group_chunks_is_two(monkeypatch):
     assert connector.gpu_staging_capacity_bytes == 2 * connector.gpu_staging_chunk_bytes
 
 
-def test_codec_chunk_major_device_buffer_layout(monkeypatch):
+def test_codec_chunk_major_device_buffer_layout():
     import torch
 
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
     original = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
@@ -730,13 +614,12 @@ def test_codec_chunk_major_device_buffer_layout(monkeypatch):
     assert torch.equal(kv_caches["l0"].v_cache, original["l0"].v_cache)
 
 
-def test_codec_chunk_major_handles_tail_and_sparse_blocks(monkeypatch):
+def test_codec_chunk_major_handles_tail_and_sparse_blocks():
     import torch
 
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
     original = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
@@ -785,13 +668,12 @@ def test_codec_chunk_major_handles_tail_and_sparse_blocks(monkeypatch):
                 assert torch.equal(layer.k_scale[bid], src.k_scale[bid])
 
 
-def test_codec_chunk_major_rejects_duplicate_block_ids(monkeypatch):
+def test_codec_chunk_major_rejects_duplicate_block_ids():
     import torch
 
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
     kv_caches = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
@@ -805,102 +687,6 @@ def test_codec_chunk_major_rejects_duplicate_block_ids(monkeypatch):
 
     with pytest.raises(ValueError, match="duplicate block ids"):
         codec.gpu_to_chunk_major_device_buffer(device_buf, [[0, 1], [1]])
-
-
-@pytest.mark.parametrize("layout", ["block", "segment", "segment_indexed"])
-@pytest.mark.parametrize("method_name", ["gpu_to_host", "host_to_gpu"])
-def test_codec_rejects_invalid_block_ids_before_copy(monkeypatch, layout, method_name):
-    import torch
-
-    if not hasattr(torch, "arange"):
-        pytest.skip("real torch is unavailable")
-
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", layout)
-    kv_caches = {
-        "l0": SimpleNamespace(
-            k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
-            v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
-            k_scale=None,
-            v_scale=None,
-        ),
-    }
-    codec = ATOMKVByteCodec(kv_caches)
-    host = torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
-    method = getattr(codec, method_name)
-
-    with pytest.raises(ValueError, match="block id out of range"):
-        method(host, [0, 4])
-
-    with pytest.raises(ValueError, match="block id out of range"):
-        method(host, [-1])
-
-
-def test_codec_rejects_short_host_buffer(monkeypatch):
-    import torch
-
-    if not hasattr(torch, "arange"):
-        pytest.skip("real torch is unavailable")
-
-    monkeypatch.setenv("OFFLOAD_CODEC_LAYOUT", "segment_indexed")
-    kv_caches = {
-        "l0": SimpleNamespace(
-            k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
-            v_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
-            k_scale=None,
-            v_scale=None,
-        ),
-    }
-    codec = ATOMKVByteCodec(kv_caches)
-    host = torch.empty(codec.bytes_per_block - 1, dtype=torch.uint8)
-
-    with pytest.raises(ValueError, match="host_buf is too small"):
-        codec.gpu_to_host(host, [0])
-
-
-def test_copy_stream_is_cached_per_codec_device(monkeypatch):
-    import torch
-
-    if not hasattr(torch, "device") or not hasattr(torch, "cuda"):
-        pytest.skip("torch cuda API is unavailable")
-
-    conn = LMCacheOffloadConnector.__new__(LMCacheOffloadConnector)
-    conn._tls = threading.local()
-    conn._codec = SimpleNamespace(device=torch.device("cuda:1"))
-    active_devices = []
-    created_on = []
-
-    class _FakeDeviceCtx:
-        def __init__(self, device) -> None:
-            self.device = str(device)
-
-        def __enter__(self):
-            active_devices.append(self.device)
-            return None
-
-        def __exit__(self, *args):
-            active_devices.pop()
-            return False
-
-    class _FakeStream:
-        def __init__(self) -> None:
-            created_on.append(active_devices[-1] if active_devices else "default")
-
-    monkeypatch.setattr(
-        offload_connector_mod.torch.cuda,
-        "device",
-        lambda device: _FakeDeviceCtx(device),
-    )
-    monkeypatch.setattr(offload_connector_mod.torch.cuda, "Stream", _FakeStream)
-
-    rank1_stream = conn._stream()
-    assert conn._stream() is rank1_stream
-    assert created_on == ["cuda:1"]
-
-    conn._codec = SimpleNamespace(device=torch.device("cuda:0"))
-    rank0_stream = conn._stream()
-
-    assert rank0_stream is not rank1_stream
-    assert created_on == ["cuda:1", "cuda:0"]
 
 
 def test_full_prompt_hit_is_clamped_before_load_spec():

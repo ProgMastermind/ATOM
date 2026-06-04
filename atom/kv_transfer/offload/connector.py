@@ -87,15 +87,12 @@ class LMCacheOffloadConnector(KVConnectorBase):
         self._save_executor = ThreadPoolExecutor(
             max_workers=n_save_workers, thread_name_prefix="lmc-offload-save"
         )
-        self._tls = threading.local()  # per-thread copy stream
         self._lock = threading.Lock()
         self._done_load: set[ReqId] = set()
         self._done_save: set[ReqId] = set()
         self._failed_load: set[ReqId] = set()
 
         self._engine = None
-        self._sm = None
-        self._tdb = None
         self._codec: ATOMKVByteCodec | None = None
         self._lookup_server = None
 
@@ -140,8 +137,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
         # opaque uint8 object, so keep a supported tensor MemoryFormat.
         self._engine.fmt = MemoryFormat.KV_2LTD
         self._engine.post_init()
-        self._sm = self._engine.storage_manager
-        self._tdb = self._engine.token_database
 
         # DEBUG: wrap engine.lookup to capture EVERY call (incl. the ones the ZMQ
         # lookup_server makes on behalf of the scheduler) — args + result.
@@ -182,7 +177,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
             rank,
             self._codec.bytes_per_block,
             self.chunk_size,
-            self._codec.layout,
+            "chunk_major",
             gpu_connector.staging_slots,
             gpu_connector.gpu_staging_chunk_bytes,
             gpu_connector.gpu_staging_group_chunks,
@@ -242,34 +237,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
             self._engine.lookup_unpin([str(req_id)])  # LMCache pin keyed by str id
         except Exception:
             pass
-
-    def _copy_device(self) -> torch.device | None:
-        codec = getattr(self, "_codec", None)
-        device = getattr(codec, "device", None)
-        if device is None:
-            return None
-        device = torch.device(device)
-        if device.type != "cuda":
-            return None
-        return device
-
-    def _stream(self) -> torch.cuda.Stream:
-        """A CUDA stream owned by the calling copy-daemon thread and device."""
-        device = self._copy_device()
-        key = str(device) if device is not None else "default"
-        streams = getattr(self._tls, "streams", None)
-        if streams is None:
-            streams = {}
-            self._tls.streams = streams
-        s = streams.get(key)
-        if s is None:
-            if device is None:
-                s = torch.cuda.Stream()
-            else:
-                with torch.cuda.device(device):
-                    s = torch.cuda.Stream()
-            streams[key] = s
-        return s
 
     def _profile_enabled(self) -> bool:
         return os.environ.get("OFFLOAD_PROFILE", "1").lower() not in (
