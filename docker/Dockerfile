@@ -295,7 +295,7 @@ RUN pip install --upgrade pip && \
 # Stage 1: MORI — parallel
 # --------------------------------------------------------------------
 FROM base AS build_mori
-ARG MORI_COMMIT="v1.1.0"
+ARG MORI_COMMIT="e94694c79ad1ff78ca8cfeefccad0bcda2a24c95"
 
 RUN echo "========== [Parallel] Building MORI ==========" && \
     git clone https://github.com/ROCm/mori.git /app/mori && \
