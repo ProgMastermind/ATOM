@@ -78,18 +78,25 @@ class ATOMKVByteCodec:
             int(t[0].numel()) * t.element_size() for t in self._segments
         ]
         self.bytes_per_block: int = sum(self._seg_block_bytes)
-        self._native_kv_staging = None
-        if self._device.type == "cuda" and os.environ.get(
-            "OFFLOAD_NATIVE_KV_STAGING", "0"
-        ).lower() not in ("0", "false", "no", "off"):
+        self._fused_kv_staging = None
+        fused_env = os.environ.get(
+            "OFFLOAD_FUSED_KV_STAGING",
+            os.environ.get("OFFLOAD_NATIVE_KV_STAGING", "0"),
+        )
+        if self._device.type == "cuda" and fused_env.lower() not in (
+            "0",
+            "false",
+            "no",
+            "off",
+        ):
             try:
-                from atom.kv_transfer.offload import native_kv_staging
+                from atom.kv_transfer.offload import triton_kv_staging
 
-                native_kv_staging.load_extension()
-                self._native_kv_staging = native_kv_staging
+                triton_kv_staging.load_extension()
+                self._fused_kv_staging = triton_kv_staging
             except Exception:
                 logger.warning(
-                    "ATOMKVByteCodec: native KV staging unavailable; "
+                    "ATOMKVByteCodec: Triton KV staging unavailable; "
                     "using chunk fallback",
                     exc_info=True,
                 )
@@ -99,8 +106,8 @@ class ATOMKVByteCodec:
         return self._device
 
     @property
-    def has_native_chunk_major_staging(self) -> bool:
-        return self._native_kv_staging is not None
+    def has_fused_chunk_major_staging(self) -> bool:
+        return self._fused_kv_staging is not None
 
     # -- helpers ----------------------------------------------------------
     def _segment_bases(self, nblocks: int) -> list[int]:
@@ -231,7 +238,7 @@ class ATOMKVByteCodec:
 
         Layout is MemoryObj-compatible:
         ``[chunk0: seg0 blocks | seg1 blocks | ...][chunk1: ...]``.
-        Native fused staging is used when available; otherwise this method
+        Fused Triton staging is used when available; otherwise this method
         provides a reference implementation for tests and CPU fallback.
         """
         groups, flat_block_ids, chunk_block_counts = self._normalize_block_id_groups(
@@ -244,8 +251,8 @@ class ATOMKVByteCodec:
         with self._device_ctx():
             stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
             with stream_ctx:
-                if self._native_kv_staging is not None:
-                    self._native_kv_staging.fused_pack_chunk_major(
+                if self._fused_kv_staging is not None:
+                    self._fused_kv_staging.fused_pack_chunk_major(
                         self._segments,
                         self._seg_block_bytes,
                         chunk_block_counts,
@@ -282,8 +289,8 @@ class ATOMKVByteCodec:
         with self._device_ctx():
             stream_ctx = torch.cuda.stream(stream) if stream is not None else _nullctx()
             with stream_ctx:
-                if self._native_kv_staging is not None:
-                    self._native_kv_staging.fused_unpack_chunk_major(
+                if self._fused_kv_staging is not None:
+                    self._fused_kv_staging.fused_unpack_chunk_major(
                         device_buf,
                         self._segments,
                         self._seg_block_bytes,

@@ -254,7 +254,7 @@ class ATOMLMCacheGPUConnector:
         return state.host_tmp[:nbytes]
 
     def _can_use_fused_chunk_major(self) -> bool:
-        return self._use_cuda() and self.codec.has_native_chunk_major_staging
+        return self._use_cuda() and self.codec.has_fused_chunk_major_staging
 
     def _memory_tensor(self, memory_obj: Any, nbytes: int) -> torch.Tensor:
         tensor = getattr(memory_obj, "tensor", None)
