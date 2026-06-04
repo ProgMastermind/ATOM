@@ -1094,7 +1094,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             # Takes directly from model dtype in config.json
             x_q_dtype = (
-                self.moe.a_quant_dtype if self.moe.a_quant_dtype == "fp8_e4m3" else None
+                self.moe.a_quant_dtype if self.moe.a_quant_dtype != "bf16" else None
             )
 
             return triton_kernel_moe_forward(
