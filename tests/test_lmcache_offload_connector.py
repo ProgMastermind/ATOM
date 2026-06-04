@@ -153,7 +153,7 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    original = {
+    kv_caches = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(6 * 2, dtype=torch.uint8).reshape(6, 2),
             v_cache=(torch.arange(6 * 3, dtype=torch.uint8).reshape(6, 3) + 51),
@@ -161,41 +161,25 @@ def test_lmcache_connector_maps_token_ranges_to_block_ids():
             v_scale=None,
         )
     }
-    kv_caches = {
-        "l0": SimpleNamespace(
-            k_cache=original["l0"].k_cache.clone(),
-            v_cache=original["l0"].v_cache.clone(),
-            k_scale=None,
-            v_scale=None,
-        )
-    }
     codec = ATOMKVByteCodec(kv_caches)
     connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
-    memory_obj = SimpleNamespace(
-        tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
-    )
 
-    connector.batched_from_gpu(
-        [memory_obj],
+    assert connector._ranges_to_block_ids(
         [4],
         [12],
         block_ids=[0, 1, 2, 3, 4, 5],
-    )
-
-    kv_caches["l0"].k_cache.zero_()
-    kv_caches["l0"].v_cache.zero_()
-    connector.batched_to_gpu(
-        [memory_obj],
-        [4],
-        [12],
+    ) == [[1, 2]]
+    assert connector._ranges_to_block_ids(
+        [0, 8],
+        [8, 16],
         block_ids=[0, 1, 2, 3, 4, 5],
-    )
-
-    for bid in [1, 2]:
-        assert torch.equal(kv_caches["l0"].k_cache[bid], original["l0"].k_cache[bid])
-        assert torch.equal(kv_caches["l0"].v_cache[bid], original["l0"].v_cache[bid])
-    assert torch.count_nonzero(kv_caches["l0"].k_cache[0]) == 0
-    assert torch.count_nonzero(kv_caches["l0"].v_cache[0]) == 0
+    ) == [[0, 1], [2, 3]]
+    with pytest.raises(ValueError, match="block-aligned"):
+        connector._ranges_to_block_ids(
+            [2],
+            [8],
+            block_ids=[0, 1, 2, 3, 4, 5],
+        )
 
 
 def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
@@ -323,7 +307,6 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
             original["l0"].v_cache[[3]].reshape(-1),
         ]
     )
-    assert connector.last_fastpath() == "fused_chunk"
     transfer_stats = connector.last_transfer_stats()
     assert transfer_stats["chunks"] == 2
     assert transfer_stats["groups"] == 1
@@ -350,7 +333,6 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
         block_ids=[0, 1, 2, 3, 4, 5],
     )
 
-    assert connector.last_fastpath() == "fused_chunk"
     assert unpack_groups == [[[1, 2], [3]]]
     for bid in [1, 2, 3]:
         assert torch.equal(kv_caches["l0"].k_cache[bid], original["l0"].k_cache[bid])
@@ -359,100 +341,12 @@ def test_lmcache_connector_fused_chunk_fastpath_uses_chunk_major(monkeypatch):
     assert torch.count_nonzero(kv_caches["l0"].v_cache[0]) == 0
 
 
-def test_lmcache_connector_fallback_staging_is_chunk_bounded(monkeypatch):
+def test_lmcache_connector_requires_fused_chunk_major_staging():
     import torch
 
     if not hasattr(torch, "arange"):
         pytest.skip("real torch is unavailable")
 
-    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
-    original = {
-        "l0": SimpleNamespace(
-            k_cache=torch.arange(8 * 2, dtype=torch.uint8).reshape(8, 2),
-            v_cache=(torch.arange(8 * 3, dtype=torch.uint8).reshape(8, 3) + 51),
-            k_scale=None,
-            v_scale=None,
-        )
-    }
-    kv_caches = {
-        "l0": SimpleNamespace(
-            k_cache=original["l0"].k_cache.clone(),
-            v_cache=original["l0"].v_cache.clone(),
-            k_scale=None,
-            v_scale=None,
-        )
-    }
-    codec = ATOMKVByteCodec(kv_caches)
-    connector = ATOMLMCacheGPUConnector(codec, block_size=4, chunk_size=8)
-    cap = 2 * codec.bytes_per_block
-    slot_requests = []
-    host_requests = []
-    orig_ensure_slot = connector._ensure_slot
-    orig_ensure_host_tmp = connector._ensure_host_tmp
-
-    def _ensure_slot(slot, nbytes):
-        device_buf = orig_ensure_slot(slot, nbytes)
-        slot_requests.append((nbytes, int(slot.tensor.numel())))
-        return device_buf
-
-    def _ensure_host_tmp(state, nbytes):
-        host_buf = orig_ensure_host_tmp(state, nbytes)
-        host_requests.append((nbytes, int(state.host_tmp.numel())))
-        return host_buf
-
-    monkeypatch.setattr(connector, "_ensure_slot", _ensure_slot)
-    monkeypatch.setattr(connector, "_ensure_host_tmp", _ensure_host_tmp)
-    memory_objs = [
-        SimpleNamespace(
-            tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
-        ),
-        SimpleNamespace(
-            tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
-        ),
-        SimpleNamespace(
-            tensor=torch.empty(1 * codec.bytes_per_block, dtype=torch.uint8)
-        ),
-    ]
-
-    connector.batched_from_gpu(
-        memory_objs,
-        [0, 8, 16],
-        [8, 16, 20],
-        block_ids=list(range(8)),
-    )
-
-    assert connector.last_fastpath() == "chunk"
-    assert connector.last_transfer_stats()["chunks"] == 3
-    assert connector.last_transfer_stats()["max_chunk_bytes"] == cap
-    assert all(nbytes <= cap for nbytes, _ in slot_requests)
-    assert all(capacity == cap for _, capacity in slot_requests)
-    assert all(nbytes <= cap for nbytes, _ in host_requests)
-    assert all(capacity == cap for _, capacity in host_requests)
-
-    kv_caches["l0"].k_cache.zero_()
-    kv_caches["l0"].v_cache.zero_()
-    connector.batched_to_gpu(
-        memory_objs,
-        [0, 8, 16],
-        [8, 16, 20],
-        block_ids=list(range(8)),
-    )
-
-    for bid in range(5):
-        assert torch.equal(kv_caches["l0"].k_cache[bid], original["l0"].k_cache[bid])
-        assert torch.equal(kv_caches["l0"].v_cache[bid], original["l0"].v_cache[bid])
-    assert torch.count_nonzero(kv_caches["l0"].k_cache[5]) == 0
-    assert torch.count_nonzero(kv_caches["l0"].v_cache[5]) == 0
-
-
-def test_lmcache_connector_release_covers_fallback_chunks(monkeypatch):
-    import torch
-
-    if not hasattr(torch, "arange"):
-        pytest.skip("real torch is unavailable")
-
-    monkeypatch.setenv("OFFLOAD_GPU_STAGING_CHUNKS", "1")
-    monkeypatch.setenv("OFFLOAD_RELEASE_GPU_STAGING_AFTER_TRANSFER", "1")
     kv_caches = {
         "l0": SimpleNamespace(
             k_cache=torch.arange(4 * 2, dtype=torch.uint8).reshape(4, 2),
@@ -466,23 +360,16 @@ def test_lmcache_connector_release_covers_fallback_chunks(monkeypatch):
     memory_objs = [
         SimpleNamespace(
             tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
-        ),
-        SimpleNamespace(
-            tensor=torch.empty(2 * codec.bytes_per_block, dtype=torch.uint8)
-        ),
+        )
     ]
 
-    connector.batched_from_gpu(
-        memory_objs,
-        [0, 8],
-        [8, 16],
-        block_ids=list(range(4)),
-    )
-
-    state = connector._thread_state()
-    assert state.host_tmp is not None
-    assert int(state.host_tmp.numel()) == 2 * codec.bytes_per_block
-    assert all(slot.tensor is None for slot in state.slots)
+    with pytest.raises(RuntimeError, match="requires Triton fused"):
+        connector.batched_from_gpu(
+            memory_objs,
+            [0],
+            [8],
+            block_ids=list(range(4)),
+        )
 
 
 def test_lmcache_connector_rejects_oversized_memory_obj():

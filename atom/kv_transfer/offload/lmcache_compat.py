@@ -122,9 +122,6 @@ class ATOMLMCacheGPUConnector:
     def release_gpu_staging_after_transfer(self) -> bool:
         return self._release_gpu_staging_after_transfer
 
-    def _set_last_fastpath(self, value: str) -> None:
-        self._tls.last_fastpath = value
-
     def _set_last_transfer_stats(
         self,
         *,
@@ -158,12 +155,8 @@ class ATOMLMCacheGPUConnector:
             "effective_gbps": float(effective_gbps),
         }
 
-    def reset_fastpath(self) -> None:
-        self._set_last_fastpath("none")
+    def reset_transfer_stats(self) -> None:
         self._set_last_transfer_stats()
-
-    def last_fastpath(self) -> str:
-        return getattr(self._tls, "last_fastpath", "unknown")
 
     def last_transfer_stats(self) -> dict[str, int | float]:
         return dict(getattr(self._tls, "last_transfer_stats", {}))
@@ -218,43 +211,17 @@ class ATOMLMCacheGPUConnector:
         slot.tensor = None
         slot.free_event_valid = False
 
-    def _ensure_host_tmp(
-        self,
-        state: _ThreadTransferState,
-        nbytes: int,
-    ) -> torch.Tensor:
-        nbytes = int(nbytes)
-        if nbytes > self._gpu_staging_capacity_bytes:
-            raise RuntimeError(
-                "ATOM LMCache connector internal error: transfer group exceeds "
-                "bounded host staging capacity: "
-                f"nbytes={nbytes}, capacity={self._gpu_staging_capacity_bytes}"
-            )
-        if (
-            state.host_tmp is None
-            or int(state.host_tmp.numel()) != self._gpu_staging_capacity_bytes
-        ):
-            if state.use_cuda:
-                try:
-                    state.host_tmp = torch.empty(
-                        (self._gpu_staging_capacity_bytes,),
-                        dtype=torch.uint8,
-                        pin_memory=True,
-                    )
-                except RuntimeError:
-                    state.host_tmp = torch.empty(
-                        (self._gpu_staging_capacity_bytes,),
-                        dtype=torch.uint8,
-                    )
-            else:
-                state.host_tmp = torch.empty(
-                    (self._gpu_staging_capacity_bytes,),
-                    dtype=torch.uint8,
-                )
-        return state.host_tmp[:nbytes]
-
     def _can_use_fused_chunk_major(self) -> bool:
         return self._use_cuda() and self.codec.has_fused_chunk_major_staging
+
+    def _require_fused_chunk_major(self) -> None:
+        if self._can_use_fused_chunk_major():
+            return
+        raise RuntimeError(
+            "ATOM LMCache connector requires Triton fused chunk-major staging; "
+            "set OFFLOAD_FUSED_KV_STAGING=1 and ensure the Triton staging "
+            "kernel loads successfully"
+        )
 
     def _memory_tensor(self, memory_obj: Any, nbytes: int) -> torch.Tensor:
         tensor = getattr(memory_obj, "tensor", None)
@@ -456,113 +423,50 @@ class ATOMLMCacheGPUConnector:
             return
 
         state = self._thread_state()
-        use_cuda = state.use_cuda
         chunks = self._iter_transfer_chunks(memory_objs, block_id_groups)
         groups = self._iter_transfer_groups(chunks)
         self._record_transfer_stats(chunks, groups)
         if not chunks:
             return
 
-        if self._can_use_fused_chunk_major():
-            self._set_last_fastpath("fused_chunk")
-            used_slots: list[_StagingSlot] = []
-            pack_ms = 0.0
-            copy_ms = 0.0
-            sync_ms = 0.0
-            t_total0 = time.perf_counter()
-            try:
-                for group in groups:
-                    slot = self._next_slot(state)
-                    self._remember_slot(used_slots, slot)
-                    device_buf = self._ensure_slot(slot, group.nbytes)
-                    if slot.free_event_valid:
-                        state.pack_stream.wait_event(slot.free_event)
-                    t0 = time.perf_counter()
-                    with state.stream_ctx(state.pack_stream):
-                        self.codec.gpu_to_chunk_major_device_buffer(
-                            device_buf,
-                            self._group_block_ids(group),
-                            stream=state.pack_stream,
-                        )
-                    pack_ms += (time.perf_counter() - t0) * 1000
-                    slot.ready_event.record(state.pack_stream)
-                    state.copy_stream.wait_event(slot.ready_event)
-                    t0 = time.perf_counter()
-                    with state.stream_ctx(state.copy_stream):
-                        self._slice_to_memory_objs(group, device_buf)
-                    copy_ms += (time.perf_counter() - t0) * 1000
-                    slot.free_event.record(state.copy_stream)
-                    slot.free_event_valid = True
-                t0 = time.perf_counter()
-                state.copy_stream.synchronize()
-                sync_ms += (time.perf_counter() - t0) * 1000
-            except Exception:
-                for slot in used_slots:
-                    slot.free_event_valid = False
-                raise
-            finally:
-                self._release_slots_if_requested(used_slots)
-            self._record_transfer_stats(
-                chunks,
-                groups,
-                pack_ms=pack_ms,
-                copy_ms=copy_ms,
-                sync_ms=sync_ms,
-                transfer_ms=(time.perf_counter() - t_total0) * 1000,
-            )
-            return
-
-        self._set_last_fastpath("chunk")
+        self._require_fused_chunk_major()
+        used_slots: list[_StagingSlot] = []
         pack_ms = 0.0
         copy_ms = 0.0
         sync_ms = 0.0
         t_total0 = time.perf_counter()
-        used_slots: list[_StagingSlot] = []
-        for group in groups:
-            slot = self._next_slot(state)
-            self._remember_slot(used_slots, slot)
-            device_buf = self._ensure_slot(slot, group.nbytes)
-            host_buf = self._ensure_host_tmp(state, group.nbytes)
-            try:
-                if use_cuda:
-                    if slot.free_event_valid:
-                        state.pack_stream.wait_event(slot.free_event)
-                    t0 = time.perf_counter()
-                    with state.stream_ctx(state.pack_stream):
-                        self.codec.gpu_to_chunk_major_device_buffer(
-                            device_buf,
-                            self._group_block_ids(group),
-                            stream=state.pack_stream,
-                        )
-                    pack_ms += (time.perf_counter() - t0) * 1000
-                    slot.ready_event.record(state.pack_stream)
-                    state.copy_stream.wait_event(slot.ready_event)
-                    t0 = time.perf_counter()
-                    with state.stream_ctx(state.copy_stream):
-                        host_buf.copy_(device_buf, non_blocking=True)
-                    copy_ms += (time.perf_counter() - t0) * 1000
-                    slot.free_event.record(state.copy_stream)
-                    slot.free_event_valid = True
-                    t0 = time.perf_counter()
-                    state.copy_stream.synchronize()
-                    sync_ms += (time.perf_counter() - t0) * 1000
-                else:
-                    t0 = time.perf_counter()
+        try:
+            for group in groups:
+                slot = self._next_slot(state)
+                self._remember_slot(used_slots, slot)
+                device_buf = self._ensure_slot(slot, group.nbytes)
+                if slot.free_event_valid:
+                    state.pack_stream.wait_event(slot.free_event)
+                t0 = time.perf_counter()
+                with state.stream_ctx(state.pack_stream):
                     self.codec.gpu_to_chunk_major_device_buffer(
                         device_buf,
                         self._group_block_ids(group),
+                        stream=state.pack_stream,
                     )
-                    pack_ms += (time.perf_counter() - t0) * 1000
-                    t0 = time.perf_counter()
-                    host_buf.copy_(device_buf, non_blocking=False)
-                    copy_ms += (time.perf_counter() - t0) * 1000
+                pack_ms += (time.perf_counter() - t0) * 1000
+                slot.ready_event.record(state.pack_stream)
+                state.copy_stream.wait_event(slot.ready_event)
                 t0 = time.perf_counter()
-                self._slice_to_memory_objs(group, host_buf)
+                with state.stream_ctx(state.copy_stream):
+                    self._slice_to_memory_objs(group, device_buf)
                 copy_ms += (time.perf_counter() - t0) * 1000
-            except Exception:
+                slot.free_event.record(state.copy_stream)
+                slot.free_event_valid = True
+            t0 = time.perf_counter()
+            state.copy_stream.synchronize()
+            sync_ms += (time.perf_counter() - t0) * 1000
+        except Exception:
+            for slot in used_slots:
                 slot.free_event_valid = False
-                raise
-        self._release_slots_if_requested(used_slots)
+            raise
+        finally:
+            self._release_slots_if_requested(used_slots)
         self._record_transfer_stats(
             chunks,
             groups,
@@ -590,113 +494,50 @@ class ATOMLMCacheGPUConnector:
             return
 
         state = self._thread_state()
-        use_cuda = state.use_cuda
         chunks = self._iter_transfer_chunks(memory_objs, block_id_groups)
         groups = self._iter_transfer_groups(chunks)
         self._record_transfer_stats(chunks, groups)
         if not chunks:
             return
 
-        if self._can_use_fused_chunk_major():
-            self._set_last_fastpath("fused_chunk")
-            used_slots: list[_StagingSlot] = []
-            copy_ms = 0.0
-            pack_ms = 0.0
-            sync_ms = 0.0
-            t_total0 = time.perf_counter()
-            try:
-                for group in groups:
-                    slot = self._next_slot(state)
-                    self._remember_slot(used_slots, slot)
-                    device_buf = self._ensure_slot(slot, group.nbytes)
-                    if slot.free_event_valid:
-                        state.copy_stream.wait_event(slot.free_event)
-                    t0 = time.perf_counter()
-                    with state.stream_ctx(state.copy_stream):
-                        self._memory_objs_to_slice(group, device_buf)
-                    copy_ms += (time.perf_counter() - t0) * 1000
-                    slot.ready_event.record(state.copy_stream)
-                    state.pack_stream.wait_event(slot.ready_event)
-                    t0 = time.perf_counter()
-                    with state.stream_ctx(state.pack_stream):
-                        self.codec.chunk_major_device_buffer_to_gpu(
-                            device_buf,
-                            self._group_block_ids(group),
-                            stream=state.pack_stream,
-                        )
-                    pack_ms += (time.perf_counter() - t0) * 1000
-                    slot.free_event.record(state.pack_stream)
-                    slot.free_event_valid = True
-                t0 = time.perf_counter()
-                state.pack_stream.synchronize()
-                sync_ms += (time.perf_counter() - t0) * 1000
-            except Exception:
-                for slot in used_slots:
-                    slot.free_event_valid = False
-                raise
-            finally:
-                self._release_slots_if_requested(used_slots)
-            self._record_transfer_stats(
-                chunks,
-                groups,
-                pack_ms=pack_ms,
-                copy_ms=copy_ms,
-                sync_ms=sync_ms,
-                transfer_ms=(time.perf_counter() - t_total0) * 1000,
-            )
-            return
-
-        self._set_last_fastpath("chunk")
+        self._require_fused_chunk_major()
+        used_slots: list[_StagingSlot] = []
         copy_ms = 0.0
         pack_ms = 0.0
         sync_ms = 0.0
         t_total0 = time.perf_counter()
-        used_slots: list[_StagingSlot] = []
-        for group in groups:
-            slot = self._next_slot(state)
-            self._remember_slot(used_slots, slot)
-            device_buf = self._ensure_slot(slot, group.nbytes)
-            host_buf = self._ensure_host_tmp(state, group.nbytes)
-            try:
+        try:
+            for group in groups:
+                slot = self._next_slot(state)
+                self._remember_slot(used_slots, slot)
+                device_buf = self._ensure_slot(slot, group.nbytes)
+                if slot.free_event_valid:
+                    state.copy_stream.wait_event(slot.free_event)
                 t0 = time.perf_counter()
-                self._memory_objs_to_slice(group, host_buf)
+                with state.stream_ctx(state.copy_stream):
+                    self._memory_objs_to_slice(group, device_buf)
                 copy_ms += (time.perf_counter() - t0) * 1000
-                if use_cuda:
-                    if slot.free_event_valid:
-                        state.copy_stream.wait_event(slot.free_event)
-                    t0 = time.perf_counter()
-                    with state.stream_ctx(state.copy_stream):
-                        device_buf.copy_(host_buf, non_blocking=True)
-                    copy_ms += (time.perf_counter() - t0) * 1000
-                    slot.ready_event.record(state.copy_stream)
-                    state.pack_stream.wait_event(slot.ready_event)
-                    t0 = time.perf_counter()
-                    with state.stream_ctx(state.pack_stream):
-                        self.codec.chunk_major_device_buffer_to_gpu(
-                            device_buf,
-                            self._group_block_ids(group),
-                            stream=state.pack_stream,
-                        )
-                    pack_ms += (time.perf_counter() - t0) * 1000
-                    slot.free_event.record(state.pack_stream)
-                    slot.free_event_valid = True
-                    t0 = time.perf_counter()
-                    state.pack_stream.synchronize()
-                    sync_ms += (time.perf_counter() - t0) * 1000
-                else:
-                    t0 = time.perf_counter()
-                    device_buf.copy_(host_buf, non_blocking=False)
-                    copy_ms += (time.perf_counter() - t0) * 1000
-                    t0 = time.perf_counter()
+                slot.ready_event.record(state.copy_stream)
+                state.pack_stream.wait_event(slot.ready_event)
+                t0 = time.perf_counter()
+                with state.stream_ctx(state.pack_stream):
                     self.codec.chunk_major_device_buffer_to_gpu(
                         device_buf,
                         self._group_block_ids(group),
+                        stream=state.pack_stream,
                     )
-                    pack_ms += (time.perf_counter() - t0) * 1000
-            except Exception:
+                pack_ms += (time.perf_counter() - t0) * 1000
+                slot.free_event.record(state.pack_stream)
+                slot.free_event_valid = True
+            t0 = time.perf_counter()
+            state.pack_stream.synchronize()
+            sync_ms += (time.perf_counter() - t0) * 1000
+        except Exception:
+            for slot in used_slots:
                 slot.free_event_valid = False
-                raise
-        self._release_slots_if_requested(used_slots)
+            raise
+        finally:
+            self._release_slots_if_requested(used_slots)
         self._record_transfer_stats(
             chunks,
             groups,

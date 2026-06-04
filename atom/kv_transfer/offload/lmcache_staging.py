@@ -71,7 +71,6 @@ class _ThreadTransferState:
         self.pack_stream = None
         self.copy_stream = None
         self.next_slot = 0
-        self.host_tmp: torch.Tensor | None = None
         if use_cuda:
             with torch.cuda.device(device):
                 self.pack_stream = torch.cuda.Stream()

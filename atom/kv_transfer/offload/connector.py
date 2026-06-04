@@ -244,15 +244,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
             "off",
         )
 
-    def _last_gpu_connector_fastpath(self) -> str:
-        gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
-        if gpu_connector is None or not hasattr(gpu_connector, "last_fastpath"):
-            return "unknown"
-        try:
-            return str(gpu_connector.last_fastpath())
-        except Exception:
-            return "unknown"
-
     def _last_gpu_connector_transfer_stats(self) -> dict[str, int | float]:
         gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
         if gpu_connector is None or not hasattr(gpu_connector, "last_transfer_stats"):
@@ -262,12 +253,12 @@ class LMCacheOffloadConnector(KVConnectorBase):
         except Exception:
             return {}
 
-    def _reset_gpu_connector_fastpath(self) -> None:
+    def _reset_gpu_connector_transfer_stats(self) -> None:
         gpu_connector = getattr(getattr(self, "_engine", None), "gpu_connector", None)
-        if gpu_connector is None or not hasattr(gpu_connector, "reset_fastpath"):
+        if gpu_connector is None or not hasattr(gpu_connector, "reset_transfer_stats"):
             return
         try:
-            gpu_connector.reset_fastpath()
+            gpu_connector.reset_transfer_stats()
         except Exception:
             pass
 
@@ -327,7 +318,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
         mask[:hbm] = False
 
         t_retrieve0 = time.perf_counter()
-        self._reset_gpu_connector_fastpath()
+        self._reset_gpu_connector_transfer_stats()
         ret_mask = self._engine.retrieve(
             torch.tensor(toks),
             mask=mask,
@@ -335,7 +326,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
             req_id=str(req.req_id),
         )
         retrieve_ms = (time.perf_counter() - t_retrieve0) * 1000
-        fastpath = self._last_gpu_connector_fastpath()
         transfer_stats = self._last_gpu_connector_transfer_stats()
         self._lookup_unpin(req.req_id)
         loaded = bool(ret_mask[hbm:lmc].all().item()) if lmc > hbm else True
@@ -353,7 +343,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
             hbm=hbm,
             lmc=lmc,
             retrieved=int(ret_mask.sum().item()),
-            fastpath=fastpath,
             chunks=transfer_stats.get("chunks", 0),
             groups=transfer_stats.get("groups", 0),
             max_chunk_bytes=transfer_stats.get("max_chunk_bytes", 0),
@@ -375,8 +364,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
         if self._profile_enabled():
             logger.info(
                 "[OFFLOAD-LOAD-PROF] rank=%s req=%s hbm=%d lmc=%d "
-                "retrieved=%d status=%s fastpath=%s chunks=%d "
-                "groups=%d max_chunk_bytes=%d max_group_bytes=%d "
+                "retrieved=%d status=%s chunks=%d groups=%d "
+                "max_chunk_bytes=%d max_group_bytes=%d "
                 "gpu_staging_chunk_bytes=%d gpu_staging_group_chunks=%d "
                 "gpu_staging_capacity_bytes=%d total_bytes=%d "
                 "pack_ms=%.2f copy_ms=%.2f sync_ms=%.2f "
@@ -388,7 +377,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 lmc,
                 int(ret_mask.sum().item()),
                 "ok" if loaded else "miss",
-                fastpath,
                 int(transfer_stats.get("chunks", 0)),
                 int(transfer_stats.get("groups", 0)),
                 int(transfer_stats.get("max_chunk_bytes", 0)),
@@ -439,7 +427,7 @@ class LMCacheOffloadConnector(KVConnectorBase):
         mask[:skip] = False
 
         t_store0 = time.perf_counter()
-        self._reset_gpu_connector_fastpath()
+        self._reset_gpu_connector_transfer_stats()
         self._engine.store(
             torch.tensor(toks),
             mask=mask,
@@ -447,7 +435,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
             req_id=str(req.req_id),
         )
         store_ms = (time.perf_counter() - t_store0) * 1000
-        fastpath = self._last_gpu_connector_fastpath()
         transfer_stats = self._last_gpu_connector_transfer_stats()
         with self._lock:
             self._done_save.add(req.req_id)
@@ -459,7 +446,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
             status="ok",
             toks=len(toks),
             skip=skip,
-            fastpath=fastpath,
             chunks=transfer_stats.get("chunks", 0),
             groups=transfer_stats.get("groups", 0),
             max_chunk_bytes=transfer_stats.get("max_chunk_bytes", 0),
@@ -481,8 +467,8 @@ class LMCacheOffloadConnector(KVConnectorBase):
         if self._profile_enabled():
             logger.info(
                 "[OFFLOAD-SAVE-PROF] rank=%s req=%s toks=%d skip=%d "
-                "fastpath=%s chunks=%d groups=%d max_chunk_bytes=%d "
-                "max_group_bytes=%d gpu_staging_chunk_bytes=%d "
+                "chunks=%d groups=%d max_chunk_bytes=%d max_group_bytes=%d "
+                "gpu_staging_chunk_bytes=%d "
                 "gpu_staging_group_chunks=%d gpu_staging_capacity_bytes=%d "
                 "total_bytes=%d pack_ms=%.2f copy_ms=%.2f sync_ms=%.2f "
                 "transfer_ms=%.2f effective_gbps=%.2f "
@@ -491,7 +477,6 @@ class LMCacheOffloadConnector(KVConnectorBase):
                 req.req_id,
                 len(toks),
                 skip,
-                fastpath,
                 int(transfer_stats.get("chunks", 0)),
                 int(transfer_stats.get("groups", 0)),
                 int(transfer_stats.get("max_chunk_bytes", 0)),

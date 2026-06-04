@@ -97,7 +97,7 @@ class ATOMKVByteCodec:
             except Exception:
                 logger.warning(
                     "ATOMKVByteCodec: Triton KV staging unavailable; "
-                    "using chunk fallback",
+                    "fused chunk-major staging disabled",
                     exc_info=True,
                 )
 
@@ -239,7 +239,7 @@ class ATOMKVByteCodec:
         Layout is MemoryObj-compatible:
         ``[chunk0: seg0 blocks | seg1 blocks | ...][chunk1: ...]``.
         Fused Triton staging is used when available; otherwise this method
-        provides a reference implementation for tests and CPU fallback.
+        provides a reference implementation for tests.
         """
         groups, flat_block_ids, chunk_block_counts = self._normalize_block_id_groups(
             block_id_groups,
