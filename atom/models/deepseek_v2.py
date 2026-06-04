@@ -1982,10 +1982,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
         self.fuse_input_norm_quant = False
         self.fuse_ar_input_norm = ENABLE_ALLREDUCE_RMSNORM_FUSION
-        if (
-            quant_config is not None
-            and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION
-        ):
+        if quant_config is not None and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION:
             if (
                 self.quant_dtype == dtypes.fp8 or self.quant_dtype == dtypes.fp4x2
             ) and use_triton_gemm():
