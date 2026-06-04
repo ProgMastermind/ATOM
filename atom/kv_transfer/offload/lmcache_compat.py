@@ -13,7 +13,6 @@ how those blocks are packed as opaque bytes.
 from __future__ import annotations
 
 from dataclasses import dataclass
-import os
 import threading
 import time
 from typing import Any
@@ -21,139 +20,17 @@ from typing import Any
 import torch
 
 from atom.kv_transfer.offload.gpu_connector import ATOMKVByteCodec
+from atom.kv_transfer.offload.lmcache_staging import (
+    _StagingSlot,
+    _ThreadTransferState,
+    _env_flag,
+    _env_int,
+    _env_optional_int,
+)
 
 
 def _cdiv(a: int, b: int) -> int:
     return -(-int(a) // int(b))
-
-
-class ATOMRawBytesLMCacheMetadata:
-    """Proxy around ``LMCacheMetadata`` with ATOM raw-byte allocation shapes."""
-
-    def __init__(
-        self,
-        base_metadata: Any,
-        *,
-        atom_block_size: int,
-        bytes_per_block: int,
-    ) -> None:
-        self._atom_base_metadata = base_metadata
-        self.__dict__.update(vars(base_metadata))
-        self.atom_block_size = int(atom_block_size)
-        self.atom_bytes_per_block = int(bytes_per_block)
-        chunk_size = int(getattr(base_metadata, "chunk_size"))
-        if self.atom_block_size <= 0:
-            raise ValueError("ATOM raw-byte metadata: atom_block_size must be > 0")
-        if self.atom_bytes_per_block <= 0:
-            raise ValueError("ATOM raw-byte metadata: bytes_per_block must be > 0")
-        if chunk_size % self.atom_block_size != 0:
-            raise ValueError(
-                "LMCache chunk size must be divisible by ATOM KV block size: "
-                f"chunk_size={chunk_size}, block_size={self.atom_block_size}"
-            )
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._atom_base_metadata, name)
-
-    def __eq__(self, other: object) -> bool:
-        if isinstance(other, ATOMRawBytesLMCacheMetadata):
-            return (
-                self._atom_base_metadata == other._atom_base_metadata
-                and self.atom_block_size == other.atom_block_size
-                and self.atom_bytes_per_block == other.atom_bytes_per_block
-            )
-        return False
-
-    def is_first_rank(self) -> bool:
-        return self._atom_base_metadata.is_first_rank()
-
-    def get_dtypes(self) -> list[torch.dtype]:
-        return [torch.uint8]
-
-    def get_shapes(self, num_tokens: int | None = None) -> list[torch.Size]:
-        if num_tokens is None:
-            num_tokens = int(self.chunk_size)
-        nblocks = _cdiv(int(num_tokens), self.atom_block_size)
-        return [torch.Size((nblocks * self.atom_bytes_per_block,))]
-
-    def get_num_groups(self) -> int:
-        return 1
-
-
-class _NullCtx:
-    def __enter__(self):
-        return None
-
-    def __exit__(self, *args):
-        return False
-
-
-class _StagingSlot:
-    def __init__(self, use_cuda: bool) -> None:
-        self.tensor: torch.Tensor | None = None
-        self.ready_event = None
-        self.free_event = None
-        self.free_event_valid = False
-        if use_cuda:
-            self.ready_event = torch.cuda.Event(blocking=False)
-            self.free_event = torch.cuda.Event(blocking=False)
-
-
-def _env_flag(name: str, default: str = "0") -> bool:
-    return os.environ.get(name, default).lower() not in ("0", "false", "no", "off")
-
-
-def _env_int(name: str, default: int, *, min_value: int = 1) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return default
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if value < min_value:
-        raise ValueError(f"{name} must be >= {min_value}, got {value}")
-    return value
-
-
-def _env_optional_int(name: str, *, min_value: int = 1) -> int | None:
-    raw = os.environ.get(name)
-    if raw is None or raw == "":
-        return None
-    try:
-        value = int(raw)
-    except ValueError as exc:
-        raise ValueError(f"{name} must be an integer, got {raw!r}") from exc
-    if value < min_value:
-        raise ValueError(f"{name} must be >= {min_value}, got {value}")
-    return value
-
-
-class _ThreadTransferState:
-    def __init__(
-        self,
-        device: torch.device,
-        use_cuda: bool,
-        staging_slots: int,
-    ) -> None:
-        self.device = device
-        self.use_cuda = use_cuda
-        self.pack_stream = None
-        self.copy_stream = None
-        self.next_slot = 0
-        self.host_tmp: torch.Tensor | None = None
-        if use_cuda:
-            with torch.cuda.device(device):
-                self.pack_stream = torch.cuda.Stream()
-                self.copy_stream = torch.cuda.Stream()
-                self.slots = [_StagingSlot(use_cuda) for _ in range(staging_slots)]
-        else:
-            self.slots = [_StagingSlot(use_cuda) for _ in range(staging_slots)]
-
-    def stream_ctx(self, stream):
-        if stream is None:
-            return _NullCtx()
-        return torch.cuda.stream(stream)
 
 
 @dataclass(frozen=True)
