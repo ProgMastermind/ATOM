@@ -1060,9 +1060,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
 
                 x_q_dtype = (
-                    self.moe.a_quant_dtype
-                    if self.moe.a_quant_dtype != "bf16"
-                    else None
+                    self.moe.a_quant_dtype if self.moe.a_quant_dtype != "bf16" else None
                 )
 
                 output = torch.empty_like(x)
