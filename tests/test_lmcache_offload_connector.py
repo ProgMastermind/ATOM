@@ -22,7 +22,7 @@ from atom.kv_transfer.offload.connector import (
 )
 from atom.kv_transfer.offload.gpu_connector import ATOMKVByteCodec
 from atom.kv_transfer.offload.lmcache_compat import ATOMLMCacheGPUConnector
-from atom.kv_transfer.offload.lmcache_metadata import ATOMRawBytesLMCacheMetadata
+from atom.kv_transfer.offload.metadata import ATOMRawBytesLMCacheMetadata
 from atom.model_engine.scheduler import Scheduler
 
 

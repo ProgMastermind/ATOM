@@ -40,8 +40,8 @@ from atom.kv_transfer.disaggregation.types import KVConnectorOutput, ReqId
 from atom.kv_transfer.offload import config as offcfg
 from atom.kv_transfer.offload.gpu_connector import ATOMKVByteCodec
 from atom.kv_transfer.offload.lmcache_compat import ATOMLMCacheGPUConnector
-from atom.kv_transfer.offload.lmcache_metadata import ATOMRawBytesLMCacheMetadata
 from atom.kv_transfer.offload.metadata import (
+    ATOMRawBytesLMCacheMetadata,
     LMCacheOffloadMetadata,
     LMCacheReqMeta,
     LoadSpec,
