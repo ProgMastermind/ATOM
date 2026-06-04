@@ -350,6 +350,8 @@ class FusedMoEModularKernel(torch.nn.Module):
                     dispatch_scale,
                     dispatch_ids,
                     dispatch_weights,
+                    topk_ids,
+                    self.prepare_finalize.num_dispatchers(),
                     expert_tokens_meta.expert_num_tokens,
                 )
 
