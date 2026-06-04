@@ -19,7 +19,7 @@ from typing import Any
 
 import torch
 
-from atom.kv_transfer.offload.gpu_connector import ATOMKVByteCodec
+from atom.kv_transfer.offload.atom_kv_byte_codec import ATOMKVByteCodec
 from atom.kv_transfer.offload.atom_lmcache_staging import (
     _StagingSlot,
     _ThreadTransferState,
