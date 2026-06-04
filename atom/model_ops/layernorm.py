@@ -269,9 +269,13 @@ class RMSNorm(nn.Module):
             assert (
                 residual is not None
             ), "fused_allreduce_rmsnorm requires residual input!"
-            # tensor_model_parallel_fused_allreduce_rmsnorm does not support non-contiguous input
+            # tensor_model_parallel_fused_allreduce_rmsnorm does not support
+            # non-contiguous input, but most compiled model paths already
+            # produce contiguous tensors from GEMM/MoE outputs.
+            if not x.is_contiguous():
+                x = x.contiguous()
             x, residual = tensor_model_parallel_fused_allreduce_rmsnorm(
-                x.contiguous(),
+                x,
                 residual,
                 self.weight,
                 self.eps,
