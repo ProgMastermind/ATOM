@@ -890,15 +890,15 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
 
         # Workaround for the missing MLA fp8/fp8 nhead=64 qseqlen=1
         # non-persistent kernel on gfx950. Leverage the pre-existing
-        # 16-head non-persistent kernels, folding the q/o tensors to
-        # 16 heads
+        # 8-head non-persistent kernels, folding the q/o tensors to
+        # 8 heads
         self._mla_fold_enabled = (
             self.padded_num_attention_heads in [64, 32]
             and self.dtype_kv == dtypes.fp8
             and get_gfx() == "gfx950"
         )
         self._mla_fold_factor = (
-            self.padded_num_attention_heads // 16 if self._mla_fold_enabled else 1
+            self.padded_num_attention_heads // 8 if self._mla_fold_enabled else 1
         )
 
     # TODO: support mtp and sparse
