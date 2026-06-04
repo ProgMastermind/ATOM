@@ -1985,12 +1985,11 @@ class DeepseekV2DecoderLayer(nn.Module):
         if (
             quant_config is not None
             and ENABLE_DS_INPUT_RMSNORM_QUANT_FUSION
-            and getattr(self.self_attn, "fuse_qknorm_quant", False)
         ):
             if (
                 self.quant_dtype == dtypes.fp8 or self.quant_dtype == dtypes.fp4x2
             ) and use_triton_gemm():
-                self.fuse_input_norm_quant = False
+                self.fuse_input_norm_quant = True
                 if self.fuse_ar_input_norm:
                     self.fuse_ar_input_norm = False
                     if layer_idx == 0:
