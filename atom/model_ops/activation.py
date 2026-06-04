@@ -5,7 +5,8 @@ import torch
 from typing import Optional
 from torch import nn
 import torch.nn.functional as F
-from aiter import silu_and_mul
+from aiter import dtypes, silu_and_mul, silu_and_mul_quant
+from atom.utils import envs
 from atom.config import QuantizationConfig
 from atom.quant_spec import LayerQuantConfig
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -53,6 +54,36 @@ def mxfp4_act_mul_quant_fuse(
     (x, x_scale), _ = fused_reduce_act_mul_and_mxfp4_quant(x, "silu", shuffle=shuffle)
 
     return x, x_scale
+
+
+def silu_and_mul_fp8_quant_fake(
+    x: torch.Tensor,
+    group_size: int = 128,
+    transpose_scale: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    del transpose_scale
+    M, N1 = x.shape
+    N_half = N1 // 2
+    return (
+        torch.empty((M, N_half), dtype=dtypes.fp8, device=x.device),
+        torch.empty((M, N_half // group_size), dtype=torch.float32, device=x.device),
+    )
+
+
+@torch_compile_guard(gen_fake=silu_and_mul_fp8_quant_fake, mutates_args=[])
+def silu_and_mul_fp8_quant(
+    x: torch.Tensor,
+    group_size: int = 128,
+    transpose_scale: bool | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if transpose_scale is None:
+        transpose_scale = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
+    M, N1 = x.shape
+    N_half = N1 // 2
+    out = torch.empty((M, N_half), dtype=dtypes.fp8, device=x.device)
+    scale = torch.empty((M, N_half // group_size), dtype=torch.float32, device=x.device)
+    silu_and_mul_quant(out, x, scale, group_size, 0.0, transpose_scale)
+    return out, scale
 
 
 class SiluAndMul(nn.Module):
@@ -104,6 +135,13 @@ class SiluAndMul(nn.Module):
             and self.quant_type.value == QuantType.per_1x32.value
         ):
             return mxfp4_act_mul_quant_fuse(x, shuffle=True)
+        elif (
+            x_scale is None
+            and self.fused_quant
+            and self.quant_type.value == QuantType.per_1x128.value
+            and self.params_dtype == dtypes.fp8
+        ):
+            return silu_and_mul_fp8_quant(x, group_size=128, transpose_scale=True)
         else:
             out = torch.empty(
                 [*x.shape[:-1], x.shape[-1] // 2], device=x.device, dtype=x.dtype
