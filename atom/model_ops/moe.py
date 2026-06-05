@@ -902,6 +902,30 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
 
             atom_config = get_current_atom_config()
 
+            # Stash dense (pre-swizzle) shared-expert weights so the always-on
+            # shared expert can be evaluated by a standalone dense MXFP4 GEMM
+            # (gemm_a16wfp4, see Mxfp4MoEMethod._apply_shared_experts_dense)
+            # instead of being fused into grouped_topk routing. The shared
+            # experts occupy the last ``num_fused_shared_experts`` slots of the
+            # routed weight tensors; their raw per-expert layout
+            # (N, K // 2) + scale (N, K // 32) is exactly what gemm_a16wfp4
+            # consumes, whereas _swizzle_mxfp4 below reorders the scales into
+            # the MoE-kernel-only CDNA4 layout.
+            n_shared = layer.num_fused_shared_experts
+            if n_shared > 0:
+                layer.shared_w13_weight = (
+                    layer.w13_weight.data[-n_shared:].view(torch.uint8).contiguous()
+                )
+                layer.shared_w13_weight_scale = layer.w13_weight_scale.data[
+                    -n_shared:
+                ].contiguous()
+                layer.shared_w2_weight = (
+                    layer.w2_weight.data[-n_shared:].view(torch.uint8).contiguous()
+                )
+                layer.shared_w2_weight_scale = layer.w2_weight_scale.data[
+                    -n_shared:
+                ].contiguous()
+
             (
                 w13_weight,
                 w13_scale,
@@ -1045,10 +1069,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     use_grouped_topk=use_grouped_topk,
                     num_expert_group=num_expert_group,
                     topk_group=topk_group,
-                    num_fused_shared_experts=layer.num_fused_shared_experts,
                 )
-                # routing widened the per-token gate count by the shared
-                # experts; the GEMM must process all of them.
+                # Routed-only gate count (no shared-expert widening).
                 n_expts_act = routing_data.n_expts_act
 
                 # Convert to triton routing data structures
@@ -1057,7 +1079,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 if global_num_experts > 0:
                     n_expts_tot = global_num_experts
 
-                n_expts_tot = n_expts_tot + layer.num_fused_shared_experts
+                # Shared experts are handled separately (see below), so the
+                # routed GEMM processes only the routed experts.
 
                 x_q_dtype = (
                     self.moe.a_quant_dtype if self.moe.a_quant_dtype != "bf16" else None
@@ -1086,6 +1109,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     expert_map=expert_map,
                     x_q_dtype=x_q_dtype,
                 )
+
+                # Always-on shared expert(s) via a standalone dense GEMM,
+                # added to the routed output before the TP all-reduce.
+                if layer.num_fused_shared_experts > 0:
+                    _moe_result = _moe_result + self._apply_shared_experts_dense(
+                        layer, x, activation
+                    )
                 return _moe_result
 
             assert (
@@ -1189,6 +1219,59 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             intermediate_pad=self.intermediate_pad,
             moe_extra_args=moe_extra_args,
         )
+
+    def _apply_shared_experts_dense(self, layer, x, activation):
+        """Standalone dense MXFP4 GEMM for the always-on shared expert(s).
+
+        Functionally replaces fusing the shared expert into grouped_topk
+        routing. The fused path appended each shared expert as an always-on
+        routed slot with a fixed weight of ``SHARED_SCORE`` (== 1.0 here),
+        placed *after* the routed renorm / ``routed_scaling_factor`` and run
+        through the MoE GEMM as the last expert(s) of ``w13/w2``.
+
+        Here we instead apply the shared expert to every token via two dense
+        ``gemm_a16wfp4`` calls (gate_up -> SiLU-and-mul -> down) on the
+        pre-swizzle weight slices stashed in ``process_weights_after_loading``,
+        and return the result so the caller adds it (weight 1.0) to the routed
+        output before the TP all-reduce. The shared-expert intermediate is
+        TP-partitioned exactly like the routed experts, so both partial outputs
+        reduce together.
+        """
+        from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
+        from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
+
+        # The fused shared expert used the DeepSeek SiLU path; SwiGLU models
+        # (gpt-oss) have no shared experts, so this assert documents the scope.
+        assert (
+            activation != ActivationType.Swiglu
+        ), "dense shared-expert GEMM only supports the SiLU activation path"
+
+        M = x.shape[0]
+        swiglu_limit = getattr(layer, "swiglu_limit", 0.0)
+
+        shared_out = None
+        for e in range(layer.num_fused_shared_experts):
+            gate_up = gemm_a16wfp4(
+                x,
+                layer.shared_w13_weight[e],
+                layer.shared_w13_weight_scale[e],
+            )
+            half_n = gate_up.shape[-1] // 2
+            intermediate = torch.empty((M, half_n), device=x.device, dtype=x.dtype)
+            fused_clamp_act_mul(
+                gate_up,
+                out=intermediate,
+                swiglu_limit=swiglu_limit,
+                activation="silu",
+                dtype_quant=None,
+            )
+            out_e = gemm_a16wfp4(
+                intermediate,
+                layer.shared_w2_weight[e],
+                layer.shared_w2_weight_scale[e],
+            )
+            shared_out = out_e if shared_out is None else shared_out + out_e
+        return shared_out
 
 
 # Refer to CompressedTensorsW8A8Fp8MoEMethod in vllm
