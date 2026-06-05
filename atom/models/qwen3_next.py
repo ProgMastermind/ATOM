@@ -14,6 +14,7 @@ from atom.config import Config, QuantizationConfig
 from atom.model_config.qwen3_next import Qwen3NextConfig
 from atom.model_ops.activation import SiluAndMul
 from atom.model_ops.base_attention import LinearAttention
+from atom.model_ops.triton_mrope import try_mrope_qk_fused
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import DualRMSNorm
 from atom.model_ops.layernorm import GemmaRMSNorm
@@ -48,9 +49,6 @@ from einops import rearrange
 from torch import nn
 from transformers.activations import ACT2FN
 from aiter import QuantType
-
-if is_vllm():
-    from vllm.config import get_current_vllm_config
 
 ENABLE_ALLREDUCE_RMSNORM_FUSION = envs.ATOM_ENABLE_ALLREDUCE_RMSNORM_FUSION
 ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION = (
@@ -429,7 +427,19 @@ class Qwen3NextAttention(nn.Module):
             )
         else:
             q, k = self.qk_norm(q, k)
-            q, k = self.rotary_emb(positions, q, k)
+            fused_qk = try_mrope_qk_fused(
+                self.rotary_emb,
+                positions,
+                q,
+                k,
+                self.num_heads,
+                self.num_kv_heads,
+                self.head_dim,
+            )
+            if fused_qk is None:
+                q, k = self.rotary_emb(positions, q, k)
+            else:
+                q, k = fused_qk
             attn_output = self.attn(q, k, v)
 
         if self.use_fused_sigmoid_mul_quant:
@@ -693,63 +703,6 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         core_attn_out, maybe_scale = self.norm(core_attn_out, z)
         output = self.out_proj(core_attn_out, x_scale=maybe_scale)
         return output
-
-
-if is_vllm():
-    from vllm.model_executor.layers.mamba.abstract import MambaBase
-    from vllm.model_executor.layers.mamba.mamba_utils import (
-        MambaStateCopyFunc,
-        MambaStateCopyFuncCalculator,
-        MambaStateDtypeCalculator,
-        MambaStateShapeCalculator,
-    )
-
-    class Qwen3NextGatedDeltaNetVllm(Qwen3NextGatedDeltaNet, MambaBase):
-        def __init__(
-            self,
-            atom_config: Qwen3NextConfig,
-            quant_config=None,
-            speculative_config=None,
-            prefix: str = "",
-        ) -> None:
-            super().__init__(
-                atom_config=atom_config,
-                quant_config=quant_config,
-                speculative_config=speculative_config,
-                prefix=prefix,
-            )
-            self.model_config = atom_config.plugin_config.vllm_config.model_config
-            self.cache_config = atom_config.plugin_config.vllm_config.cache_config
-            self.tp_rank = get_tensor_model_parallel_rank()
-            compilation_config = get_current_vllm_config().compilation_config
-            if prefix in compilation_config.static_forward_context:
-                raise ValueError(f"Duplicate layer name: {prefix}")
-            compilation_config.static_forward_context[prefix] = self
-
-        def get_state_dtype(self) -> tuple[torch.dtype, torch.dtype]:
-            return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-                self.model_config.dtype,
-                self.cache_config.mamba_cache_dtype,
-                self.cache_config.mamba_ssm_cache_dtype,
-            )
-
-        def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
-            return MambaStateShapeCalculator.gated_delta_net_state_shape(
-                self.tp_size,
-                self.num_k_heads,
-                self.num_v_heads,
-                self.head_k_dim,
-                self.head_v_dim,
-                self.conv_kernel_size,
-                self.num_spec,
-            )
-
-        @property
-        def mamba_type(self) -> str:
-            return "gdn_attention"
-
-    # If oot case, override the Qwen3NextGatedDeltaNet with the VLLM version which inherits from MambaBase to ensure it gets registered in the static_forward_context for vLLM compilation.
-    Qwen3NextGatedDeltaNet = Qwen3NextGatedDeltaNetVllm
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -1107,50 +1060,3 @@ class Qwen3NextForCausalLM(nn.Module):
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()
-
-
-if is_vllm():
-    from atom.plugin.vllm.model_wrapper import ATOMMoEForCausalLM
-    from vllm.config import VllmConfig
-    from vllm.model_executor.models.interfaces import IsHybrid
-
-    class Qwen3NextForCausalLMVllm(ATOMMoEForCausalLM, IsHybrid):
-        @classmethod
-        def get_mamba_state_dtype_from_config(
-            cls,
-            vllm_config: "VllmConfig",
-        ) -> tuple[torch.dtype, torch.dtype]:
-            return MambaStateDtypeCalculator.gated_delta_net_state_dtype(
-                vllm_config.model_config.dtype,
-                vllm_config.cache_config.mamba_cache_dtype,
-                vllm_config.cache_config.mamba_ssm_cache_dtype,
-            )
-
-        @classmethod
-        def get_mamba_state_shape_from_config(
-            cls, vllm_config: "VllmConfig"
-        ) -> tuple[tuple[int, int], tuple[int, int]]:
-            parallel_config = vllm_config.parallel_config
-            hf_config = vllm_config.model_config.hf_text_config
-            tp_size = parallel_config.tensor_parallel_size
-            num_spec = (
-                vllm_config.speculative_config.num_speculative_tokens
-                if vllm_config.speculative_config
-                else 0
-            )
-
-            return MambaStateShapeCalculator.gated_delta_net_state_shape(
-                tp_size,
-                hf_config.linear_num_key_heads,
-                hf_config.linear_num_value_heads,
-                hf_config.linear_key_head_dim,
-                hf_config.linear_value_head_dim,
-                hf_config.linear_conv_kernel_dim,
-                num_spec,
-            )
-
-        @classmethod
-        def get_mamba_state_copy_func(
-            cls,
-        ) -> tuple[MambaStateCopyFunc, MambaStateCopyFunc]:
-            return MambaStateCopyFuncCalculator.gated_delta_net_state_copy_func()

@@ -28,7 +28,6 @@ class PluginConfig:
     vllm_scheduler_config: Any = None
     vllm_cache_config: Any = None
     vllm_quant_config: Any = None
-    vllm_use_atom_attention: bool = False
 
     # sglang specific
     sglang_model_opt_config: Any = None
@@ -123,7 +122,6 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
     vllm_scheduler_config = config.scheduler_config
     vllm_cache_config = config.cache_config
     vllm_parallel_config = config.parallel_config
-    vllm_use_atom_attention = not envs.ATOM_DISABLE_VLLM_PLUGIN_ATTENTION
     use_dp_ep = (
         vllm_parallel_config.enable_expert_parallel
         and vllm_parallel_config.data_parallel_size > 1
@@ -163,7 +161,6 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         vllm_scheduler_config=vllm_scheduler_config,
         vllm_cache_config=vllm_cache_config,
         vllm_quant_config=vllm_quant_config,
-        vllm_use_atom_attention=vllm_use_atom_attention,
     )
 
     # specific
