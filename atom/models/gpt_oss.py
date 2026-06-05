@@ -239,17 +239,15 @@ class MLPBlock(torch.nn.Module):
         _interleave_swiglu_weights(self.experts)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return x
-        
         num_tokens = x.shape[0]
 
-        g = self.router(x[..., : self.hidden_size])
+        # g = self.router(x[..., : self.hidden_size])
 
         # Pad input for MXFP4 MoE GEMM alignment if needed
         if self.moe_hidden_pad > 0 and self.tp_size > 1:
             x = F.pad(x, (0, self.moe_hidden_pad))
 
-        x = self.experts(hidden_states=x, router_logits=g)
+        # x = self.experts(hidden_states=x, router_logits=g)
 
         if self.tp_size > 1 and not ENABLE_ALLREDUCE_RMSNORM_FUSION:
             x = tensor_model_parallel_all_reduce(x)
