@@ -132,6 +132,14 @@ ENABLE_DS_QKNORM_QUANT_FUSION = envs.ATOM_ENABLE_DS_QKNORM_QUANT_FUSION
 def _rmsnorm_nw(x: torch.Tensor, eps: float, dim: int) -> torch.Tensor:
     if _V4_USE_TRITON_RMSNORM:
         return rmsnorm_nw(x, eps)
+    if _V4_RMSNORM_BACKEND == "torch":
+        # Pure-torch fallback for gfx1250 (Inductor-wrapped triton rmsnorm_nw
+        # emits NaN; aiter ck path is gfx950-only). Compute the variance in
+        # fp32 from a single upcast, then scale — avoids the extra fp32 temps
+        # a naive `x.float()*rsqrt(...)` would allocate at large-batch prefill.
+        xf = x.float()
+        rms = xf.pow(2).mean(-1, keepdim=True).add_(eps).rsqrt_()
+        return xf.mul_(rms).to(x.dtype)
     ones = torch.ones(dim, dtype=x.dtype, device=x.device)
     return rmsnorm2d_fwd_(x, ones, eps, dim)
 
@@ -2357,8 +2365,15 @@ class Block(nn.Module):
         # `x.is_cuda` is implicit here — model lives on GPU post-`.to()`; a CPU tensor
         # would have crashed earlier in DeepseekV4Attention.
         _dim_ok = args.dim % 512 == 0 or args.dim % 256 == 0
-        self._mhc_pre = getattr(aiter, "mhc_pre", None) if _dim_ok else None
-        self._mhc_post = getattr(aiter, "mhc_post", None) if _dim_ok else None
+        from atom.utils import envs as _atom_envs
+
+        _force_fb = _atom_envs.ATOM_GFX1250_FALLBACK
+        self._mhc_pre = (
+            getattr(aiter, "mhc_pre", None) if (_dim_ok and not _force_fb) else None
+        )
+        self._mhc_post = (
+            getattr(aiter, "mhc_post", None) if (_dim_ok and not _force_fb) else None
+        )
 
     # mHC `hc_post_mult_value`: V4 uses `2.0 * sigmoid(post)` for the post gate.
     HC_POST_MULT = 2.0
@@ -2416,6 +2431,10 @@ class Block(nn.Module):
             self.hc_eps,
         )
         y = torch.sum(pre.unsqueeze(-1) * residual, dim=-2)  # [num_tokens, dim]
+        if norm_weight is not None:
+            y = F.rms_norm(y.float(), (y.shape[-1],), norm_weight.float(), norm_eps).to(
+                dtype
+            )
         return y.to(dtype), post, comb
 
     def hc_post(
@@ -2470,7 +2489,7 @@ class Block(nn.Module):
             self.attn_norm.weight,
             self.norm_eps,
         )
-        # x = self.attn_norm(x)  # [num_tokens, dim]
+        # norm fused into hc_pre (aiter kernel or torch fallback)
         x = self.attn(x, positions)  # [num_tokens, dim]
         x = self.hc_post(x, residual, post, comb)  # [num_tokens, hc, dim]
         # ----- FFN sub-layer with mHC mixing -----
@@ -2483,7 +2502,7 @@ class Block(nn.Module):
             self.ffn_norm.weight,
             self.norm_eps,
         )
-        # x = self.ffn_norm(x)  # [num_tokens, dim]
+        # norm fused into hc_pre (aiter kernel or torch fallback)
         x = self.ffn(
             x
         )  # [num_tokens, dim]  (input_ids read from forward_context for hash MoE)

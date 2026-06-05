@@ -103,6 +103,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_USE_GLUON_PA_DECODE": lambda: (
         os.getenv("ATOM_USE_GLUON_PA_DECODE", "0") == "1"
     ),
+    # gfx1250 (or other arches where aiter C++ modules are not built):
+    # route mhc / moe_topk / dsv4_rotate_quant / rope_1c_cached_positions_fwd /
+    # top_k_per_row through torch fallbacks. Smoke-only on gfx950; correctness
+    # only, no perf guarantee.
+    "ATOM_GFX1250_FALLBACK": lambda: (os.getenv("ATOM_GFX1250_FALLBACK", "0") == "1"),
     # --- Plugin Mode ---
     "ATOM_DISABLE_VLLM_PLUGIN": lambda: (
         os.getenv("ATOM_DISABLE_VLLM_PLUGIN", "0").lower() == "1"
