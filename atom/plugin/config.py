@@ -157,6 +157,8 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         getattr(config, "speculative_config", None)
     )
 
+    vllm_enable_dbo = getattr(vllm_parallel_config, "enable_dbo", False)
+
     return Config(
         model=vllm_model_config.model,
         trust_remote_code=getattr(vllm_model_config, "trust_remote_code", False),
@@ -179,6 +181,8 @@ def _generate_atom_config_from_vllm_config(config: Any) -> PluginConfig:
         enable_expert_parallel=vllm_parallel_config.enable_expert_parallel,
         master_addr=None,
         enable_dp_attention=False,
+        enable_tbo=vllm_enable_dbo,
+        enable_tbo_decode=vllm_enable_dbo,
         plugin_config=plugin_config,
         speculative_config=atom_speculative_config,
     )
