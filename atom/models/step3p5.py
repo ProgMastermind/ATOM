@@ -426,10 +426,9 @@ class Step3p5Attention(nn.Module):
         )
 
         # Sliding window and sink tokens per layer ---------------------------
-        # DEBUG: temporarily disable sliding window to test if pa_decode_gluon is the issue
         sliding_window = None
         sinks = None
-        if is_sliding and not os.environ.get("ATOM_STEP3P5_NO_SLIDING"):
+        if is_sliding:
             sliding_window = getattr(config, "sliding_window", None)
             sink_size = getattr(config, "sink", 0)
             if sink_size > 0:
@@ -453,51 +452,25 @@ class Step3p5Attention(nn.Module):
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        import os
-
-        debug_nan = os.environ.get("ATOM_DEBUG_NAN2")
-
         qkv = self.qkv_proj(hidden_states)
         q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
-        if debug_nan and (q.isnan().any() or k.isnan().any() or v.isnan().any()):
-            print(
-                f"[NAN-ATTN] qkv has NaN: q={q.isnan().any()} k={k.isnan().any()} v={v.isnan().any()}"
-            )
 
         # QK Norm – apply per-head RMSNorm
         # Reshape to (..., num_heads, head_dim), apply norm, reshape back
         q = self.q_norm(q.reshape(*q.shape[:-1], -1, self.head_dim)).flatten(-2)
         k = self.k_norm(k.reshape(*k.shape[:-1], -1, self.head_dim)).flatten(-2)
-        if debug_nan and (q.isnan().any() or k.isnan().any()):
-            print(
-                f"[NAN-ATTN] after qk_norm NaN: q={q.isnan().any()} k={k.isnan().any()}"
-            )
 
         attn_output = self.attn(q, k, v, positions)
-        if debug_nan and attn_output.isnan().any():
-            print(
-                f"[NAN-ATTN] attn output has NaN, num_heads={self.num_heads}, num_kv_heads={self.num_kv_heads}, q_size={self.q_size}, kv_size={self.kv_size}, attn_output.shape={attn_output.shape}"
-            )
 
         # Head-wise gating
         if self.use_head_wise_attn_gate:
             gate = self.g_proj(hidden_states)  # (tokens, num_heads_tp)
-            if debug_nan and gate.isnan().any():
-                print(f"[NAN-ATTN] gate (g_proj) has NaN, gate.shape={gate.shape}")
             # gate: (tokens, num_heads_tp) -> (tokens, num_heads_tp, 1)
             gate = torch.sigmoid(gate).unsqueeze(-1)
             reshaped = attn_output.reshape(*attn_output.shape[:-1], -1, self.head_dim)
-            if debug_nan:
-                print(
-                    f"[NAN-ATTN] attn_output.shape={attn_output.shape} reshaped.shape={reshaped.shape} gate.shape={gate.shape}"
-                )
             attn_output = (reshaped * gate).flatten(-2)
-            if debug_nan and attn_output.isnan().any():
-                print("[NAN-ATTN] after gate multiply has NaN")
 
         output = self.o_proj(attn_output)
-        if debug_nan and output.isnan().any():
-            print("[NAN-ATTN] o_proj output has NaN")
         return output
 
 
@@ -693,24 +666,8 @@ class Step3p5Model(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        import os as _dbg_os
-
-        _dbg_layer = _dbg_os.environ.get("ATOM_DEBUG_LAYER")
-        for i, layer in enumerate(self.layers[self.start_layer : self.end_layer]):
+        for layer in self.layers[self.start_layer : self.end_layer]:
             hidden_states, residual = layer(positions, hidden_states, residual)
-            if _dbg_layer:
-                _hs_nan = torch.isnan(hidden_states).any().item()
-                _res_nan = (
-                    torch.isnan(residual).any().item()
-                    if residual is not None
-                    else False
-                )
-                if _hs_nan or _res_nan:
-                    print(
-                        f"[LAYER NaN] layer={i} hs_nan={_hs_nan} res_nan={_res_nan} hs_norm={hidden_states.float().norm():.3f}",
-                        flush=True,
-                    )
-                    break
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors(
