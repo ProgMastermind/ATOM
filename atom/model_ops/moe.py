@@ -1240,8 +1240,9 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
         from aiter.ops.triton.fusions.fused_clamp_act_mul import fused_clamp_act_mul
 
-        # The fused shared expert used the DeepSeek SiLU path; SwiGLU models
-        # (gpt-oss) have no shared experts, so this assert documents the scope.
+        # The dense shared-expert GEMM only implements the SiLU activation
+        # path; SwiGLU models have no fused shared experts, so this assert
+        # documents the supported scope.
         assert (
             activation != ActivationType.Swiglu
         ), "dense shared-expert GEMM only supports the SiLU activation path"
