@@ -820,6 +820,11 @@ class ModelRunner:
             config.parallel_config.data_parallel_master_ip,
             config.parallel_config.data_parallel_base_port,
         )
+        if os.getenv("ATOM_DISABLE_AITER_CUSTOM_ALL_REDUCE", "0") == "1":
+            from aiter.dist.parallel_state import set_custom_all_reduce
+
+            set_custom_all_reduce(False)
+            logger.info("Disabled aiter custom all-reduce via ATOM_DISABLE_AITER_CUSTOM_ALL_REDUCE=1")
         init_dist_env(
             config.tensor_parallel_size,
             rankID=rank,

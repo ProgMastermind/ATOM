@@ -27,7 +27,7 @@
     "model_name": "DeepSeek-V4-Pro",
     "model_path": "deepseek-ai/DeepSeek-V4-Pro",
     "extraArgs": "--kv_cache_dtype fp8 -tp 8 --hf-overrides '{\"use_index_cache\": true, \"index_topk_freq\": 4}'",
-    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+    "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nATOM_DISABLE_AITER_CUSTOM_ALL_REDUCE=1",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
     "accuracy_threshold": 0.94,
