@@ -26,7 +26,7 @@ set -euo pipefail
 
 # ======================== configuration ========================
 MODEL_PATH="${MODEL_PATH:-/mnt/models/DeepSeek-V4-Pro/}"
-DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:nightly_202606051758}"
+DOCKER_IMAGE="${DOCKER_IMAGE:-rocm/atom-dev:nightly_202606071111-Jasen-fix_dockerfile}"
 CONTAINER="${CONTAINER:-atom_mesh_dsv4_2p1d_dpa_${SLURM_JOB_ID}}"
 
 PREFILL_TP="${PREFILL_TP:-8}"
@@ -415,17 +415,148 @@ trap cleanup EXIT
 trap 'echo "=== received signal, cleaning up ==="; exit 130' INT TERM
 
 # ======================== helper ========================
+
+# ── NIC detection (from ROCm/mori ci_run.sh) ─────────────────────────────────
+detect_nic_type() {
+    if [[ -n "${MORI_NIC_TYPE:-}" ]]; then
+        echo "$MORI_NIC_TYPE"
+        return
+    fi
+    local bnxt=0 mlx5=0 ionic=0
+    if [[ -d /sys/class/infiniband ]]; then
+        for dev in /sys/class/infiniband/*; do
+            local name
+            name=$(basename "$dev")
+            case "$name" in
+                bnxt_re*) ((bnxt++)) ;;
+                mlx5*)    ((mlx5++)) ;;
+                ionic*)   ((ionic++)) ;;
+                *)
+                    local drv
+                    drv=$(readlink -f "$dev/device/driver" 2>/dev/null || true)
+                    drv=$(basename "$drv" 2>/dev/null || true)
+                    case "$drv" in
+                        bnxt*)  ((bnxt++)) ;;
+                        mlx5*)  ((mlx5++)) ;;
+                        ionic*) ((ionic++)) ;;
+                    esac
+                    ;;
+            esac
+        done
+    fi
+    if (( bnxt >= mlx5 && bnxt >= ionic && bnxt > 0 )); then
+        echo "bnxt"
+    elif (( ionic >= mlx5 && ionic > 0 )); then
+        echo "ionic"
+    else
+        echo "mlx5"
+    fi
+}
+
+find_host_ibverbs() {
+    local candidates=(
+        /usr/lib64/libibverbs.so.1
+        /lib/x86_64-linux-gnu/libibverbs.so.1
+        /usr/lib/x86_64-linux-gnu/libibverbs.so.1
+    )
+    for c in "${candidates[@]}"; do
+        local resolved
+        resolved=$(readlink -f "$c" 2>/dev/null || true)
+        if [[ -f "$resolved" ]]; then
+            echo "$resolved"
+            return
+        fi
+    done
+}
+
+# Build bind-mount flags for out-of-tree RDMA userspace libraries.
+# Ensures container uses the host's RDMA stack regardless of the
+# container's base OS (e.g. Ubuntu 24.04 image on 22.04 host).
+nic_mount_flags() {
+    local nic_type="$1"
+    local flags=()
+    case "$nic_type" in
+        bnxt)
+            local host_ibverbs
+            host_ibverbs=$(find_host_ibverbs)
+            if [[ -n "$host_ibverbs" ]]; then
+                flags+=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
+            fi
+            for lib in /usr/local/lib/libbnxt_re-rdmav*.so; do
+                if [[ -f "$lib" ]]; then
+                    flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/libibverbs/$(basename "$lib")")
+                fi
+            done
+            for lib in /usr/local/lib/libbnxt_re.so; do
+                if [[ -f "$lib" ]]; then
+                    flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/$(basename "$lib")")
+                fi
+            done
+            if [[ -d /etc/libibverbs.d ]]; then
+                flags+=(-v /etc/libibverbs.d:/etc/libibverbs.d:ro)
+            fi
+            ;;
+        ionic)
+            local host_ibverbs
+            host_ibverbs=$(find_host_ibverbs)
+            if [[ -n "$host_ibverbs" ]]; then
+                flags+=(-v "$host_ibverbs:/lib/x86_64-linux-gnu/libibverbs.so.1")
+            fi
+            local ionic_dirs=(/usr/local/lib /usr/lib/x86_64-linux-gnu)
+            for dir in "${ionic_dirs[@]}"; do
+                for lib in "$dir"/libionic*.so; do
+                    if [[ -f "$lib" ]]; then
+                        local real
+                        real=$(readlink -f "$lib")
+                        if [[ -f "$real" ]]; then
+                            flags+=(-v "$real:$real")
+                        fi
+                        flags+=(-v "$lib:/usr/lib/x86_64-linux-gnu/$(basename "$lib")")
+                    fi
+                done
+            done
+            local provider_dir=/usr/lib/x86_64-linux-gnu/libibverbs
+            if [[ -d "$provider_dir" ]]; then
+                for lib in "$provider_dir"/libionic-rdmav*.so; do
+                    if [[ -f "$lib" ]]; then
+                        flags+=(-v "$lib:$lib")
+                    fi
+                done
+            fi
+            if [[ -d /etc/libibverbs.d ]]; then
+                flags+=(-v /etc/libibverbs.d:/etc/libibverbs.d:ro)
+            fi
+            ;;
+        mlx5)
+            ;;
+    esac
+    echo "${flags[@]}"
+}
+
 launch_container() {
     local node="$1"
     local role="$2"
     echo "[${role}] starting container on ${node}"
     srun --nodelist="$node" --nodes=1 --ntasks=1 bash -lc "
         set -euo pipefail
+
+        # ── Detect NIC type and build RDMA bind-mount flags on this node ──
+        $(declare -f detect_nic_type find_host_ibverbs nic_mount_flags)
+        NIC_TYPE=\$(detect_nic_type)
+        echo \"[docker] NIC type detected: \${NIC_TYPE} on \$(hostname)\"
+        read -ra NIC_MOUNTS <<< \"\$(nic_mount_flags \"\${NIC_TYPE}\")\"
+        if [[ \${#NIC_MOUNTS[@]} -gt 0 ]]; then
+            echo \"[docker] RDMA mounts: \${NIC_MOUNTS[*]}\"
+        else
+            echo \"[docker] no out-of-tree RDMA mounts needed\"
+        fi
+
         docker rm -f '${CONTAINER}' 2>/dev/null || true
         docker pull '${DOCKER_IMAGE}'
         docker run -d --name '${CONTAINER}' \
             --network host --ipc host --privileged \
             --device /dev/kfd --device /dev/dri \
+            --device /dev/infiniband \
             --group-add video \
             --cap-add IPC_LOCK --cap-add NET_ADMIN \
             --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 \
@@ -436,6 +567,7 @@ launch_container() {
             -v '${LOG_ROOT}/${role}':/workspace/logs \
             -v '${LOG_ROOT}/bench':/workspace/benchmark_results \
             -v '${LOG_ROOT}/gsm8k':/workspace/gsm8k_results \
+            \"\${NIC_MOUNTS[@]}\" \
             '${DOCKER_IMAGE}' sleep infinity
         docker inspect -f '{{.State.Status}}' '${CONTAINER}'
 
@@ -445,20 +577,6 @@ launch_container() {
             sysctl -w net.ipv4.tcp_max_syn_backlog=4096 2>/dev/null || true
         '
         echo \"[docker] tuned TCP backlog on \$(hostname)\"
-
-        # Fix ionic RDMA ABI mismatch (cross-rack)
-        HOST_IONIC=\$(ls /usr/lib/x86_64-linux-gnu/libionic.so.1.* 2>/dev/null \
-                      | grep -v '\\.a\$' | head -1 || true)
-        if [[ -n \"\${HOST_IONIC}\" && -f \"\${HOST_IONIC}\" ]]; then
-            IONIC_NAME=\$(basename \"\${HOST_IONIC}\")
-            docker cp \"\${HOST_IONIC}\" '${CONTAINER}':/usr/lib/x86_64-linux-gnu/\"\${IONIC_NAME}\"
-            docker exec '${CONTAINER}' bash -c \"
-                cd /usr/lib/x86_64-linux-gnu
-                ln -sf '\${IONIC_NAME}' libionic.so.1
-                cp -f '\${IONIC_NAME}' libibverbs/libionic-rdmav34.so 2>/dev/null || true
-            \"
-            echo \"[docker] patched libionic → \${IONIC_NAME} on \$(hostname)\"
-        fi
     "
 }
 
