@@ -763,9 +763,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if envs.is_set("ATOM_USE_TRITON_MOE"):
             self.use_triton = envs.ATOM_USE_TRITON_MOE
         else:
-            self.use_triton = (
-                gfx.startswith("gfx94")
-                or (gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM)
+            self.use_triton = gfx.startswith("gfx94") or (
+                gfx.startswith("gfx95") and envs.ATOM_USE_TRITON_GEMM
             )
         logger.info(f"Mxfp4MoEMethod use_triton = {self.use_triton}")
         if self.use_triton:
@@ -952,10 +951,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
             # 64 // 2 = 32, tile_k = 128). w13 is the (gate|up) operand
             # (rows = 2*inter, k_dim = model_dim); w2 (down) has
             # rows = model_dim, k_dim = inter.
-            from aiter.fused_moe import _grouped_a8w4_prepare_scale_batch
+            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
+                _grouped_a8w4_prepare_scale_batch,
+            )
 
-            _GROUPED_WARP_TILE_N = 32
-            _GROUPED_TILE_K = 128
+            _GROUPED_WARP_TILE_N = 64
+            _GROUPED_TILE_K = 256
             layer.w13_weight_scale = atom_parameter(
                 _grouped_a8w4_prepare_scale_batch(
                     layer.w13_weight_scale.data,
