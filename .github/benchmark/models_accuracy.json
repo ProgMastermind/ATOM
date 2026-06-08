@@ -124,7 +124,7 @@
     "model_name": "Qwen3-Next-80B-A3B-Thinking",
     "model_path": "Qwen/Qwen3-Next-80B-A3B-Thinking",
     "extraArgs": "-tp 8 --kv_cache_dtype fp8 --no-enable_prefix_caching",
-    "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1",
+    "env_vars": "ATOM_ENABLE_QK_NORM_ROPE_CACHE_QUANT_FUSION=1\nNCCL_DEBUG=INFO\nRCCL_LOG_LEVEL=INFO\nAMD_SERIALIZE_KERNEL=3",
     "runner": "linux-atom-do-mi350x-8",
     "test_level": "pr",
     "accuracy_threshold": 0.65,
