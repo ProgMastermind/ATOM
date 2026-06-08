@@ -28,7 +28,7 @@ from atom.model_ops.moe_utils import (
 )
 from atom.utils import envs
 
-if envs.ATOM_USE_TRITON_GEMM:
+if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
     from aiter.ops.triton.moe.moe_routing.routing import routing
     from aiter.ops.triton.moe.moe_op_gemm_a8w4 import (
         moe_gemm_a8w4,
@@ -47,7 +47,7 @@ def _swizzle_mxfp4(w1, w1_scale, w2, w2_scale, w_dtype, N_1, K_1, N_2, K_2, TP=1
     """weight swizzle for mxfp4 moe, used for aiter triton weight mxfp4 moe method/kernels"""
 
     # assert environment variable is active for use with triton gemm
-    assert envs.ATOM_USE_TRITON_GEMM
+    assert envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE
 
     # transposing for expected layout of aiter triton kernels
     w1_triton_layout = w1.transpose(-2, -1)
