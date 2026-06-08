@@ -25,7 +25,14 @@ def is_rocm_aiter_fusion_shared_expert_enabled_for_quant_config(
         return False
 
     if quant_config is not None and shared_expert_prefix is not None:
-        shared_spec = quant_config.get_layer_quant_config(shared_expert_prefix)
+        # shared_expert_prefix points at the shared expert module, while quant
+        # exclude entries are usually leaf weights under that module
+        # (e.g. shared_expert.down_proj).  Match children here; otherwise a
+        # BF16 shared expert can be mistaken for the global routed expert dtype.
+        shared_spec = quant_config.get_layer_quant_config(
+            shared_expert_prefix,
+            check_children=True,
+        )
         routed_spec = (
             quant_config.get_layer_quant_config(routed_expert_prefix)
             if routed_expert_prefix is not None
