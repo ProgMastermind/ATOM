@@ -344,13 +344,16 @@ class FusedMoEModularKernel(torch.nn.Module):
             if dispatch_scale is not None:
                 dispatch_scale = dispatch_scale[:total_valid_tokens]
 
+        # aiter's expert_mask slot expects a BINARY 0/1 mask (1 = local expert), NOT the
+        # index map. Convert here like the Fp8MoEMethod path. (Defensive: modular path is
+        # not hit by Step-3.5 but shares the index-map-into-mask bug pattern.)
         fused_out = fused_moe(
             dispatch_a1,
             w1,
             w2,
             dispatch_weights,
             dispatch_ids,
-            expert_map,
+            (expert_map > -1).to(torch.int32) if expert_map is not None else None,
             activation,
             quant_type=quant_type,
             num_local_tokens=expert_tokens_meta.expert_num_tokens,

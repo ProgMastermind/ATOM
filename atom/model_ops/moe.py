@@ -1576,13 +1576,20 @@ class CompressedTensorsFp8MoEMethod(FusedMoEMethodBase):
                 apply_router_weight_on_input=apply_router_weight_on_input,
             )
         else:
+            # aiter expects a BINARY 0/1 expert_mask (1 = local expert), NOT the index
+            # map; pass binary like the Fp8MoEMethod path above. (Defensive: not hit by
+            # Step-3.5 but same index-map-into-mask bug pattern.)
             return torch.ops.aiter.rocm_aiter_fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                expert_mask=expert_map,
+                expert_mask=(
+                    (expert_map > -1).to(torch.int32)
+                    if expert_map is not None
+                    else None
+                ),
                 activation=activation.value,
                 quant_type=self.quant_type.value,
                 w1_scale=layer.w13_weight_scale,
@@ -1962,13 +1969,21 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         # per_Tensor doesn't support num_local_tokens, so fallback to
         # rocm_aiter_fused_moe when using per-tensor or no modular kernel.
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
+            # aiter expects a BINARY 0/1 expert_mask (1 = local expert), NOT the index
+            # map. merged ATOM forwards the index-map expert_map (-1 / 0..N-1) here, which
+            # aiter mis-reads -> ck_moe_stage1 OOB (HIP illegal memory access). Convert to
+            # binary (matches the pre-merge mask that ran clean on this same aiter).
             return torch.ops.aiter.rocm_aiter_fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
                 topk_weights,
                 topk_ids,
-                expert_mask=expert_map,
+                expert_mask=(
+                    (expert_map > -1).to(torch.int32)
+                    if expert_map is not None
+                    else None
+                ),
                 activation=activation.value,
                 quant_type=self.quant_type.value,
                 w1_scale=layer.w13_weight_scale,
