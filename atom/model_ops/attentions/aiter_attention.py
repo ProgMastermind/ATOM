@@ -756,7 +756,13 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         hf_config = config.hf_config
         num_query_heads = self.num_attention_heads
         num_kv_heads = max(
-            1, hf_config.num_key_value_heads // get_tp_group().world_size
+            1,
+            getattr(
+                hf_config,
+                "num_key_value_heads",
+                getattr(hf_config, "num_attention_groups", None),
+            )
+            // get_tp_group().world_size,
         )
         p = f"ub{ubatch_idx}_"
         var = self.model_runner.forward_vars
