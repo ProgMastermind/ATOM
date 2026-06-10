@@ -15,7 +15,8 @@ Step-3.5 is a sparse MoE transformer with:
     sigmoid routing with learnable router bias
   - Dense MLP on layers 0-2
   - Per-layer SwiGLU clamp limits
-  - Multi-token prediction (MTP) with num_nextn_predict_layers=3
+  - Multi-token prediction (MTP) config (num_nextn_predict_layers=3) is present
+    but NOT implemented here (not needed for standard inference).
 """
 
 import os
@@ -292,8 +293,10 @@ class Step3p5MoE(nn.Module):
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_size)
 
-        # Router logits must be computed in fp32 (need_fp32_gate=True in config)
-        if getattr(self, "_need_fp32_gate", True):
+        # Router logits must be computed in fp32 (need_fp32_gate=True in config).
+        # self._need_fp32_gate is always set in __init__ (default False when the
+        # config field is absent), so read it directly.
+        if self._need_fp32_gate:
             router_logits = torch.nn.functional.linear(
                 hidden_states.float(), self.gate.weight.float()
             )
@@ -436,6 +439,8 @@ class Step3p5Attention(nn.Module):
         sinks = None
         if is_sliding:
             sliding_window = getattr(config, "sliding_window", None)
+            # config.sink may be False (bool) or an int; only a positive int
+            # enables attention sinks (False/0 -> no sinks).
             sink_size = getattr(config, "sink", 0)
             if sink_size > 0:
                 sinks = nn.Parameter(torch.empty(self.num_heads, requires_grad=False))
