@@ -30,6 +30,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "ATOM_DP_MASTER_PORT": lambda: int(os.getenv("ATOM_DP_MASTER_PORT", "29500")),
     # --- Compilation & Execution ---
     "ATOM_USE_TRITON_GEMM": lambda: os.getenv("ATOM_USE_TRITON_GEMM", "0") == "1",
+    # Force the unquantized (bf16/fp16) Linear path through the AITER Triton/gluon
+    # gemm_a16w16 kernel instead of tgemm.mm. Auto-detects backend (gluon on
+    # gfx1250, triton elsewhere). K is zero-padded to a 256 multiple as needed.
+    "ATOM_FORCE_TRITON_GEMM_BF16": lambda: os.getenv("ATOM_FORCE_TRITON_GEMM_BF16", "0")
+    == "1",
     "ATOM_USE_TRITON_MXFP4_BMM": lambda: (
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),

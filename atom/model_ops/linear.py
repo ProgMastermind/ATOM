@@ -46,6 +46,21 @@ def use_fp4_non_shuffle_triton_gemm() -> bool:
     return envs.ATOM_USE_FP4_NON_SHUFFLE_TRITON_GEMM
 
 
+def force_triton_gemm_bf16() -> bool:
+    return envs.ATOM_FORCE_TRITON_GEMM_BF16
+
+
+if force_triton_gemm_bf16():
+    try:
+        # Auto-dispatches to the gfx1250 gluon a16w16 kernel; triton elsewhere.
+        from aiter.ops.triton.gemm.basic.gemm_a16w16 import gemm_a16w16  # noqa: E402
+    except ImportError as e:
+        logger.warning(f"Triton/gluon a16w16 GEMM not available: {e}")
+        gemm_a16w16 = None
+else:
+    gemm_a16w16 = None
+
+
 if use_fp4_non_shuffle_triton_gemm():
     try:
         from aiter.ops.triton.gemm_afp4wfp4 import gemm_afp4wfp4  # noqa: E402
@@ -266,6 +281,31 @@ def gemm_a8w8_blockscale_preshuffle_impl(
 
 
 class LinearBase(nn.Module):
+    # LCM of the gfx1250 gluon a16w16 BLOCK_K values {64, 128, 256}; padding K up
+    # to this multiple keeps it divisible by whichever BLOCK_K the tuned config
+    # selects, satisfying the kernel's K % BLOCK_K == 0 requirement.
+    _A16W16_K_MULTIPLE = 256
+
+    def _a16w16_mm(self, x: torch.Tensor, otype) -> torch.Tensor:
+        """Unquantized matmul via the AITER Triton/gluon a16w16 kernel.
+
+        Computes Y = X @ Wᵀ (+ bias). K is zero-padded to a multiple of
+        ``_A16W16_K_MULTIPLE`` when needed (exact, since the padding columns are
+        zero); the static weight's padded copy is cached on first use.
+        """
+        K = x.shape[-1]
+        K_pad = -(-K // self._A16W16_K_MULTIPLE) * self._A16W16_K_MULTIPLE
+        w = self.weight
+        if K_pad != K:
+            pad = K_pad - K
+            if getattr(self, "_a16w16_weight_pad", None) is None:
+                self._a16w16_weight_pad = torch.nn.functional.pad(self.weight, (0, pad))
+            w = self._a16w16_weight_pad
+            x = torch.nn.functional.pad(x, (0, pad))
+        x2d = x.reshape(-1, x.shape[-1])
+        y = gemm_a16w16(x2d, w, self.bias, dtype=otype)
+        return y.reshape(*x.shape[:-1], y.shape[-1])
+
     def __init__(
         self,
         input_size: int,
@@ -600,12 +640,15 @@ class LinearBase(nn.Module):
         self, x: torch.Tensor, x_scale: Optional[torch.Tensor] = None, otype=dtypes.bf16
     ) -> torch.Tensor:
         if self.quant_type.value == QuantType.No.value:
-            y = tgemm.mm(
-                x,
-                self.weight,
-                self.bias,
-                otype=otype,
-            )
+            if force_triton_gemm_bf16() and gemm_a16w16 is not None:
+                y = self._a16w16_mm(x, otype)
+            else:
+                y = tgemm.mm(
+                    x,
+                    self.weight,
+                    self.bias,
+                    otype=otype,
+                )
         else:
             if x_scale is None:
                 quant_func = self.quant_func
