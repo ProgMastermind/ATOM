@@ -183,12 +183,6 @@ class MiniMaxM2Attention(nn.Module):
         )
         self.rotary_dim = rotary_dim
         self.kv_cache_dtype = kv_cache_dtype
-        self.delegate_qknorm_rope_to_vllm = (
-            is_vllm()
-            and self.use_qk_norm
-            and self.tp_size > 1
-            and self.kv_cache_dtype == "fp8"
-        )
         cos = self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
         sin = self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
         self.register_buffer(
@@ -213,6 +207,13 @@ class MiniMaxM2Attention(nn.Module):
                 self.k_norm.weight.weight_loader = self._make_tp_norm_loader(
                     self.total_num_kv_heads * self.head_dim
                 )
+
+        self.delegate_qknorm_rope_to_vllm = (
+            is_vllm()
+            and self.use_qk_norm
+            and self.tp_size > 1
+            and self.kv_cache_dtype == "fp8"
+        )
 
         self.attn = Attention(
             self.num_heads,
