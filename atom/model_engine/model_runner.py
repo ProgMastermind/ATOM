@@ -1203,6 +1203,12 @@ class ModelRunner:
             "num_key_value_heads",
             getattr(hf_config, "num_attention_groups", None),
         )
+        if num_kv_heads_cfg is None:
+            raise ValueError(
+                "Model config has neither 'num_key_value_heads' nor "
+                "'num_attention_groups'; cannot determine number of KV heads "
+                f"for {getattr(hf_config, 'architectures', hf_config)}"
+            )
         if num_kv_heads_cfg >= self.world_size:
             assert num_kv_heads_cfg % self.world_size == 0
             return num_kv_heads_cfg // self.world_size
@@ -1461,6 +1467,12 @@ class ModelRunner:
             "num_key_value_heads",
             getattr(hf_config, "num_attention_groups", None),
         )
+        if num_kv_heads_cfg is None:
+            raise ValueError(
+                "Model config has neither 'num_key_value_heads' nor "
+                "'num_attention_groups'; cannot determine number of KV heads "
+                f"for {getattr(hf_config, 'architectures', hf_config)}"
+            )
         if num_kv_heads_cfg >= self.world_size:
             assert num_kv_heads_cfg % self.world_size == 0
             num_kv_heads = num_kv_heads_cfg // self.world_size
