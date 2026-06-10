@@ -4,6 +4,7 @@ import torch
 from aiter.dist.communication_op import (
     tensor_model_parallel_all_reduce,
     tensor_model_parallel_fused_qknorm_allreduce_rope,
+    tensor_model_parallel_fused_qknorm_allreduce_rope_cache_quant,
 )
 from aiter.dist.parallel_state import (
     get_pp_group,
@@ -27,6 +28,7 @@ from atom.models.utils import (
 )
 from atom.utils import envs
 from atom.utils.decorators import support_torch_compile
+from atom.utils.forward_context import get_forward_context
 from torch import nn
 from transformers import PretrainedConfig
 
@@ -179,6 +181,7 @@ class MiniMaxM2Attention(nn.Module):
             rope_scaling=rope_scaling,
         )
         self.rotary_dim = rotary_dim
+        self.kv_cache_dtype = kv_cache_dtype
         cos = self.rotary_emb.cos_cache.squeeze(-2).squeeze(-2)
         sin = self.rotary_emb.sin_cache.squeeze(-2).squeeze(-2)
         self.register_buffer(
@@ -244,16 +247,64 @@ class MiniMaxM2Attention(nn.Module):
                 cos_sin_cache = self.qknorm_rope_cos_sin_cache
                 if cos_sin_cache.dtype != qkv.dtype or cos_sin_cache.device != qkv.device:
                     cos_sin_cache = cos_sin_cache.to(device=qkv.device, dtype=qkv.dtype)
-                q, k, v = tensor_model_parallel_fused_qknorm_allreduce_rope(
-                    qkv,
-                    self.q_norm.weight,
-                    self.k_norm.weight,
-                    cos_sin_cache,
-                    positions,
-                    self.head_dim,
-                    self.rotary_dim,
-                    self.rms_norm_eps,
+                fwd_ctx = get_forward_context()
+                use_fused_cache_quant = (
+                    self.kv_cache_dtype == "fp8"
+                    and hasattr(self.attn, "impl")
+                    and not fwd_ctx.context.is_dummy_run
+                    and f"layer_{self.layer_num}" in fwd_ctx.kv_cache_data
                 )
+                if use_fused_cache_quant:
+                    kv_cache = fwd_ctx.kv_cache_data[f"layer_{self.layer_num}"]
+                    k_cache = kv_cache.k_cache
+                    v_cache = kv_cache.v_cache
+                    k_scale = kv_cache.k_scale
+                    v_scale = kv_cache.v_scale
+                    if k_scale is not None and v_scale is not None:
+                        x = 16 // k_cache.element_size()
+                        if k_cache.dim() == 5 and v_cache.dim() == 4:
+                            n, nh, hd, bs = v_cache.shape
+                            v_cache = v_cache.view(n, nh, bs // x, hd, x)
+                        q, k, v = (
+                            tensor_model_parallel_fused_qknorm_allreduce_rope_cache_quant(
+                                qkv,
+                                self.q_norm.weight,
+                                self.k_norm.weight,
+                                cos_sin_cache,
+                                positions,
+                                k_cache,
+                                v_cache,
+                                k_scale,
+                                v_scale,
+                                fwd_ctx.attn_metadata.slot_mapping,
+                                self.head_dim,
+                                self.rotary_dim,
+                                self.rms_norm_eps,
+                            )
+                        )
+                        self.attn.impl._skip_next_kv_cache_write = True
+                    else:
+                        q, k, v = tensor_model_parallel_fused_qknorm_allreduce_rope(
+                            qkv,
+                            self.q_norm.weight,
+                            self.k_norm.weight,
+                            cos_sin_cache,
+                            positions,
+                            self.head_dim,
+                            self.rotary_dim,
+                            self.rms_norm_eps,
+                        )
+                else:
+                    q, k, v = tensor_model_parallel_fused_qknorm_allreduce_rope(
+                        qkv,
+                        self.q_norm.weight,
+                        self.k_norm.weight,
+                        cos_sin_cache,
+                        positions,
+                        self.head_dim,
+                        self.rotary_dim,
+                        self.rms_norm_eps,
+                    )
             else:
                 q, k, v = torch.split(
                     qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1
