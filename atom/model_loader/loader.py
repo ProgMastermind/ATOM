@@ -571,7 +571,14 @@ def load_model(
                             )
 
                             if matched:
-                                loaded_weights_record.add(prefix + name)
+                                # Record the MAPPED param name (e.g.
+                                # moe.experts.w13_weight), not the ckpt name
+                                # (e.g. moe.gate_proj.weight): the post-load
+                                # verification below diffs against params_dict
+                                # keys (param names), so recording the ckpt name
+                                # makes fused-expert params (w13_weight/w2_weight)
+                                # falsely show up as "NOT loaded".
+                                loaded_weights_record.add(prefix + name_mapped)
                                 break
 
                         if matched:
