@@ -227,6 +227,10 @@ class PagedAttentionImpl(nn.Module):
         elif use_triton_attn and self.rotary_emb is not None:
             self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
+            if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+                q_out = torch.empty(*q.shape, dtype=k_cache.dtype, device=q.device)
+            else:
+                q_out = q
             q, k, k_cache, v_cache = fused_qk_rope_reshape_and_cache(
                 q,
                 k,
@@ -243,7 +247,7 @@ class PagedAttentionImpl(nn.Module):
                 flash_layout=self.use_flash_layout,
                 apply_scale=self.kv_cache_dtype.startswith("fp8"),
                 offs=None,
-                q_out=q,
+                q_out=q_out,
                 k_out=k,
                 output_zeros=False,
             )
@@ -398,7 +402,11 @@ class PagedAttentionImpl(nn.Module):
 
         attn_metadata = fwd_ctx.attn_metadata
 
-        o = torch.empty_like(q)
+        if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+            o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
+        else:
+            o = torch.empty_like(q)
+
         num_seqs = attn_metadata.context_lens.shape[0]
 
         if envs.ATOM_USE_UNIFIED_ATTN or self.use_flash_layout:
@@ -594,21 +602,31 @@ class PagedAttentionImpl(nn.Module):
 
         attn_metadata = fwd_ctx.attn_metadata
 
-        o = torch.empty_like(q)
+        if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+            o = torch.empty(*q.shape, dtype=torch.bfloat16, device=q.device)
+        else:
+            o = torch.empty_like(q)
+
         sliding_window = (
             (self.sliding_window - 1, 0) if self.sliding_window > 0 else (-1, -1)
         )
 
         # `block_tables` is always populated by TritonMHAMetadataBuilder.
-        # For pure prefill (no cached tokens) it is the fake table built in
-        # prepare_prefill that maps seq i to token indices
+        # For pure prefill (no cached tokens) it is, by default, the fake table
+        # built in prepare_prefill that maps seq i to token indices
         # [cu_seqlens_k[i], ..., cu_seqlens_k[i+1]-1], paired with raw K/V
         # treated as kv_cache with block_size=1.
-        if attn_metadata.has_cached:
+        #
+        # Under ATOM_USE_UNIFIED_ATTN, prepare_prefill instead uploads the real
+        # per-seq block_table and reads from KV cache, the new tokens
+        # already written into the paged flash-layout cache during rope_cache
+        # are read straight from `k_cache`/`v_cache`, identical to the
+        # prefix-cache-hit path.
+        if envs.ATOM_USE_UNIFIED_ATTN or attn_metadata.has_cached:
             k_for_attn = k_cache
             v_for_attn = v_cache
-            # Cached path reads the paged KV cache, which is 5D SHUFFLE unless
-            # the (legacy) 4D flash layout is in use.
+            # Reads the paged KV cache, which is 5D SHUFFLE unless the (default)
+            # 4D flash layout is in use.
             shuffled_kv_cache = not self.use_flash_layout
         else:
             #   k: [total_tokens, num_kv_heads, head_size]
