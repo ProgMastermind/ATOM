@@ -241,7 +241,12 @@ class MLPBlock(torch.nn.Module):
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         num_tokens = x.shape[0]
 
-        g = self.router(x[..., : self.hidden_size])
+        # At tp==1 the feeding RMSNorm pads x to a 256-multiple and the router
+        # weight K is padded to match (see TransformerBlock), so consume the
+        # padded activation directly. Slicing back to hidden_size here would
+        # break the GEMM whenever it falls back off the triton bf16 path
+        # (which is the only path that re-pads defensively).
+        g = self.router(x[..., : self.router.weight.shape[1]])
 
         # Pad input for MXFP4 MoE GEMM alignment if needed
         if self.moe_hidden_pad > 0 and self.tp_size > 1:
@@ -291,7 +296,10 @@ class TransformerBlock(torch.nn.Module):
         self.input_layernorm = RMSNorm(
             config.hidden_size,
             eps=1e-5,
-            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION and layer_num > 0,
+            fused_allreduce=ENABLE_ALLREDUCE_RMSNORM_FUSION
+            and self.tp_size > 1
+            and layer_num > 0,
+            x_pad_to_multiple=0 if self.tp_size > 1 else 256,
         )
         # Fuse o_proj AllReduce into post_attention_layernorm.
         # Padding for MXFP4 MoE GEMM alignment is now handled inside MLPBlock,
