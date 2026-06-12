@@ -14,7 +14,7 @@ from aiter import (
     concat_and_cache_mla,
     dtypes,
     flash_attn_varlen_func,
-    fused_qk_rope_concat_and_cache_mla,
+    fused_qk_rope_concat_and_cache_mla_seg,
     get_hip_quant,
 )
 from aiter.dist.parallel_state import get_dp_group
@@ -40,8 +40,8 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
 )
-fused_qk_rope_concat_and_cache_mla = mark_trace(
-    fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
+fused_qk_rope_concat_and_cache_mla_seg = mark_trace(
+    fused_qk_rope_concat_and_cache_mla_seg, prefix="rope_and_kv_cache", torch_compile=False
 )
 mla_prefill_fwd = mark_trace(mla_prefill_fwd, prefix="mla_prefill", torch_compile=False)
 mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=False)
@@ -918,7 +918,7 @@ class MLAAttention(nn.Module):
                 device=q_nope.device,
             )
             if kv_cache.numel() > 0:
-                fused_qk_rope_concat_and_cache_mla(
+                fused_qk_rope_concat_and_cache_mla_seg(
                     q_nope,
                     q_rope,
                     k_nope,
