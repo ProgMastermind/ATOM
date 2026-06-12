@@ -167,6 +167,15 @@
           "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
         },
         {
+          "tp_size": 2,
+          "display": "Kimi-K2.5-MXFP4 TP2 (AW)",
+          "dashboard_model": "Kimi-K2.5-MXFP4-aw-tp2",
+          "prefix": "kimi-k2-5-mxfp4-aw-tp2",
+          "bench_args": "",
+          "extra_args": "--trust-remote-code --tensor-parallel-size 2 --max-num-batched-tokens 16384 --max-model-len 16384",
+          "env_vars": "AITER_QUICK_REDUCE_QUANTIZATION=INT4"
+        },
+        {
           "tp_size": 4,
           "display": "Kimi-K2.5-MXFP4 TP4 (AW)",
           "dashboard_model": "Kimi-K2.5-MXFP4-aw-tp4",

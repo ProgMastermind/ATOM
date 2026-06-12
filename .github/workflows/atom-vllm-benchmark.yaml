@@ -56,6 +56,7 @@ on:
           - gpt-oss-120b TP1 (AW)
           - gpt-oss-120b TP2 (AW)
           - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP2 (AW)
           - Kimi-K2.5-MXFP4 TP4 (AW)
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP1 (AW)
@@ -97,6 +98,7 @@ on:
           - gpt-oss-120b TP1 (AW)
           - gpt-oss-120b TP2 (AW)
           - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP2 (AW)
           - Kimi-K2.5-MXFP4 TP4 (AW)
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP1 (AW)
@@ -138,6 +140,7 @@ on:
           - gpt-oss-120b TP1 (AW)
           - gpt-oss-120b TP2 (AW)
           - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP2 (AW)
           - Kimi-K2.5-MXFP4 TP4 (AW)
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP1 (AW)
@@ -179,6 +182,7 @@ on:
           - gpt-oss-120b TP1 (AW)
           - gpt-oss-120b TP2 (AW)
           - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP2 (AW)
           - Kimi-K2.5-MXFP4 TP4 (AW)
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP1 (AW)
@@ -220,6 +224,7 @@ on:
           - gpt-oss-120b TP1 (AW)
           - gpt-oss-120b TP2 (AW)
           - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP2 (AW)
           - Kimi-K2.5-MXFP4 TP4 (AW)
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP1 (AW)
@@ -261,6 +266,7 @@ on:
           - gpt-oss-120b TP1 (AW)
           - gpt-oss-120b TP2 (AW)
           - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP2 (AW)
           - Kimi-K2.5-MXFP4 TP4 (AW)
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP1 (AW)
@@ -302,6 +308,7 @@ on:
           - gpt-oss-120b TP1 (AW)
           - gpt-oss-120b TP2 (AW)
           - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP2 (AW)
           - Kimi-K2.5-MXFP4 TP4 (AW)
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP1 (AW)
@@ -343,6 +350,7 @@ on:
           - gpt-oss-120b TP1 (AW)
           - gpt-oss-120b TP2 (AW)
           - gpt-oss-120b TP8 (AW)
+          - Kimi-K2.5-MXFP4 TP2 (AW)
           - Kimi-K2.5-MXFP4 TP4 (AW)
           - Kimi-K2.5-MXFP4 TP8 (AW)
           - MiniMax-M2.5 TP1 (AW)
@@ -936,6 +944,7 @@ jobs:
               "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
               "GLM-4.7-FP8 TP4 (AW)",
               "GLM-4.7-FP8 MTP TP4 (AW)",
+              "Kimi-K2.5-MXFP4 TP2 (AW)",
               "Kimi-K2.5-MXFP4 TP4 (AW)",
               "MiniMax-M2.5 TP2 (AW)",
           }
@@ -1138,6 +1147,7 @@ jobs:
               "Qwen3-Next-80B-A3B-Instruct-FP8-MTP TP1 (AW)",
               "GLM-4.7-FP8 TP4 (AW)",
               "GLM-4.7-FP8 MTP TP4 (AW)",
+              "Kimi-K2.5-MXFP4 TP2 (AW)",
               "Kimi-K2.5-MXFP4 TP4 (AW)",
               "MiniMax-M2.5 TP2 (AW)",
           }
