@@ -12,8 +12,10 @@ import triton.language as tl
 from aiter import (
     QuantType,
     concat_and_cache_mla,
+    concat_and_cache_mla_seg,
     dtypes,
     flash_attn_varlen_func,
+    fused_qk_rope_concat_and_cache_mla,
     fused_qk_rope_concat_and_cache_mla_seg,
     get_hip_quant,
 )
@@ -40,6 +42,12 @@ from aiter.ops.triton.batched_gemm_a8w8_a_per_token_group_prequant_w_per_batched
 concat_and_cache_mla = mark_trace(
     concat_and_cache_mla, prefix="kv_cache", torch_compile=False
 )
+concat_and_cache_mla_seg = mark_trace(
+    concat_and_cache_mla_seg, prefix="kv_cache_seg", torch_compile=False
+)
+fused_qk_rope_concat_and_cache_mla = mark_trace(
+    fused_qk_rope_concat_and_cache_mla, prefix="rope_and_kv_cache", torch_compile=False
+)
 fused_qk_rope_concat_and_cache_mla_seg = mark_trace(
     fused_qk_rope_concat_and_cache_mla_seg, prefix="rope_and_kv_cache", torch_compile=False
 )
@@ -51,6 +59,20 @@ mla_decode_fwd = mark_trace(mla_decode_fwd, prefix="mla_decode", torch_compile=F
 logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
+
+# The fused seg MLA kernels (fused_qk_rope_concat_and_cache_mla_seg +
+# concat_and_cache_mla_seg + the gfx1250 mla_decode_fwd asm) share a single
+# segmented KV cache layout (all tokens' nope packed first, then all tokens'
+# pe) and a fixed page size hard-coded in the kernels.
+_MLA_SEG_PAGE_SIZE = 64
+# The gfx1250 decode asm consumes an fp8 Q whose per-head row stride is padded
+# to 768 bytes (poc_kl pack_q_page1_padded layout). q_out is allocated with this
+# padded last dim and sliced to the logical kv_lora_rank + qk_rope_head_dim
+# columns; the padding tail is never read by the decode kernel.
+_MLA_Q_OUT_PADDED_DIM = 768
+# Dims the fused seg kernels are compiled against (KV_LORA / PE_DIM constexprs).
+_MLA_SEG_KV_LORA_RANK = 512
+_MLA_SEG_PE_DIM = 64
 
 if use_triton_gemm():
     try:
@@ -164,6 +186,54 @@ class MLAAttention(nn.Module):
             else None
         )
         self.layer_num = layer_num
+        # When the triton MLA backend is selected we keep the original
+        # interleaved KV cache layout (concat_and_cache_mla /
+        # fused_qk_rope_concat_and_cache_mla) and an unpadded 576-wide q_out;
+        # only the gfx1250 asm decode path needs the segmented layout + 768 pad.
+        self.use_triton_mla = bool(envs.ATOM_USE_TRITON_MLA)
+        # One-shot guard so the seg-layout constraint checks run once per layer
+        # instead of on every forward step.
+        self._seg_layout_validated = False
+
+    def _validate_seg_layout(self, attn_metadata, positions) -> None:
+        """Validate the static constraints required by the segmented MLA
+        kernels (fused_qk_rope_concat_and_cache_mla_seg / concat_and_cache_mla_seg
+        / gfx1250 mla_decode_fwd). Runs once per layer."""
+        if self._seg_layout_validated:
+            return
+        page_size = get_current_atom_config().kv_cache_block_size
+        assert page_size == _MLA_SEG_PAGE_SIZE, (
+            "seg MLA kernels require kv_cache_block_size == "
+            f"{_MLA_SEG_PAGE_SIZE}, got {page_size}"
+        )
+        assert self.kv_cache_dtype.startswith("fp8"), (
+            "fused seg MLA write/decode path requires an fp8 kv cache "
+            f"(kv_cache_dtype={self.kv_cache_dtype})"
+        )
+        assert attn_metadata.dtype_q == dtypes.fp8, (
+            f"seg q_out must be fp8, got dtype_q={attn_metadata.dtype_q}"
+        )
+        assert (
+            self.kv_lora_rank == _MLA_SEG_KV_LORA_RANK
+            and self.qk_rope_head_dim == _MLA_SEG_PE_DIM
+        ), (
+            "fused seg kernel is fixed to kv_lora_rank="
+            f"{_MLA_SEG_KV_LORA_RANK}, qk_rope_head_dim={_MLA_SEG_PE_DIM}; got "
+            f"{self.kv_lora_rank}, {self.qk_rope_head_dim}"
+        )
+        cos_dim = self.rotary_emb.cos_cache.shape[-1]
+        assert cos_dim == self.qk_rope_head_dim // 2, (
+            f"cos/sin cache last dim must be {self.qk_rope_head_dim // 2} "
+            f"(reuse_freqs_front_part), got {cos_dim}"
+        )
+        assert positions.dtype == torch.int64, (
+            f"positions must be int64 for the seg kernel, got {positions.dtype}"
+        )
+        assert attn_metadata.slot_mapping.dtype == torch.int64, (
+            "slot_mapping must be int64 for the seg kernel, got "
+            f"{attn_metadata.slot_mapping.dtype}"
+        )
+        self._seg_layout_validated = True
 
     def process_weights_after_loading(self):
         if is_rocm_aiter_fp4bmm_enabled():
@@ -369,6 +439,7 @@ class MLAAttention(nn.Module):
             k_full,
             v_full,
             weight_preshuffle=getattr(self.kv_b_proj.weight, "is_shuffled", False),
+            seg_layout=True,
         )
         output = flash_attn_varlen_func(
             q=prefill_q,
@@ -482,6 +553,7 @@ class MLAAttention(nn.Module):
                 k_chunk,
                 v_chunk,
                 weight_preshuffle=weight_preshuffle,
+                seg_layout=True,
             )
             suf_out, suf_lse = flash_attn_varlen_func(
                 q=prefill_q,
@@ -659,6 +731,13 @@ class MLAAttention(nn.Module):
         if self.head_repeat_factor > 1:
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
 
+        # q arrives with a padded per-head row stride (_MLA_Q_OUT_PADDED_DIM);
+        # slice back to the logical kv_lora_rank + qk_rope_head_dim columns. The
+        # slice keeps the padded row stride, which the asm kernel expects. The
+        # triton path uses an unpadded 576-wide q_out, so no slicing is needed.
+        if not self.use_triton_mla:
+            q = q[..., : self.kv_lora_rank + self.qk_rope_head_dim]
+
         o = torch.empty(
             B,
             self.padded_num_heads,
@@ -728,6 +807,13 @@ class MLAAttention(nn.Module):
         if self.head_repeat_factor > 1:
             q = q.repeat_interleave(self.head_repeat_factor, dim=1)
 
+        # q arrives with a padded per-head row stride (_MLA_Q_OUT_PADDED_DIM);
+        # slice back to the logical kv_lora_rank + qk_rope_head_dim columns. The
+        # slice keeps the padded row stride, which the asm kernel expects. The
+        # triton path uses an unpadded 576-wide q_out, so no slicing is needed.
+        if not self.use_triton_mla:
+            q = q[..., : self.kv_lora_rank + self.qk_rope_head_dim]
+
         o = torch.empty(
             B,
             self.padded_num_heads,
@@ -765,12 +851,49 @@ class MLAAttention(nn.Module):
                 attn_metadata.triton_block_table,
                 attn_metadata.context_lens,
                 attn_metadata.triton_attn_logits,
-                4,  # num_kv_splits
+                # Must match triton_attn_logits.shape[2] allocated in
+                # TritonMLAMetadataBuilder (num_kv_splits=4); the kernel asserts
+                # num_kv_splits == attn_logits.shape[2].
+                attn_metadata.triton_attn_logits.shape[2],  # num_kv_splits
                 self.scale,
                 page_size,
                 k_scale=self._k_scale,
                 v_scale=self._k_scale,
             )
+
+            if envs.ATOM_DUMP_MLA_DECODE and not self.is_sparse_mla:
+                # Dump the token-major (interleaved) KV cache + this layer's
+                # decode inputs so op_tests/test_mla_decode_replay.py can replay
+                # them through AITER mla_decode_fwd vs the Triton reference.
+                from atom.utils.mla_decode_dump import dump_decode_mla
+
+                dump_decode_mla(
+                    layer_num=self.layer_num,
+                    q=q,
+                    kv_buffer_view=kv_c_and_k_pe_cache.view(
+                        -1, page_size, 1, q.shape[-1]
+                    ),
+                    o=o,
+                    qo_indptr=attn_metadata.cu_seqlens_q,
+                    kv_indptr=attn_metadata.kv_indptr,
+                    kv_indices=attn_metadata.kv_indices,
+                    kv_last_page_lens=attn_metadata.kv_last_page_lens,
+                    max_q_len=attn_metadata.max_seqlen_q,
+                    page_size=page_size,
+                    sm_scale=self.scale,
+                    q_scale=self._q_scale,
+                    kv_scale=self._k_scale,
+                    num_kv_splits=1,
+                    context_lens=getattr(attn_metadata, "context_lens", None),
+                    num_heads=self.num_heads,
+                    padded_num_heads=self.padded_num_heads,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    v_head_dim=self.v_head_dim,
+                    head_repeat_factor=self.head_repeat_factor,
+                    is_sparse_mla=self.is_sparse_mla,
+                    kv_layout="interleaved",
+                )
         else:
             kv_buffer = kv_c_and_k_pe_cache.unsqueeze(2)
             paged_cu_seqlens_q = attn_metadata.cu_seqlens_q
@@ -844,6 +967,35 @@ class MLAAttention(nn.Module):
                 kv_scale=self._k_scale,
             )
 
+            if envs.ATOM_DUMP_MLA_DECODE and not self.is_sparse_mla:
+                from atom.utils.mla_decode_dump import dump_decode_mla
+
+                dump_decode_mla(
+                    layer_num=self.layer_num,
+                    q=q,
+                    kv_buffer_view=kv_buffer.view(-1, page_size, 1, q.shape[-1]),
+                    o=o,
+                    qo_indptr=paged_cu_seqlens_q,
+                    kv_indptr=paged_kv_indptr,
+                    kv_indices=paged_kv_indices,
+                    kv_last_page_lens=paged_kv_last_page_lens,
+                    max_q_len=max_q_len,
+                    page_size=page_size,
+                    sm_scale=self.scale,
+                    q_scale=self._q_scale,
+                    kv_scale=self._k_scale,
+                    num_kv_splits=1,
+                    context_lens=getattr(attn_metadata, "context_lens", None),
+                    num_heads=self.num_heads,
+                    padded_num_heads=self.padded_num_heads,
+                    kv_lora_rank=self.kv_lora_rank,
+                    qk_rope_head_dim=self.qk_rope_head_dim,
+                    v_head_dim=self.v_head_dim,
+                    head_repeat_factor=self.head_repeat_factor,
+                    is_sparse_mla=self.is_sparse_mla,
+                    kv_layout="seg",
+                )
+
         if self.head_repeat_factor > 1:
             o = o[:, :: self.head_repeat_factor, :].contiguous()
 
@@ -882,14 +1034,32 @@ class MLAAttention(nn.Module):
             self.rotary_emb(positions, prefill_q_pe, k_rope)
 
             if kv_cache.numel() > 0:
-                concat_and_cache_mla(
-                    k_nope,
-                    k_rope.squeeze(1),
-                    kv_cache,
-                    attn_metadata.slot_mapping.flatten(),
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    scale=self._k_scale,
-                )
+                if self.use_triton_mla:
+                    # Triton MLA path: original interleaved per-token layout.
+                    concat_and_cache_mla(
+                        k_nope,
+                        k_rope.squeeze(1),
+                        kv_cache,
+                        attn_metadata.slot_mapping.flatten(),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=self._k_scale,
+                    )
+                else:
+                    self._validate_seg_layout(attn_metadata, positions)
+                    # Write the KV cache in the segmented layout so the
+                    # decode-phase mla_decode_fwd (which reads seg layout) sees a
+                    # consistent cache for tokens written during prefill.
+                    # kv_cache is flattened to
+                    # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so
+                    # the kernel derives page_size from stride(0).
+                    concat_and_cache_mla_seg(
+                        k_nope,
+                        k_rope.squeeze(1),
+                        kv_cache.view(kv_cache.shape[0], -1),
+                        attn_metadata.slot_mapping.flatten(),
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        scale=self._k_scale,
+                    )
 
             if attn_metadata.has_cached:
                 chunk_meta = getattr(attn_metadata, "mla_chunk_meta", None)
@@ -908,34 +1078,72 @@ class MLAAttention(nn.Module):
         else:
             q_nope, q_rope = self._q_proj_and_k_up_proj(q, x_scale=q_scale)
 
-            q_out = torch.empty(
-                (
-                    q_nope.shape[0],
-                    self.num_heads,
-                    self.kv_lora_rank + self.qk_rope_head_dim,
-                ),
-                dtype=attn_metadata.dtype_q,
-                device=q_nope.device,
-            )
-            if kv_cache.numel() > 0:
-                fused_qk_rope_concat_and_cache_mla_seg(
-                    q_nope,
-                    q_rope,
-                    k_nope,
-                    k_rope,
-                    kv_cache.view(
-                        kv_cache.shape[0], -1, self.kv_lora_rank + self.qk_rope_head_dim
+            if self.use_triton_mla:
+                # Triton MLA path: unpadded 576-wide q_out, interleaved cache.
+                q_out = torch.empty(
+                    (
+                        q_nope.shape[0],
+                        self.num_heads,
+                        self.kv_lora_rank + self.qk_rope_head_dim,
                     ),
-                    q_out,
-                    attn_metadata.slot_mapping,
-                    self._k_scale,
-                    self._q_scale,
-                    positions,
-                    self.rotary_emb.cos_cache,
-                    self.rotary_emb.sin_cache,
-                    is_neox=self.rotary_emb.is_neox_style,
-                    is_nope_first=True,
+                    dtype=attn_metadata.dtype_q,
+                    device=q_nope.device,
                 )
+            else:
+                # Allocate q_out with a padded last dim so each head row has a
+                # 768-byte stride (required by the gfx1250 decode asm). The kernel
+                # only writes the first kv_lora_rank + qk_rope_head_dim columns;
+                # the padding tail is left untouched and never read.
+                q_out = torch.empty(
+                    (
+                        q_nope.shape[0],
+                        self.num_heads,
+                        _MLA_Q_OUT_PADDED_DIM,
+                    ),
+                    dtype=attn_metadata.dtype_q,
+                    device=q_nope.device,
+                )
+            if kv_cache.numel() > 0:
+                if self.use_triton_mla:
+                    fused_qk_rope_concat_and_cache_mla(
+                        q_nope,
+                        q_rope,
+                        k_nope,
+                        k_rope,
+                        # Interleaved layout: [num_blocks, block_size, kv_lora+pe].
+                        kv_cache.view(
+                            kv_cache.shape[0],
+                            -1,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                        ),
+                        q_out,
+                        attn_metadata.slot_mapping,
+                        self._k_scale,
+                        self._q_scale,
+                        positions,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
+                        is_nope_first=True,
+                    )
+                else:
+                    self._validate_seg_layout(attn_metadata, positions)
+                    fused_qk_rope_concat_and_cache_mla_seg(
+                        q_nope,
+                        q_rope,
+                        k_nope,
+                        k_rope,
+                        # Flat seg layout: [num_blocks, page_size*(kv_lora + pe)].
+                        kv_cache.view(kv_cache.shape[0], -1),
+                        q_out,
+                        attn_metadata.slot_mapping,
+                        self._k_scale,
+                        self._q_scale,
+                        positions,
+                        self.rotary_emb.cos_cache,
+                        self.rotary_emb.sin_cache,
+                        is_neox=self.rotary_emb.is_neox_style,
+                    )
                 # q_out = self.fused_kv_bmm(q, q_scale, k_nope, k_rope, positions, kv_cache, attn_metadata)
 
             if context.is_prefill:
