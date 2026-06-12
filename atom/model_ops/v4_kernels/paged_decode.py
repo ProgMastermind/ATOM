@@ -902,6 +902,170 @@ def sparse_attn_v4_paged_decode_reference(
     return _sparse_attn_ragged_torch(q, unified_kv, attn_sink, topk_idxs, softmax_scale)
 
 
+def _sparse_attn_v4_paged_decode_hipkittens(
+    q: torch.Tensor,
+    unified_kv: torch.Tensor,
+    kv_indices: torch.Tensor,
+    kv_indptr: torch.Tensor,
+    attn_sink: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    """Route a V4 decode through aiter hipkittens ``mla_v40_decode_fwd``.
+
+    PoC path: ``unified_kv`` stays bf16 in ATOM, and we quantize per-call
+    (bf16 -> fp8+e8m0+pad nope buf + bf16 rope buf) before invoking the
+    kernel. This eats the bandwidth headroom the kernel was designed to
+    capture — phase 2 will move the packed layout into ``unified_kv``
+    itself so this hot-path quantization disappears.
+
+    The kernel's ratio-agnostic ``kv_indices`` / ``kv_indptr`` contract
+    matches ATOM's per-token paged indices: we feed them through directly,
+    one slot per token (page_size=1).
+    """
+    import aiter
+    from aiter import dtypes as aiter_dtypes
+
+    from atom.model_ops.v4_kernels.v4_quant import (
+        V4_DIM_NOPE,
+        V4_DIM_QK,
+        V4_DIM_ROPE,
+        quantize_bf16_to_v4_2buff,
+    )
+
+    assert q.dim() == 3 and q.shape[-1] == V4_DIM_QK, (
+        f"hipkittens v40: q must be [N, H, {V4_DIM_QK}] bf16, " f"got {tuple(q.shape)}"
+    )
+    assert unified_kv.dim() == 2 and unified_kv.shape[-1] == V4_DIM_QK, (
+        f"hipkittens v40: unified_kv must be [P, {V4_DIM_QK}] bf16, "
+        f"got {tuple(unified_kv.shape)}"
+    )
+
+    device = q.device
+    N, H, _ = q.shape
+    nhead_kv = 1
+    page_size = 1
+
+    # ---- per-call quantization (Q + the full unified_kv pool) -----------
+    # We pack Q rather than gathering its rows because there's no slot table
+    # for Q — kernel reads q[t, h, :] directly. For KV we keep the full pool
+    # packed: the kernel walks it via kv_indices/kv_page_indices the same
+    # way ATOM hands them out for the Triton backend.
+    q_packed, q_rope = quantize_bf16_to_v4_2buff(q)
+    kv_packed, kv_rope = quantize_bf16_to_v4_2buff(unified_kv)
+    # Kernel expects KV as [num_page, page_size=1, num_kv_heads=1, ...].
+    kv_packed = kv_packed.view(-1, page_size, nhead_kv, kv_packed.shape[-1])
+    kv_rope = kv_rope.view(-1, page_size, nhead_kv, V4_DIM_ROPE)
+
+    # ---- per-seq layout: ATOM hands us one entry per token, decode=1 ----
+    # qo_indptr describes N "sequences" of length 1 each (decode step).
+    qo_indptr = torch.arange(N + 1, dtype=torch.int32, device=device)
+    max_seqlen_q = 1
+    # kv_indices is per-token (variable length); kv_indptr is the per-token
+    # prefix sum. The hipkittens contract takes those exact tensors.
+    kv_indptr_i32 = kv_indptr.to(torch.int32)
+    kv_indices_i32 = kv_indices.to(torch.int32).contiguous()
+    # Each token is one full "page" (page_size=1) so last-page-len is 1.
+    kv_last_page_lens = torch.ones(N, dtype=torch.int32, device=device)
+
+    # ---- persistent / reduce metadata (aiter public builder) ------------
+    batch_size = N
+    nhead = H
+    fp8_t = aiter_dtypes.fp8
+    # max_split_per_batch: same heuristic the persistent test uses
+    # (clamped to CU count when nhead is large).
+    cu_num = torch.cuda.get_device_properties(device).multi_processor_count
+    max_split_per_batch = max(1, cu_num)
+    if nhead >= 128:
+        max_split_per_batch = min(
+            (cu_num + batch_size - 1) // batch_size, max_split_per_batch
+        )
+
+    sizes = aiter.get_mla_metadata_info_v1(
+        batch_size,
+        max_seqlen_q,
+        nhead,
+        fp8_t,
+        fp8_t,
+        is_sparse=False,
+        fast_mode=True,
+        num_kv_splits=max_split_per_batch,
+        intra_batch_mode=False,
+    )
+    (
+        (work_meta_data_size, work_meta_data_type),
+        (work_indptr_size, work_indptr_type),
+        (work_info_set_size, work_info_set_type),
+        (reduce_indptr_size, reduce_indptr_type),
+        (reduce_final_map_size, reduce_final_map_type),
+        (reduce_partial_map_size, reduce_partial_map_type),
+    ) = sizes
+    work_meta_data = torch.empty(
+        work_meta_data_size, dtype=work_meta_data_type, device=device
+    )
+    work_indptr = torch.empty(work_indptr_size, dtype=work_indptr_type, device=device)
+    work_info_set = torch.empty(
+        work_info_set_size, dtype=work_info_set_type, device=device
+    )
+    reduce_indptr = torch.empty(
+        reduce_indptr_size, dtype=reduce_indptr_type, device=device
+    )
+    reduce_final_map = torch.empty(
+        reduce_final_map_size, dtype=reduce_final_map_type, device=device
+    )
+    reduce_partial_map = torch.empty(
+        reduce_partial_map_size, dtype=reduce_partial_map_type, device=device
+    )
+
+    aiter.get_mla_metadata_v1(
+        qo_indptr,
+        kv_indptr_i32,
+        kv_last_page_lens,
+        nhead // nhead_kv,
+        nhead_kv,
+        False,  # is_causal=False: ATOM already applies sparsity via kv_indices
+        work_meta_data,
+        work_info_set,
+        work_indptr,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        page_size=page_size,
+        kv_granularity=max(page_size, 16),
+        max_seqlen_qo=max_seqlen_q,
+        uni_seqlen_qo=max_seqlen_q,
+        fast_mode=True,
+        max_split_per_batch=max_split_per_batch,
+        intra_batch_mode=False,
+        dtype_q=fp8_t,
+        dtype_kv=fp8_t,
+    )
+
+    # ---- kernel call ----------------------------------------------------
+    o = torch.empty(
+        (N, H, V4_DIM_NOPE + V4_DIM_ROPE), dtype=torch.bfloat16, device=device
+    )
+    aiter.mla.mla_v40_decode_fwd(
+        q_packed,
+        q_rope,
+        kv_packed,
+        kv_rope,
+        o,
+        qo_indptr,
+        kv_indptr_i32,
+        kv_indices_i32,
+        kv_last_page_lens,
+        max_seqlen_q,
+        work_indptr,
+        work_info_set,
+        reduce_indptr,
+        reduce_final_map,
+        reduce_partial_map,
+        sm_scale=softmax_scale,
+        attn_sink=attn_sink,
+    )
+    return o
+
+
 def sparse_attn_v4_paged_decode(
     q: torch.Tensor,
     unified_kv: torch.Tensor,
@@ -916,6 +1080,17 @@ def sparse_attn_v4_paged_decode(
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
     """
+    from atom.utils import envs
+
+    if envs.ATOM_USE_HIPKITTENS_V4_ATTN and kv_scales is None:
+        return _sparse_attn_v4_paged_decode_hipkittens(
+            q,
+            unified_kv,
+            kv_indices,
+            kv_indptr,
+            attn_sink,
+            softmax_scale,
+        )
     if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
         return _sparse_attn_v4_paged_decode_triton(
             q,

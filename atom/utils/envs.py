@@ -34,6 +34,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
+    # V4 decode attention: route to aiter hipkittens kernel
+    # (aiter.mla.mla_v40_decode_fwd) instead of Triton/reference. Requires
+    # MI350 (gfx950) + AITER_ENABLE_EXPERIMENTAL=1. PoC stage: KV is
+    # quantized bf16 -> fp8+scale on-the-fly inside the wrapper.
+    "ATOM_USE_HIPKITTENS_V4_ATTN": lambda: (
+        os.getenv("ATOM_USE_HIPKITTENS_V4_ATTN", "0") == "1"
+    ),
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
