@@ -252,6 +252,87 @@ class MLAAttention(nn.Module):
         )
         self._seg_layout_validated = True
 
+    def _assert_seg_write(self, kv_cache: torch.Tensor, slot_mapping: torch.Tensor) -> None:
+        """Per-step runtime asserts for the seg KV-cache write path. Gated by
+        ATOM_DEBUG_MLA_SEG. Catches layout/stride/slot_mapping mistakes that
+        would otherwise silently scatter the cache to wrong offsets."""
+        if not envs.ATOM_DEBUG_MLA_SEG:
+            return
+        entry = self.kv_lora_rank + self.qk_rope_head_dim
+        num_blocks = kv_cache.shape[0]
+        kvf = kv_cache.view(num_blocks, -1)
+        assert kvf.is_contiguous(), "seg kv_cache flat view must be contiguous"
+        assert kvf.stride(0) == entry * _MLA_SEG_PAGE_SIZE, (
+            f"seg kv_cache block stride {kvf.stride(0)} != "
+            f"page_size*entry {entry * _MLA_SEG_PAGE_SIZE}"
+        )
+        assert kvf.shape[1] % entry == 0 and kvf.shape[1] // entry == _MLA_SEG_PAGE_SIZE, (
+            f"seg kv_cache derived page_size {kvf.shape[1] // entry} != "
+            f"{_MLA_SEG_PAGE_SIZE}"
+        )
+        slot = slot_mapping.flatten()
+        valid = slot[slot >= 0]
+        if valid.numel() > 0:
+            max_slot = int(valid.max().item())
+            assert max_slot < num_blocks * _MLA_SEG_PAGE_SIZE, (
+                f"seg slot_mapping max {max_slot} >= "
+                f"num_blocks*page_size {num_blocks * _MLA_SEG_PAGE_SIZE}"
+            )
+
+    def _assert_seg_decode(
+        self,
+        kv_buffer_4d: torch.Tensor,
+        q: torch.Tensor,
+        kv_indptr: torch.Tensor,
+        kv_indices: torch.Tensor,
+    ) -> None:
+        """Per-step runtime asserts for the seg decode inputs. Gated by
+        ATOM_DEBUG_MLA_SEG."""
+        if not envs.ATOM_DEBUG_MLA_SEG:
+            return
+        entry = self.kv_lora_rank + self.qk_rope_head_dim
+        num_blocks = kv_buffer_4d.shape[0]
+        assert kv_buffer_4d.shape[1] == _MLA_SEG_PAGE_SIZE, (
+            f"seg decode kv_buffer page_size {kv_buffer_4d.shape[1]} != "
+            f"{_MLA_SEG_PAGE_SIZE}"
+        )
+        assert kv_buffer_4d.shape[-1] == entry, (
+            f"seg decode kv_buffer last dim {kv_buffer_4d.shape[-1]} != {entry}"
+        )
+        assert q.shape[-1] == entry, (
+            f"seg decode q last dim {q.shape[-1]} != {entry}"
+        )
+        # q must keep the padded per-head row stride (768) the asm kernel reads.
+        assert q.stride(-2) == _MLA_Q_OUT_PADDED_DIM, (
+            f"seg decode q per-head stride {q.stride(-2)} != "
+            f"{_MLA_Q_OUT_PADDED_DIM} (padded row stride not preserved)"
+        )
+        # kv_indptr is page-level: total referenced pages == kv_indices length,
+        # and every page id must be a valid physical block.
+        total_pages = int(kv_indptr[-1].item())
+        assert total_pages <= kv_indices.shape[0], (
+            f"seg decode kv_indptr[-1] {total_pages} > kv_indices len "
+            f"{kv_indices.shape[0]}"
+        )
+        if total_pages > 0:
+            max_blk = int(kv_indices[:total_pages].max().item())
+            assert max_blk < num_blocks, (
+                f"seg decode kv_indices max block {max_blk} >= num_blocks "
+                f"{num_blocks}"
+            )
+
+    @staticmethod
+    def _assert_seg_decode_output(o: torch.Tensor) -> None:
+        """Assert the seg decode kernel produced a fully-written, finite output.
+        Gated by ATOM_DEBUG_MLA_SEG. A NaN/inf here points at the asm kernel not
+        writing all of `o` (e.g. unsupported nhead/decode_qlen variant)."""
+        if not envs.ATOM_DEBUG_MLA_SEG:
+            return
+        assert torch.isfinite(o).all(), (
+            "seg decode output `o` contains NaN/inf (asm likely did not write "
+            "the whole buffer for this nhead/decode_qlen variant)"
+        )
+
     def process_weights_after_loading(self):
         if is_rocm_aiter_fp4bmm_enabled():
             kv_b_proj_weight = get_and_maybe_dequant_weights(self.kv_b_proj)
@@ -764,7 +845,10 @@ class MLAAttention(nn.Module):
         if not self.use_triton_mla:
             q = q[..., : self.kv_lora_rank + self.qk_rope_head_dim]
 
-        o = torch.empty(
+        # DEBUG(seg): zero-init instead of empty so any region the decode asm
+        # does not write shows up as 0 rather than garbage (isolates
+        # uninitialized-read bugs in the seg pass).
+        o = torch.zeros(
             B,
             self.padded_num_heads,
             self.kv_lora_rank,
@@ -840,7 +924,10 @@ class MLAAttention(nn.Module):
         if not self.use_triton_mla:
             q = q[..., : self.kv_lora_rank + self.qk_rope_head_dim]
 
-        o = torch.empty(
+        # DEBUG(seg): zero-init instead of empty so any region the decode asm
+        # does not write shows up as 0 rather than garbage (isolates
+        # uninitialized-read bugs in the seg pass).
+        o = torch.zeros(
             B,
             self.padded_num_heads,
             self.kv_lora_rank,
@@ -971,9 +1058,13 @@ class MLAAttention(nn.Module):
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
             page_size = get_current_atom_config().kv_cache_block_size
+            seg_kv_buffer_4d = kv_buffer.view(-1, page_size, 1, q.shape[-1])
+            self._assert_seg_decode(
+                seg_kv_buffer_4d, q, paged_kv_indptr, paged_kv_indices
+            )
             mla_decode_fwd(
                 q,
-                kv_buffer.view(-1, page_size, 1, q.shape[-1]),
+                seg_kv_buffer_4d,
                 o,
                 paged_cu_seqlens_q,
                 paged_kv_indptr,
@@ -992,6 +1083,8 @@ class MLAAttention(nn.Module):
                 q_scale=self._q_scale,
                 kv_scale=self._k_scale,
             )
+
+            self._assert_seg_decode_output(o)
 
             if envs.ATOM_DUMP_MLA_DECODE and not self.is_sparse_mla:
                 from atom.utils.mla_decode_dump import dump_decode_mla
@@ -1078,6 +1171,7 @@ class MLAAttention(nn.Module):
                     # kv_cache is flattened to
                     # [num_blocks, page_size*(kv_lora_rank + qk_rope_head_dim)] so
                     # the kernel derives page_size from stride(0).
+                    self._assert_seg_write(kv_cache, attn_metadata.slot_mapping)
                     concat_and_cache_mla_seg(
                         k_nope,
                         k_rope.squeeze(1),
@@ -1120,7 +1214,10 @@ class MLAAttention(nn.Module):
                 # 768-byte stride (required by the gfx1250 decode asm). The kernel
                 # only writes the first kv_lora_rank + qk_rope_head_dim columns;
                 # the padding tail is left untouched and never read.
-                q_out = torch.empty(
+                # DEBUG(seg): zero-init the padded q_out so the unwritten
+                # [576:768] tail is 0 rather than garbage (the decode asm reads
+                # rows at a 768 stride). Helps isolate uninitialized-read bugs.
+                q_out = torch.zeros(
                     (
                         q_nope.shape[0],
                         self.num_heads,
@@ -1154,6 +1251,7 @@ class MLAAttention(nn.Module):
                     )
                 else:
                     self._validate_seg_layout(attn_metadata, positions)
+                    self._assert_seg_write(kv_cache, attn_metadata.slot_mapping)
                     fused_qk_rope_concat_and_cache_mla_seg(
                         q_nope,
                         q_rope,

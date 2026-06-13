@@ -34,6 +34,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("ATOM_USE_TRITON_MXFP4_BMM", "0") == "1"
     ),
     "ATOM_USE_TRITON_MLA": lambda: os.getenv("ATOM_USE_TRITON_MLA", "0") == "1",
+    # Debug-only: enable per-step runtime assertions in the segmented (aiter)
+    # MLA write/decode path (layout/stride/slot_mapping/index ranges + isfinite
+    # on the decode output). Off by default; set to 1 when debugging seg garbage.
+    "ATOM_DEBUG_MLA_SEG": lambda: os.getenv("ATOM_DEBUG_MLA_SEG", "0") == "1",
     "ATOM_USE_TRITON_MOE": lambda: os.getenv("ATOM_USE_TRITON_MOE", "0") == "1",
     # --- Kernel Fusion Toggles ---
     # fused_compress_attn: switch between Triton (default historical) and a
