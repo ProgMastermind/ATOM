@@ -240,7 +240,11 @@ class PagedAttentionImpl(nn.Module):
         elif use_triton_attn and self.rotary_emb is not None:
             self.per_token_quant = False
             k_scale = v_scale = self.kv_scale
-            if envs.ATOM_USE_UNIFIED_ATTN and self.kv_cache_dtype.startswith("fp8"):
+            if (
+                envs.ATOM_USE_UNIFIED_ATTN
+                and self.kv_cache_dtype.startswith("fp8")
+                and not self._should_dispatch_pa_decode_bf16_asm(fwd_ctx)
+            ):
                 q_out = torch.empty(*q.shape, dtype=k_cache.dtype, device=q.device)
             else:
                 q_out = q
@@ -449,6 +453,10 @@ class PagedAttentionImpl(nn.Module):
         fwd_ctx: ForwardContext,
     ) -> None:
         attn_metadata = fwd_ctx.attn_metadata
+        if q.dtype == aiter.dtypes.fp8:
+            self._raise_pa_decode_bf16_asm_requirement(
+                "requires BF16 query, got pre-quantized FP8 query"
+            )
         if self.kv_cache_dtype != "fp8":
             self._raise_pa_decode_bf16_asm_requirement("requires fp8 kv cache")
         if self.head_dim != 64:
