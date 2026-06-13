@@ -51,14 +51,7 @@ logger = logging.getLogger("atom")
 
 _MLA_MIN_HEADS = 16  # AITER MLA kernels require at least 16 attention heads
 
-try:
-    from aiter.jit.utils.chip_info import get_gfx as _get_gfx
-
-    _IS_GFX1250 = _get_gfx() == "gfx1250"
-except Exception:
-    _IS_GFX1250 = False
-
-if use_triton_gemm():
+if False:
     try:
         from aiter.ops.triton.fused_gemm_a8w8_blockscale_split_cat import (
             fused_gemm_a8w8_blockscale_preshuffle_split_cat,
@@ -70,6 +63,8 @@ if use_triton_gemm():
         logger.warning(f"Triton fused GEMM split_cat not available: {e}")
         fused_gemm_afp4wfp4_preshuffle_split_cat = None
         fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
+fused_gemm_afp4wfp4_preshuffle_split_cat = None
+fused_gemm_a8w8_blockscale_preshuffle_split_cat = None
 
 
 def is_rocm_aiter_fp4bmm_enabled() -> bool:
@@ -621,7 +616,6 @@ class MLAAttention(nn.Module):
             elif (
                 fused_gemm_a8w8_blockscale_preshuffle_split_cat is not None
                 and weight.dtype == dtypes.fp8
-                and not _IS_GFX1250
             ):  # FP8 GEMM + split + cat
                 weight_shuffled = weight.reshape(
                     weight.shape[0] // 16, weight.shape[1] * 16
