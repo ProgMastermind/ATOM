@@ -544,21 +544,43 @@ class PagedAttentionImpl(nn.Module):
             return t
         return t.to(torch.int32).contiguous()
 
+    def _scale_to_pa_form(
+        self, scale: Optional[torch.Tensor], device: torch.device
+    ) -> torch.Tensor:
+        """Per-tensor [1] fp32 dequant scale on `device`. Uses the scale the KV
+        cache was quantized with (passed from rope_cache). The ASM kernel only
+        supports a per-tensor scalar, so fall back to the format constant if a
+        per-token scale (numel>1) slips through."""
+        if scale is None or scale.numel() != 1:
+            return torch.full(
+                (1,), self.kv_scale_float, dtype=torch.float32, device=device
+            )
+        return scale.detach().to(device=device, dtype=torch.float32).reshape(1).contiguous()
+
     def _get_pa_decode_bf16_asm_scale_tensors(
-        self, device: torch.device
+        self,
+        k_scale: Optional[torch.Tensor],
+        v_scale: Optional[torch.Tensor],
+        device: torch.device,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        """GPU-cached (key_scale, value_scale) for the ASM kernel, derived from
+        the cache's quant scales (== self.kv_scale == Triton k_descale/v_descale).
+        Cached on the source tensor identity so the common case (a constant
+        self.kv_scale) does NOT do a per-call CPU->GPU copy."""
+        key = (
+            None if k_scale is None else k_scale.data_ptr(),
+            None if v_scale is None else v_scale.data_ptr(),
+            device,
+        )
         cached = self._pa_decode_bf16_asm_scale_tensors
-        if cached is not None and cached[0].device == device:
-            return cached
-        key_scale = torch.full(
-            (1,), self.kv_scale_float, dtype=torch.float32, device=device
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        scales = (
+            self._scale_to_pa_form(k_scale, device),
+            self._scale_to_pa_form(v_scale, device),
         )
-        value_scale = torch.full(
-            (1,), self.kv_scale_float, dtype=torch.float32, device=device
-        )
-        cached = (key_scale, value_scale)
-        self._pa_decode_bf16_asm_scale_tensors = cached
-        return cached
+        self._pa_decode_bf16_asm_scale_tensors = (key, scales)
+        return scales
 
     def _get_pa_decode_bf16_asm_metadata(
         self,
@@ -764,7 +786,7 @@ class PagedAttentionImpl(nn.Module):
     def paged_attention_pa_decode_bf16_asm(
         self, q, k, v, k_cache, v_cache, k_scale, v_scale, fwd_ctx: ForwardContext
     ):
-        del k, v, k_scale, v_scale
+        del k, v
 
         self._validate_pa_decode_bf16_asm_inputs(q, k_cache, v_cache, fwd_ctx)
 
@@ -777,11 +799,14 @@ class PagedAttentionImpl(nn.Module):
         # ---- Q: FP8, logical [batch, qlen, kv_head, gqa, head_dim], contiguous ----
         q_5d = q.view(batch_size, max_seqlen_q, self.num_kv_heads, gqa, self.head_dim)
         q_fp8, query_scale = self._quantize_pa_decode_bf16_asm_query(q_5d)
-        # ---- K/V dequant scales: per-tensor [1] fp32, GPU-cached. Value ==
-        # self.kv_scale (kv_scale_float), exactly what the working Triton path
-        # passes as k_descale/v_descale. softmax_scale is passed BY VALUE below,
-        # so it is NOT folded into key_scale. ----
-        key_scale, value_scale = self._get_pa_decode_bf16_asm_scale_tensors(q.device)
+        # ---- K/V dequant scales: the scales the cache was quantized with in
+        # rope_cache (== self.kv_scale, exactly what the working Triton path
+        # passes as k_descale/v_descale). Coerced to per-tensor [1] fp32 and
+        # GPU-cached (no per-call H2D copy). softmax_scale is passed BY VALUE
+        # below, so it is NOT folded into key_scale. ----
+        key_scale, value_scale = self._get_pa_decode_bf16_asm_scale_tensors(
+            k_scale, v_scale, q.device
+        )
         # ---- V cache: FP8 5D [np, kv_head, page//x, head_dim, x] ----
         v_cache_5d = self._view_v_cache_for_pa_decode_bf16_asm(v_cache, k_cache)
 
