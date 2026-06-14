@@ -611,13 +611,7 @@ class PagedAttentionImpl(nn.Module):
 
         def _empty(spec):
             shape, dtype = spec
-            # Zero-init (NOT torch.empty): get_ps_metadata_v1 fills only the used
-            # prefix of these over-allocated buffers; if the kernel ever reads an
-            # unfilled tail slot (work_indptr/work_info), garbage there becomes a
-            # bogus work item -> garbage KV address -> NaN -> token 0 ("!!!!").
-            # Zeroed tail => zero-length work => no-op. Cached per request, so this
-            # runs once per request (cheap).
-            return torch.zeros(shape, dtype=dtype, device=device)
+            return torch.empty(shape, dtype=dtype, device=device)
 
         (
             work_meta_data_spec,
@@ -833,13 +827,7 @@ class PagedAttentionImpl(nn.Module):
         )
 
         # ---- Output: bf16, Q's logical shape ----
-        # Zero-init (diagnostic): if the kernel ever leaves an output row unwritten
-        # (work-distribution gap at batch>=64 varlen), torch.empty garbage in that
-        # row propagates -> NaN -> token 0 ("!!!!"). Zeroed => a missed row is 0,
-        # not poison. Revert to torch.empty once the gap is found/fixed.
-        output = torch.zeros(
-            q_5d.shape, dtype=torch.bfloat16, device=q.device
-        )
+        output = torch.empty(q_5d.shape, dtype=torch.bfloat16, device=q.device)
         split_rows = max(
             1,
             int(ps_metadata["reduce_partial_map"].numel()) * max_seqlen_q,
