@@ -45,6 +45,27 @@ def separate_reasoning(text: str) -> Tuple[Optional[str], str]:
         reasoning = match.group(1).strip()
         return (reasoning if reasoning else None, "")
 
+    # gpt-oss / OpenAI Harmony format. The model emits channel-delimited output
+    #   <|channel|>analysis<|message|>{reasoning}<|end|>
+    #   <|start|>assistant<|channel|>final<|message|>{answer}<|return|>
+    # but the server detokenizes with skip_special_tokens=True, which strips the
+    # <|...|> delimiters and leaves the channel *names* as plain text:
+    #   "analysis{reasoning}assistantfinal{answer}"
+    # (commentary/tool channels may appear before the final one). The user-facing
+    # answer is the final channel; everything before it is reasoning. Split on the
+    # last final-channel boundary ("assistantfinal") so commentary/tool text stays
+    # in reasoning, not content.
+    if "assistantfinal" in text:
+        reasoning, _, content = text.rpartition("assistantfinal")
+        reasoning = re.sub(r"^(analysis|commentary)", "", reasoning.strip()).strip()
+        return (reasoning or None, content.strip())
+
+    # Truncated Harmony (finish_reason=length): only the analysis channel was
+    # emitted, no final answer yet. Surface it as reasoning so content isn't a
+    # wall of chain-of-thought.
+    if text.startswith("analysis"):
+        return (text[len("analysis"):].strip() or None, "")
+
     # No thinking block — return content as-is (tool calls parsed separately)
     return (None, text)
 
