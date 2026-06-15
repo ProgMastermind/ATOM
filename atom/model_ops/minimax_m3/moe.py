@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""MiniMax-M3 specific bf16 MoE implementation.
+"""MiniMax-M3 specific routed MoE implementation.
 
 This module intentionally does not depend on ATOM's generic ``FusedMoE``.  It
 keeps the same checkpoint-facing parameter layout (``w13_weight`` and
 ``w2_weight``) so ATOM's existing expert weight mapping can load MiniMax-M3
-checkpoints, while the forward path uses vLLM's bf16 MoE Triton helper kernels
-when they are available and falls back to a local routed GEMV implementation
-otherwise.
+checkpoints, while the forward path uses vLLM's floating-point MoE Triton
+helper kernels when they are available and falls back to a local routed GEMV
+implementation otherwise.
 """
 
 from __future__ import annotations
@@ -27,8 +27,8 @@ from atom.config import QuantizationConfig, get_current_atom_config
 from atom.model_loader.weight_utils import set_weight_attrs
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.swiglu_oai import swiglu_oai_split
-from atom.model_ops.utils import atom_parameter
-from atom.quant_spec import QuantType
+from atom.model_ops.utils import atom_parameter, normalize_e4m3fn_to_e4m3fnuz
+from atom.quant_spec import LayerQuantConfig, QuantType
 
 
 @lru_cache(maxsize=1)
@@ -36,16 +36,19 @@ def _get_vllm_moe_helpers():
     try:
         ops = import_module("vllm._custom_ops")
         fused_moe = import_module("vllm.model_executor.layers.fused_moe.fused_moe")
+        moe_utils = import_module("vllm.model_executor.layers.fused_moe.utils")
     except ModuleNotFoundError as exc:
         if exc.name is not None and exc.name.startswith("vllm"):
             return None
         raise
 
+    moe_kernel_quantize_input = getattr(moe_utils, "moe_kernel_quantize_input", None)
     return (
         ops,
         fused_moe._prepare_expert_assignment,
         fused_moe.invoke_fused_moe_triton_kernel,
         fused_moe.try_get_optimal_moe_config,
+        moe_kernel_quantize_input,
     )
 
 
@@ -175,24 +178,40 @@ def make_minimax_m3_expert_params_mapping(
     num_experts: int,
 ) -> list[tuple[str, str, int, str]]:
     """Return loader mapping for MiniMax-M3 split expert checkpoint weights."""
-    return [
-        (
-            "experts.w13_" if weight_name in ("w1", "w3") else "experts.w2_",
-            f"experts.{expert_id}.{weight_name}.",
-            expert_id,
-            shard_id,
-        )
-        for expert_id in range(num_experts)
+    mapping: list[tuple[str, str, int, str]] = []
+    for expert_id in range(num_experts):
         for shard_id, weight_name in (
             ("w1", "w1"),
             ("w2", "w2"),
             ("w3", "w3"),
-        )
-    ]
+        ):
+            if weight_name in ("w1", "w3"):
+                param_prefix = "experts.w13_"
+                scale_param = "experts.w13_weight_scale"
+            else:
+                param_prefix = "experts.w2_"
+                scale_param = "experts.w2_weight_scale"
+            mapping.append(
+                (
+                    scale_param,
+                    f"experts.{expert_id}.{weight_name}.scale",
+                    expert_id,
+                    shard_id,
+                )
+            )
+            mapping.append(
+                (
+                    param_prefix,
+                    f"experts.{expert_id}.{weight_name}.",
+                    expert_id,
+                    shard_id,
+                )
+            )
+    return mapping
 
 
 class MiniMaxM3Bf16Experts(nn.Module):
-    """Dedicated MiniMax-M3 routed experts using bf16 weights.
+    """Dedicated MiniMax-M3 routed experts.
 
     The implementation mirrors MiniMax-M3's fixed routing contract:
     sigmoid scores, optional routing-bias correction for expert choice,
@@ -225,15 +244,32 @@ class MiniMaxM3Bf16Experts(nn.Module):
         layer_quant_config = (
             quant_config.get_layer_quant_config(prefix, check_children=True)
             if quant_config is not None
+            and hasattr(quant_config, "get_layer_quant_config")
             else None
         )
-        if (
-            layer_quant_config is not None
-            and layer_quant_config.quant_type != QuantType.No
+        if layer_quant_config is None:
+            layer_quant_config = LayerQuantConfig.no_quant(
+                params_dtype or torch.get_default_dtype()
+            )
+        self.layer_quant_config = layer_quant_config
+        self.quant_type = layer_quant_config.quant_type
+        self.is_quantized = self.quant_type != QuantType.No
+        self.quant_dtype = layer_quant_config.quant_dtype
+        self.need_normalize_e4m3fn_to_e4m3fnuz = (
+            self.quant_dtype == torch.float8_e4m3fnuz
+        )
+        if self.is_quantized and self.quant_type != QuantType.per_Token:
+            raise ValueError(
+                "MiniMax-M3 dedicated MoE runtime fp8 supports PTPC "
+                f"(QuantType.per_Token) only, got {self.quant_type} for {prefix!r}."
+            )
+        if self.is_quantized and self.quant_dtype not in (
+            torch.float8_e4m3fn,
+            torch.float8_e4m3fnuz,
         ):
             raise ValueError(
-                "MiniMax-M3 dedicated MoE currently expects unquantized bf16 "
-                f"expert weights, but got quant config for {prefix!r}."
+                "MiniMax-M3 dedicated MoE only supports fp8 expert quantization, "
+                f"got dtype={self.quant_dtype} for {prefix!r}."
             )
 
         self.num_experts = num_experts
@@ -257,10 +293,11 @@ class MiniMaxM3Bf16Experts(nn.Module):
             raise ValueError(f"Duplicate layer name: {prefix}")
         compilation_config.static_forward_context[prefix] = self
 
-        dtype = params_dtype or (
-            layer_quant_config.quant_dtype
-            if layer_quant_config is not None
-            else torch.get_default_dtype()
+        self.params_dtype = params_dtype or layer_quant_config.quant_dtype
+        dtype = (
+            self.quant_dtype
+            if self.is_quantized
+            else self.params_dtype
         )
         self.w13_weight = atom_parameter(
             torch.empty(
@@ -281,6 +318,47 @@ class MiniMaxM3Bf16Experts(nn.Module):
         weight_attrs = {"weight_loader": self.weight_loader}
         set_weight_attrs(self.w13_weight, weight_attrs)
         set_weight_attrs(self.w2_weight, weight_attrs)
+        self._create_weight_scales(weight_attrs)
+
+    def _create_weight_scales(self, weight_attrs: dict) -> None:
+        if not self.is_quantized:
+            self.register_parameter("w13_weight_scale", None)
+            self.register_parameter("w2_weight_scale", None)
+            return
+
+        if self.quant_type == QuantType.per_Tensor:
+            w13_shape = (self.num_experts, 2)
+            w2_shape = (self.num_experts,)
+        elif self.quant_type == QuantType.per_Token:
+            w13_shape = (self.num_experts, 2 * self.intermediate_size_per_partition)
+            w2_shape = (self.num_experts, self.w2_weight.shape[1])
+        elif self.quant_type in (QuantType.per_1x128, QuantType.per_1x32):
+            if self.quant_type == QuantType.per_1x128:
+                block_n, block_k = 128, 128
+            else:
+                block_n, block_k = 1, 32
+            w13_shape = (
+                self.num_experts,
+                2 * ((self.intermediate_size_per_partition + block_n - 1) // block_n),
+                (self.w13_weight.shape[2] + block_k - 1) // block_k,
+            )
+            w2_shape = (
+                self.num_experts,
+                (self.w2_weight.shape[1] + block_n - 1) // block_n,
+                (self.intermediate_size_per_partition + block_k - 1) // block_k,
+            )
+        else:
+            raise ValueError(
+                "Unsupported MiniMax-M3 expert fp8 quantization type: "
+                f"{self.quant_type}."
+            )
+
+        self.w13_weight_scale = atom_parameter(
+            torch.ones(w13_shape, dtype=torch.float32)
+        )
+        self.w2_weight_scale = atom_parameter(torch.ones(w2_shape, dtype=torch.float32))
+        set_weight_attrs(self.w13_weight_scale, weight_attrs)
+        set_weight_attrs(self.w2_weight_scale, weight_attrs)
 
     def _select_experts(
         self,
@@ -346,7 +424,65 @@ class MiniMaxM3Bf16Experts(nn.Module):
             if load_shard_size != local_size:
                 target = target.narrow(shard_dim, 0, load_shard_size)
 
-        target.copy_(shard.to(dtype=target.dtype, device=target.device))
+        fp8_dtypes = (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+        if target.dtype in fp8_dtypes and shard.dtype in fp8_dtypes:
+            # Preserve checkpoint FP8 bit patterns. On MI300, ATOM's runtime
+            # dtype is e4m3fnuz while MiniMax-M3 PTPC checkpoints store e4m3fn;
+            # scale normalization after loading preserves the dequantized value.
+            target.view(torch.uint8).copy_(
+                shard.to(device=target.device).view(torch.uint8)
+            )
+        else:
+            target.copy_(shard.to(dtype=target.dtype, device=target.device))
+
+    def _copy_scale_shard(
+        self,
+        target: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        shard_dim: int | None,
+    ) -> None:
+        while loaded_weight.dim() > target.dim() and loaded_weight.shape[-1] == 1:
+            loaded_weight = loaded_weight.squeeze(-1)
+        if target.dim() == 0 or loaded_weight.dim() == 0 or shard_dim is None:
+            if loaded_weight.numel() == target.numel():
+                loaded_weight = loaded_weight.reshape(target.shape)
+            target.copy_(loaded_weight.to(dtype=target.dtype, device=target.device))
+            return
+        self._copy_tp_shard(target, loaded_weight, shard_dim=shard_dim)
+
+    def _load_w13_scale(
+        self,
+        expert_data: torch.Tensor,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+    ) -> None:
+        if shard_id == "w2":
+            raise ValueError("w2 scale cannot be loaded into w13_weight_scale.")
+
+        if self.quant_type == QuantType.per_Tensor:
+            target = expert_data[0 if shard_id == "w1" else 1]
+            self._copy_scale_shard(target, loaded_weight, shard_dim=None)
+            return
+
+        shard_size = expert_data.shape[0] // 2
+        target = (
+            expert_data.narrow(0, 0, shard_size)
+            if shard_id == "w1"
+            else expert_data.narrow(0, shard_size, shard_size)
+        )
+        self._copy_scale_shard(target, loaded_weight, shard_dim=0)
+
+    def _load_w2_scale(
+        self,
+        expert_data: torch.Tensor,
+        loaded_weight: torch.Tensor,
+    ) -> None:
+        shard_dim = (
+            None
+            if self.quant_type in (QuantType.per_Tensor, QuantType.per_Token)
+            else 1
+        )
+        self._copy_scale_shard(expert_data, loaded_weight, shard_dim=shard_dim)
 
     def weight_loader(
         self,
@@ -362,7 +498,10 @@ class MiniMaxM3Bf16Experts(nn.Module):
                 "MiniMax-M3 expert shard_id must be w1/w2/w3, " f"got {shard_id!r}."
             )
 
-        if loaded_weight.dim() == param.data.dim():
+        if (
+            loaded_weight.dim() == param.data.dim()
+            and loaded_weight.shape[0] == param.data.shape[0]
+        ):
             for local_expert_id in range(
                 min(param.data.shape[0], loaded_weight.shape[0])
             ):
@@ -372,11 +511,24 @@ class MiniMaxM3Bf16Experts(nn.Module):
                         loaded_weight[local_expert_id],
                         shard_id,
                     )
-                else:
+                elif param is self.w2_weight:
                     self._load_w2(
                         param.data[local_expert_id],
                         loaded_weight[local_expert_id],
                     )
+                elif param is self.w13_weight_scale:
+                    self._load_w13_scale(
+                        param.data[local_expert_id],
+                        loaded_weight[local_expert_id],
+                        shard_id,
+                    )
+                elif param is self.w2_weight_scale:
+                    self._load_w2_scale(
+                        param.data[local_expert_id],
+                        loaded_weight[local_expert_id],
+                    )
+                else:
+                    raise ValueError("Unknown MiniMax-M3 expert parameter.")
             return
 
         if expert_id < 0 or expert_id >= self.num_experts:
@@ -389,12 +541,53 @@ class MiniMaxM3Bf16Experts(nn.Module):
             self._load_w13(expert_data, loaded_weight, shard_id)
         elif param is self.w2_weight:
             self._load_w2(expert_data, loaded_weight)
+        elif param is self.w13_weight_scale:
+            self._load_w13_scale(expert_data, loaded_weight, shard_id)
+        elif param is self.w2_weight_scale:
+            self._load_w2_scale(expert_data, loaded_weight)
         else:
             raise ValueError("Unknown MiniMax-M3 expert parameter.")
 
     def process_weights_after_loading(self) -> None:
         self.w13_weight.data = self.w13_weight.data.contiguous()
         self.w2_weight.data = self.w2_weight.data.contiguous()
+        if self.is_quantized:
+            self.w13_weight_scale.data = self.w13_weight_scale.data.contiguous()
+            self.w2_weight_scale.data = self.w2_weight_scale.data.contiguous()
+            if self.need_normalize_e4m3fn_to_e4m3fnuz:
+                (
+                    self.w13_weight.data,
+                    self.w13_weight_scale.data,
+                    _,
+                ) = normalize_e4m3fn_to_e4m3fnuz(
+                    self.w13_weight.data,
+                    self.w13_weight_scale.data,
+                )
+                (
+                    self.w2_weight.data,
+                    self.w2_weight_scale.data,
+                    _,
+                ) = normalize_e4m3fn_to_e4m3fnuz(
+                    self.w2_weight.data,
+                    self.w2_weight_scale.data,
+                )
+
+    def _quantize_activation_ptpc(
+        self,
+        moe_kernel_quantize_input,
+        activation: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        quantized, scale = moe_kernel_quantize_input(
+            A=activation,
+            A_scale=None,
+            quant_dtype=self.quant_dtype,
+            per_act_token_quant=True,
+            block_shape=None,
+            ocp_mx_scheme=None,
+        )
+        if scale.dim() == 1:
+            scale = scale.unsqueeze(-1)
+        return quantized.contiguous(), scale.contiguous()
 
     def _forward_routed_gemv(
         self,
@@ -402,6 +595,11 @@ class MiniMaxM3Bf16Experts(nn.Module):
         topk_weights: torch.Tensor,
         topk_ids: torch.Tensor,
     ) -> torch.Tensor:
+        if self.is_quantized:
+            raise RuntimeError(
+                "MiniMax-M3 fp8 PTPC experts require vLLM's graph-safe MoE "
+                "Triton helper; the local routed GEMV fallback is floating-only."
+            )
         n_tokens = hidden_states.shape[0]
         if not hidden_states.is_contiguous():
             hidden_states = hidden_states.contiguous()
@@ -497,7 +695,14 @@ class MiniMaxM3Bf16Experts(nn.Module):
             _prepare_expert_assignment,
             invoke_fused_moe_triton_kernel,
             try_get_optimal_moe_config,
+            moe_kernel_quantize_input,
         ) = vllm_moe_helpers
+        if self.is_quantized and moe_kernel_quantize_input is None:
+            raise RuntimeError(
+                "MiniMax-M3 fp8 PTPC experts require "
+                "vllm.model_executor.layers.fused_moe.utils."
+                "moe_kernel_quantize_input."
+            )
         n_tokens = hidden_states.shape[0]
         if not hidden_states.is_contiguous():
             hidden_states = hidden_states.contiguous()
@@ -558,12 +763,23 @@ class MiniMaxM3Bf16Experts(nn.Module):
             )
         )
 
+        if self.is_quantized:
+            hidden_states_for_kernel, a1_scale = self._quantize_activation_ptpc(
+                moe_kernel_quantize_input,
+                hidden_states,
+            )
+            w13_scale = self.w13_weight_scale
+        else:
+            hidden_states_for_kernel = hidden_states
+            a1_scale = None
+            w13_scale = None
+
         invoke_fused_moe_triton_kernel(
-            hidden_states,
+            hidden_states_for_kernel,
             self.w13_weight,
             gate_up,
-            None,
-            None,
+            a1_scale,
+            w13_scale,
             None,
             sorted_token_ids,
             expert_ids,
@@ -572,11 +788,11 @@ class MiniMaxM3Bf16Experts(nn.Module):
             top_k,
             config,
             compute_type=compute_type,
-            use_fp8_w8a8=False,
+            use_fp8_w8a8=self.is_quantized,
             use_int8_w8a8=False,
             use_int8_w8a16=False,
             use_int4_w4a16=False,
-            per_channel_quant=False,
+            per_channel_quant=self.is_quantized,
             block_shape=None,
             B_bias=None,
         )
@@ -589,12 +805,23 @@ class MiniMaxM3Bf16Experts(nn.Module):
             out_dtype=hidden_states.dtype,
         )
 
+        if self.is_quantized:
+            activated_for_kernel, a2_scale = self._quantize_activation_ptpc(
+                moe_kernel_quantize_input,
+                activated,
+            )
+            w2_scale = self.w2_weight_scale
+        else:
+            activated_for_kernel = activated
+            a2_scale = None
+            w2_scale = None
+
         invoke_fused_moe_triton_kernel(
-            activated,
+            activated_for_kernel,
             self.w2_weight,
             w2_accum,
-            None,
-            None,
+            a2_scale,
+            w2_scale,
             topk_weights,
             sorted_token_ids,
             expert_ids,
@@ -603,11 +830,11 @@ class MiniMaxM3Bf16Experts(nn.Module):
             1,
             config,
             compute_type=compute_type,
-            use_fp8_w8a8=False,
+            use_fp8_w8a8=self.is_quantized,
             use_int8_w8a8=False,
             use_int8_w8a16=False,
             use_int4_w4a16=False,
-            per_channel_quant=False,
+            per_channel_quant=self.is_quantized,
             block_shape=None,
             B_bias=None,
         )
@@ -622,13 +849,14 @@ class MiniMaxM3Bf16Experts(nn.Module):
         router_logits: torch.Tensor,
         e_score_correction_bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        if self.w13_weight.dtype not in (
-            torch.bfloat16,
-            torch.float16,
-            torch.float32,
-        ):
+        valid_weight_dtypes = (
+            (torch.float8_e4m3fn, torch.float8_e4m3fnuz)
+            if self.is_quantized
+            else (torch.bfloat16, torch.float16, torch.float32)
+        )
+        if self.w13_weight.dtype not in valid_weight_dtypes:
             raise RuntimeError(
-                "MiniMax-M3 dedicated MoE expects floating bf16/fp16/fp32 "
+                "MiniMax-M3 dedicated MoE received unsupported expert "
                 f"weights, got {self.w13_weight.dtype}."
             )
 

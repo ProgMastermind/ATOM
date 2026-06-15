@@ -40,7 +40,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.utils.torch_utils import is_quantized_kv_cache, kv_cache_dtype_str_to_dtype
 from vllm.v1.kv_cache_interface import FullAttentionSpec, get_kv_quant_mode
 
-from atom.config import Config
+from atom.config import Config, get_current_atom_config
 from atom.model_loader.loader import WeightsMapper, load_model_in_plugin_mode
 from atom.model_ops.layernorm import fused_allreduce_gemma_rms_norm
 from atom.model_ops.linear import ReplicatedLinear
@@ -105,19 +105,18 @@ class MiniMaxM3MLP(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        del quant_config
         self.gate_up_proj = MergedColumnParallelLinear(
             config.hidden_size,
             [intermediate_size] * 2,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.gate_up_proj",
         )
         self.down_proj = RowParallelLinear(
             intermediate_size,
             config.hidden_size,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             reduce_results=reduce_results,
             prefix=f"{prefix}.down_proj",
         )
@@ -355,7 +354,7 @@ class MiniMaxM3Attention(nn.Module):
         cache_config=None,
     ) -> None:
         super().__init__()
-        del layer_id, quant_config, cache_config
+        del layer_id, cache_config
         vllm_cache_config = get_current_vllm_config().cache_config
 
         self.hidden_size = config.hidden_size
@@ -383,7 +382,7 @@ class MiniMaxM3Attention(nn.Module):
             self.total_num_heads,
             self.total_num_kv_heads,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
@@ -391,7 +390,7 @@ class MiniMaxM3Attention(nn.Module):
             self.hidden_size,
             bias=False,
             reduce_results=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -445,7 +444,7 @@ class MiniMaxM3SparseAttention(nn.Module):
         cache_config: str = "bf16",
     ) -> None:
         super().__init__()
-        del layer_id, quant_config
+        del layer_id
         AttentionLayerBase.register(self.__class__)
         self.hidden_size = config.hidden_size
         self.tp_size = get_tensor_model_parallel_world_size()
@@ -479,7 +478,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.total_idx_heads,
             self.idx_head_dim,
             bias=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
         self.o_proj = RowParallelLinear(
@@ -487,7 +486,7 @@ class MiniMaxM3SparseAttention(nn.Module):
             self.hidden_size,
             bias=False,
             reduce_results=False,
-            quant_config=None,
+            quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
 
@@ -703,6 +702,7 @@ class MiniMaxM3MoE(nn.Module):
         config: PretrainedConfig,
         layer_id: int,
         quant_config: QuantizationConfig | None = None,
+        expert_quant_config=None,
         params_dtype: torch.dtype | None = None,
         prefix: str = "",
     ) -> None:
@@ -738,7 +738,7 @@ class MiniMaxM3MoE(nn.Module):
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 intermediate_size=config.intermediate_size * config.n_shared_experts,
-                quant_config=None,
+                quant_config=quant_config,
                 reduce_results=False,
                 prefix=f"{prefix}.shared_experts",
             )
@@ -753,7 +753,7 @@ class MiniMaxM3MoE(nn.Module):
             swiglu_alpha=getattr(config, "swiglu_alpha", 1.702),
             swiglu_beta=getattr(config, "swiglu_beta", 1.0),
             swiglu_limit=getattr(config, "swiglu_limit", 7.0),
-            quant_config=None,
+            quant_config=expert_quant_config,
             params_dtype=params_dtype,
             prefix=f"{prefix}.experts",
         )
@@ -789,6 +789,10 @@ class MiniMaxM3DecoderLayer(minimax_m3_base.MiniMaxM3DecoderLayer):
         layer_num: int = 0,
     ) -> None:
         nn.Module.__init__(self)
+        atom_quant_config = quant_config
+        vllm_quant_config = (
+            get_current_atom_config().plugin_config.vllm_config.quant_config
+        )
         attn_cls = (
             MiniMaxM3SparseAttention
             if layer_num in minimax_m3_base._sparse_attention_layer_ids(config)
@@ -797,7 +801,7 @@ class MiniMaxM3DecoderLayer(minimax_m3_base.MiniMaxM3DecoderLayer):
         self.self_attn = attn_cls(
             config=config,
             layer_id=layer_num,
-            quant_config=quant_config,
+            quant_config=vllm_quant_config,
             prefix=f"{prefix}.self_attn",
             cache_config=cache_config,
         )
@@ -806,7 +810,8 @@ class MiniMaxM3DecoderLayer(minimax_m3_base.MiniMaxM3DecoderLayer):
             self.block_sparse_moe = MiniMaxM3MoE(
                 config=config,
                 layer_id=layer_num,
-                quant_config=quant_config,
+                quant_config=vllm_quant_config,
+                expert_quant_config=atom_quant_config,
                 params_dtype=params_dtype,
                 prefix=f"{prefix}.block_sparse_moe",
             )
@@ -814,7 +819,7 @@ class MiniMaxM3DecoderLayer(minimax_m3_base.MiniMaxM3DecoderLayer):
             self.mlp = MiniMaxM3MLP(
                 config=config,
                 intermediate_size=config.dense_intermediate_size,
-                quant_config=quant_config,
+                quant_config=vllm_quant_config,
                 prefix=f"{prefix}.mlp",
             )
         self.input_layernorm = MiniMAXGemmaRMSNorm(
@@ -848,6 +853,10 @@ class MiniMaxM3DecoderLayer(minimax_m3_base.MiniMaxM3DecoderLayer):
 
 
 class MiniMaxM3SparseForCausalLM(NativeMiniMaxM3ForCausalLM):
+    weights_mapping = {
+        ".scale": ".weight_scale_inv",
+    }
+
     def __init__(
         self,
         atom_config: Config,
@@ -869,6 +878,7 @@ class MiniMaxM3SparseForCausalLM(NativeMiniMaxM3ForCausalLM):
 class MiniMaxM3SparseForConditionalGeneration_(nn.Module, SupportsMultiModal):
     supports_encoder_tp_data = True
     packed_modules_mapping = MiniMaxM3SparseForCausalLM.packed_modules_mapping
+    weights_mapping = MiniMaxM3SparseForCausalLM.weights_mapping
     hf_to_atom_mapper = WeightsMapper(
         orig_to_new_prefix={
             "multi_modal_projector.": "vision_tower.multi_modal_projector.",
