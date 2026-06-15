@@ -1193,7 +1193,10 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         positions = var["positions"].copy_to_gpu(total_tokens)
 
         merged = AttentionMetaData_DSV4(
-            cu_seqlens_q=None,
+            # Surface prefill cu_seqlens_q so the ParallelLMHead mixed-batch
+            # gather (embed_head.py) finds per-prefill-seq last-token indices
+            # without reaching into the nested prefill metadata.
+            cu_seqlens_q=prefill_meta.cu_seqlens_q,
             cu_seqlens_k=None,
             max_seqlen_q=max(prefill_meta.max_seqlen_q, decode_meta.max_seqlen_q),
             max_seqlen_k=max(prefill_meta.max_seqlen_k, decode_meta.max_seqlen_k),
