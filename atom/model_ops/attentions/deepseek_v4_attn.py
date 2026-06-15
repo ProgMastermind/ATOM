@@ -1962,11 +1962,9 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             swa_pages=swa_pages,
         )
 
-        # ----- skip_prefix_len_csa: per-token CSA section write offset -----
-        # csa_translate_pack consumes this as offset within
-        # `kv_indices_prefix_csa[indptr[t]:indptr[t+1]]` where the CSA topk
-        # section starts (after the SWA prefix segment). Matches the per-token
-        # prefix_swa_count vector we just computed on CPU.
+        # ----- skip_prefix_len_csa: SWA prefix length per token -----
+        # csa_translate_pack recovers valid_k = slice_len - skip to write
+        # CSA topk at the slice HEAD; the SWA prefix sits at the TAIL.
         skip_csa_gpu = torch.from_numpy(prefix_swa_count_np).to(
             device, non_blocking=True
         )
