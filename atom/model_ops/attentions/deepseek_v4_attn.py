@@ -1138,7 +1138,6 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         builder is exercised first (P1) so the metadata is validated before
         the forward consumes it.
         """
-        assert not self.is_sparse or True  # placeholder; V4 is always sparse
         var = self.model_runner.forward_vars
         n_p_seqs = batch.total_seqs_num_prefill
         n_p_tokens = batch.total_tokens_num_prefill
