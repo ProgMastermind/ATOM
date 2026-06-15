@@ -789,12 +789,17 @@ def fused_allreduce_gemma_rms_norm(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """MiniMax-M3 post-attention all-reduce + Gemma RMSNorm helper.
 
-    vLLM has a dedicated fused kernel for this sequence.  ATOM currently has a
-    fused all-reduce path for standard RMSNorm only, so keep the M3 path correct
-    by composing ATOM's tensor-parallel all-reduce with GemmaRMSNorm.
+    Use aiter's fused tensor-parallel all-reduce + RMSNorm.
+    ``weight_bias=1.0`` preserves Gemma's ``normalize(x) * (1 + weight)`` math.
     """
     if get_tensor_model_parallel_world_size() > 1:
-        hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        return tensor_model_parallel_fused_allreduce_rmsnorm(
+            hidden_states.contiguous(),
+            residual,
+            norm.weight,
+            norm.variance_epsilon,
+            weight_bias=1.0,
+        )
     return norm(hidden_states, residual)
 
 

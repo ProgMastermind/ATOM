@@ -10,6 +10,7 @@ ATOM-owned modules.
 
 from collections.abc import Iterable
 
+import aiter
 import torch
 from aiter import ActivationType
 from aiter.dist.parallel_state import get_pp_group
@@ -70,6 +71,23 @@ from atom.plugin.vllm.models.minimax_m3_sparse_attention import (
     MiniMaxM3SparseMetadata,
 )
 from atom.plugin.vllm.models.minimax_m3_vision_tower import MiniMaxVLVisionModel
+
+
+def _can_use_fused_minimax_m3_attention_preproc(
+    qkv: torch.Tensor,
+    rotary_emb: nn.Module,
+    *weights: torch.Tensor,
+) -> bool:
+    return (
+        hasattr(aiter, "fused_minimax_m3_qknorm_rope_kv_insert")
+        and qkv.dim() == 2
+        and qkv.is_cuda
+        and qkv.dtype in (torch.float16, torch.bfloat16)
+        and getattr(rotary_emb, "head_size", None) == 128
+        and getattr(rotary_emb, "rotary_dim", 0) > 0
+        and getattr(rotary_emb, "is_neox_style", False)
+        and all(w.dtype == qkv.dtype for w in weights)
+    )
 
 
 class MiniMAXGemmaRMSNorm(nn.Module):
@@ -386,6 +404,9 @@ class MiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.qkv_proj",
         )
+        # reduce_results=False: the attention all-reduce is fused with the
+        # following post_attention_layernorm (GemmaRMSNorm) in the decoder layer
+        # via fused_allreduce_gemma_rms_norm.
         self.o_proj = RowParallelLinear(
             self.total_num_heads * self.head_dim,
             self.hidden_size,
@@ -422,6 +443,40 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
+        if _can_use_fused_minimax_m3_attention_preproc(
+            qkv, self.rotary_emb, self.q_norm.weight, self.k_norm.weight
+        ):
+            qkv = qkv.contiguous()
+            q = torch.empty(
+                (qkv.shape[0], self.q_size), dtype=qkv.dtype, device=qkv.device
+            )
+            cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+            aiter.fused_minimax_m3_qknorm_rope_kv_insert(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon,
+                None,
+                None,
+                0,
+                None,
+                None,
+                None,
+                0,
+                q,
+                None,
+                None,
+            )
+            _, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+            attn_output = self.attn(q, k, v)
+            output, _ = self.o_proj(attn_output)
+            return output
+
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q_by_head = q.view(*q.shape[:-1], self.num_heads, self.head_dim)
         q = self.q_norm(q_by_head).view(q.shape)
@@ -654,6 +709,73 @@ class MiniMaxM3SparseAttention(nn.Module):
         qkv = self.qkv_proj(hidden_states)
         if isinstance(qkv, tuple):
             qkv = qkv[0]
+
+        if _can_use_fused_minimax_m3_attention_preproc(
+            qkv,
+            self.rotary_emb,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.index_q_norm.weight,
+            self.index_k_norm.weight,
+        ) and (
+            self.kv_cache_torch_dtype == qkv.dtype
+            or is_quantized_kv_cache(self.kv_cache_dtype)
+        ):
+            qkv = qkv.contiguous()
+            q = torch.empty(
+                (qkv.shape[0], self.q_size), dtype=qkv.dtype, device=qkv.device
+            )
+            index_q = torch.empty(
+                (qkv.shape[0], self.index_q_size), dtype=qkv.dtype, device=qkv.device
+            )
+
+            cos_sin_cache = self.rotary_emb._match_cos_sin_cache_dtype(qkv)
+            aiter.fused_minimax_m3_qknorm_rope_kv_insert(
+                qkv,
+                self.q_norm.weight,
+                self.k_norm.weight,
+                cos_sin_cache,
+                positions,
+                self.num_heads,
+                self.num_kv_heads,
+                self.rotary_emb.rotary_dim,
+                self.q_norm.variance_epsilon,
+                self.index_q_norm.weight,
+                self.index_k_norm.weight,
+                self.num_idx_heads,
+                None,
+                None,
+                None,
+                0,
+                q,
+                index_q,
+                None,
+            )
+
+            _, k, v, _, index_k = qkv.split(
+                [
+                    self.q_size,
+                    self.kv_size,
+                    self.kv_size,
+                    self.index_q_size,
+                    self.idx_head_dim,
+                ],
+                dim=-1,
+            )
+            attn_output = torch.ops.aiter.minimax_m3_sparse_attention(
+                q,
+                k,
+                v,
+                index_q,
+                index_k,
+                self.kv_cache,
+                self.index_cache.kv_cache,
+                self.layer_name,
+            )
+            out = self.o_proj(attn_output)
+            if isinstance(out, tuple):
+                out = out[0]
+            return out
 
         q, k, v, index_q, index_k = qkv.split(
             [
