@@ -3156,13 +3156,6 @@ class FusedMoE(torch.nn.Module):
                         dim=-1, keepdim=True
                     ).clamp_min(1e-20)
 
-                # Fuse routed_scaling_factor here, matching the grouped_topk and
-                # sqrtsoftplus branches. is_rocm_aiter_fuse_routed_scaling_factor()
-                # is True, so callers rely on it being applied in routing and do
-                # not multiply it again (e.g. MiniMax-M3, routed_scaling=2.0).
-                if routed_scaling_factor != 1.0:
-                    topk_weights = topk_weights * routed_scaling_factor
-
                 topk_ids = topk_ids.to(torch.int32)
             elif scoring_func == "sqrtsoftplus":
                 # DeepSeek-V4 routing: sqrt(softplus(scores)) + bias for selection;

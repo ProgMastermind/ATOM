@@ -8,7 +8,6 @@ attention/cache integration lives under ``atom.plugin.vllm`` and must not be
 imported here.
 """
 
-import copy
 from typing import Optional, Union
 
 import torch
@@ -43,6 +42,7 @@ from atom.model_ops.minimax_m3.sparse_attn import (
     minimax_m3_sparse_attn_decode,
 )
 from atom.model_ops.moe import FusedMoE
+from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
 from atom.utils.forward_context import AttnState, get_forward_context
@@ -212,8 +212,21 @@ class MiniMaxM3MoE(nn.Module):
         self.gate.weight = atom_parameter(self.gate.weight.data.to(torch.float32))
         self.gate.weight.weight_loader_process = old_wlp
 
+        # Fuse the (single) shared expert into the routed FusedMoE when the quant
+        # scheme allows it (M3 shared & routed experts are both A4W4 MXFP4).
+        # FusedMoE appends the shared expert as an always-on "fake" expert in the
+        # last slot (id == num_local_experts); its checkpoint weights are remapped
+        # into that slot by ``weights_mapping`` on the top-level model. Only fall
+        # back to a standalone dense MLP when fusion is unavailable.
+        self.is_fused_shared_expert = bool(
+            getattr(config, "n_shared_experts", 0)
+        ) and is_rocm_aiter_fusion_shared_expert_enabled(
+            shared_expert_prefix=f"{prefix}.shared_experts",
+            routed_expert_prefix=f"{prefix}.experts",
+        )
+
         self.shared_experts: MiniMaxM3MLP | None = None
-        if getattr(config, "n_shared_experts", 0):
+        if getattr(config, "n_shared_experts", 0) and not self.is_fused_shared_expert:
             self.shared_experts = MiniMaxM3MLP(
                 config=config,
                 intermediate_size=config.intermediate_size * config.n_shared_experts,
@@ -222,17 +235,14 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-        moe_config = copy.copy(config)
-        # Keep M3 shared experts as standalone MiniMaxM3MLP modules. FusedMoE's
-        # generic shared-expert fusion would otherwise append them to routed
-        # experts and duplicate the standalone path.
-        moe_config.n_shared_experts = 0
-
         # MiniMax-M3 uses SwiGLU-OAI over MXFP4 routed experts. Route through
         # ATOM's generic FusedMoE so the experts run on aiter's fused_moe kernel
         # (the FlyDSL a4w4 MXFP4 path), or on aiter's Triton MXFP4 MoE when
-        # ATOM_USE_TRITON_MOE=1. Both honor activation=Swiglu + swiglu_limit and
-        # the sigmoid + routing-bias + routed_scaling routing FusedMoE performs.
+        # ATOM_USE_TRITON_MOE=1. grouped_topk(num_expert_group=1) is equivalent to
+        # plain top-k here (M3 has no expert groups) but, unlike the non-grouped
+        # sigmoid path, supports fused shared experts and fuses routed_scaling.
+        # Passing the real ``config`` (n_shared_experts intact) + shared_expert_prefix
+        # lets FusedMoE allocate and route the fused shared-expert slot.
         self.experts = FusedMoE(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
@@ -241,13 +251,17 @@ class MiniMaxM3MoE(nn.Module):
             reduce_results=False,
             renormalize=True,
             quant_config=quant_config,
+            use_grouped_topk=True,
+            num_expert_group=1,
+            topk_group=1,
             scoring_func=getattr(config, "scoring_func", "sigmoid"),
             e_score_correction_bias=self.e_score_correction_bias,
             activation=ActivationType.Swiglu,
             has_bias=False,
-            config=moe_config,
+            config=config,
             params_dtype=params_dtype,
             prefix=f"{prefix}.experts",
+            shared_expert_prefix=f"{prefix}.shared_experts",
         )
         self.experts.swiglu_alpha = getattr(config, "swiglu_alpha", 1.702)
         self.experts.swiglu_beta = getattr(config, "swiglu_beta", 1.0)
@@ -734,16 +748,35 @@ class MiniMaxM3Model(nn.Module):
         return hidden_states
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
+        # When the shared expert is fused it occupies expert slot
+        # ``num_local_experts``; extend the mapping by ``n_shared_experts`` so its
+        # remapped checkpoint weights (see ``weights_mapping``) load into that
+        # slot. M3's shared & routed experts are both A4W4, so fusion is active.
+        n_shared = getattr(self.config, "n_shared_experts", 0) or 0
         return FusedMoE.make_expert_params_mapping(
             ckpt_gate_proj_name="w1",
             ckpt_down_proj_name="w2",
             ckpt_up_proj_name="w3",
-            num_experts=self.config.num_local_experts,
+            num_experts=self.config.num_local_experts + n_shared,
         )
 
 
 class MiniMaxM3SparseForCausalLM(nn.Module):
+    # We do the shared-expert -> fused-slot remap ourselves via weights_mapping
+    # below (M3's block_sparse_moe naming + routed w1/w2/w3 vs shared
+    # gate/up/down is not handled by the generic have_shared_expert path), so the
+    # generic fused-shared loader stays disabled.
     disable_fused_shared_loading = True
+    # Fuse the single shared expert into routed expert slot ``num_local_experts``
+    # (128 for M3). The shared expert is an MLP (gate/up/down); remap it onto the
+    # routed-expert w1/w3/w2 naming so it loads into the fused MoE buffer's last
+    # slot. This runs before packed_modules_mapping, so the shared gate/up proj
+    # are NOT caught by the dense ".gate_proj"/".up_proj" -> gate_up_proj rule.
+    weights_mapping = {
+        "block_sparse_moe.shared_experts.gate_proj.": "block_sparse_moe.experts.128.w1.",
+        "block_sparse_moe.shared_experts.up_proj.": "block_sparse_moe.experts.128.w3.",
+        "block_sparse_moe.shared_experts.down_proj.": "block_sparse_moe.experts.128.w2.",
+    }
     packed_modules_mapping = {
         ".index_q_proj": (".qkv_proj", "index_q"),
         ".index_k_proj": (".qkv_proj", "index_k"),
@@ -830,6 +863,8 @@ class MiniMaxM3SparseForConditionalGenerationTextOnly(nn.Module):
     packed_modules_mapping = MiniMaxM3SparseForCausalLM.packed_modules_mapping
     weights_mapping = {
         "model.language_model.": "language_model.",
+        # Fuse the shared expert into routed slot 128 (see CausalLM above).
+        **MiniMaxM3SparseForCausalLM.weights_mapping,
     }
     skip_weight_prefixes = [
         "vision_tower.",
