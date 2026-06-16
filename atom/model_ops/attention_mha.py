@@ -660,7 +660,6 @@ class PagedAttentionImpl(nn.Module):
                 if atom_config.kv_cache_block_size == 1024:
                     return self.paged_attention_persistent_asm
                 return self.paged_attention_asm
-            #return self.paged_attention_asm
 
     def forward(
         self,

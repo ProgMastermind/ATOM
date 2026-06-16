@@ -17,6 +17,7 @@ from atom.distributed.kv_events import (
 from atom.model_engine.sequence import Sequence
 
 import logging
+
 logger = logging.getLogger("atom")
 
 

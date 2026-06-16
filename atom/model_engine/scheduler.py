@@ -214,8 +214,8 @@ def _optimal_cu_fraction(
     Returns None when CU masking provides no benefit (no pending prefill,
     tiny prefill).
     """
-    assert prefill_waiting_tokens>=0
-    if prefill_waiting_tokens==0 or decode_batch<64:
+    assert prefill_waiting_tokens >= 0
+    if prefill_waiting_tokens == 0 or decode_batch < 64:
         return None
     else:
         return 0.5
@@ -1483,8 +1483,8 @@ class PrefillScheduler:
                 name=disagg_cu_shm_name, create=False
             )
             logger.info("initialized shared memory")
-        self.num_seq_done=0
-        self._pending_lock=threading.Lock()
+        self.num_seq_done = 0
+        self._pending_lock = threading.Lock()
 
     def is_finished(self) -> bool:
         return not self.waiting and not self.running
@@ -1551,7 +1551,7 @@ class PrefillScheduler:
 
         if self._cu_shm is not None:
             decode_tokens = struct.unpack_from("I", self._cu_shm.buf, 0)[0]
-            cu_fraction = _optimal_cu_fraction(decode_tokens,num_batched_tokens)
+            cu_fraction = _optimal_cu_fraction(decode_tokens, num_batched_tokens)
 
         return (
             ScheduledBatch(
@@ -1615,17 +1615,29 @@ class DecodeScheduler(Scheduler):
         # from the _recv_prefill_done background thread.
         self._prefill_lock = threading.Lock()
         self.cu_fraction: Optional[float] = None
-        self.prefill_waiting_tokens=atomics.atomic(width=4, atype=atomics.INT)
+        self.prefill_waiting_tokens = atomics.atomic(width=4, atype=atomics.INT)
         self.prefill_waiting_tokens.store(0)
 
     def is_finished(self) -> bool:
-        return not self.waiting and not self.prefill_waiting and not self.running and not self.prefill_done
+        return (
+            not self.waiting
+            and not self.prefill_waiting
+            and not self.running
+            and not self.prefill_done
+        )
 
     def has_requests(self) -> bool:
-        return bool(self.waiting or self.prefill_waiting or self.running or self.prefill_done)
+        return bool(
+            self.waiting or self.prefill_waiting or self.running or self.prefill_done
+        )
 
     def get_num_unfinished_requests(self) -> int:
-        return len(self.waiting) + len(self.prefill_waiting) + len(self.running) + len(self.prefill_done)
+        return (
+            len(self.waiting)
+            + len(self.prefill_waiting)
+            + len(self.running)
+            + len(self.prefill_done)
+        )
 
     def allocate_waiting(self) -> list[Sequence]:
         """Allocate KV blocks for sequences in waiting; move them to prefill_waiting.
@@ -1643,7 +1655,7 @@ class DecodeScheduler(Scheduler):
                     break
                 self.block_manager.allocate(seq)
             self.waiting.popleft()
-        
+
             self.prefill_waiting[seq.id] = seq
             self.prefill_waiting_tokens.add(seq.num_tokens)
             newly_allocated.append(seq)
@@ -1659,7 +1671,7 @@ class DecodeScheduler(Scheduler):
         process; it is appended here so that context_lens and slot_mapping
         match the non-disagg postprocess state before the first decode step.
         """
-        
+
         seq = self.prefill_waiting.pop(seq_id, None)
         self.prefill_waiting_tokens.add(-seq.num_tokens)
         if seq is not None:
@@ -1674,8 +1686,8 @@ class DecodeScheduler(Scheduler):
         Sequences are promoted directly from prefill_waiting to running by
         on_prefill_done(); this method only schedules the running queue.
         """
-        
-        prefill_finished=False
+
+        prefill_finished = False
         while self.prefill_done:
             seq = self.prefill_done.popleft()
             seq.status = SequenceStatus.RUNNING
@@ -1689,18 +1701,18 @@ class DecodeScheduler(Scheduler):
             # slot_mapping in the same state as non-disagg before the first decode
             # step.
             self.running.append(seq)
-            prefill_finished=True
+            prefill_finished = True
 
         if not self.running:
-            self.cu_fraction=None
+            self.cu_fraction = None
             if self._cu_shm is not None:
-                struct.pack_into("I", self._cu_shm.buf, 0, 0)    
+                struct.pack_into("I", self._cu_shm.buf, 0, 0)
             return None
 
         scheduled_seqs: dict[int, Sequence] = {}
         num_scheduled_tokens: list[int] = []
         scheduled_spec_decode_tokens: dict[int, np.ndarray] = {}
-       
+
         with self._prefill_lock:
             while self.running and len(scheduled_seqs) < self.max_num_seqs:
                 seq = self.running.popleft()
@@ -1723,9 +1735,8 @@ class DecodeScheduler(Scheduler):
                     seq.type = SequenceType.DECODE
                     num_scheduled_tokens.append(num_new_tokens)
 
-
         if not scheduled_seqs:
-            self.cu_fraction=None
+            self.cu_fraction = None
             if self._cu_shm is not None:
                 struct.pack_into("I", self._cu_shm.buf, 0, 0)
             return None
@@ -1741,10 +1752,9 @@ class DecodeScheduler(Scheduler):
         if self._cu_shm is not None:
             struct.pack_into("I", self._cu_shm.buf, 0, total_tokens_num_decode)
             if prefill_finished:
-                pwait=int(self.prefill_waiting_tokens.load())
+                pwait = int(self.prefill_waiting_tokens.load())
                 self.cu_fraction = _optimal_cu_fraction(total_tokens_num_decode, pwait)
 
-        
         return (
             ScheduledBatch(
                 seqs=scheduled_seqs,

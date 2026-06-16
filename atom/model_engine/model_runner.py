@@ -2,7 +2,6 @@
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
 import ctypes
-import gzip
 import logging
 import math
 import os
@@ -1329,7 +1328,7 @@ class ModelRunner:
         # (e.g. the 512MB NCCL barrier buffer) don't OOM when two processes
         # share the GPU.
         if getattr(config, "enable_disagg", False):
-            available_for_kv_budget -= 4*safety_margin
+            available_for_kv_budget -= 4 * safety_margin
         # This prevents OOM when other processes share the GPU.
         available_for_kv = min(available_for_kv_budget, free)
 
@@ -2025,6 +2024,7 @@ class ModelRunner:
         stream.synchronize()
         reset_forward_context()
         return sampled_cpu
+
     def gated_delta_net_state_dtypes(self) -> tuple[torch.dtype, torch.dtype]:
         return self.config.torch_dtype, self.config.torch_dtype
 
@@ -2450,7 +2450,7 @@ class ModelRunner:
                     logits = self.graph_logits[graph_key][:num_tokens]
                 else:
                     logits = self.model.compute_logits(hidden_states)
-        
+
         return logits, hidden_states
 
     def postprocess(
@@ -2610,7 +2610,7 @@ class ModelRunner:
                 needs_independent_noise,
             ) = self.prepare_model(batch)
             logits, hidden_states = self.run_model(input_ids, batch)
-        
+
         # postprocess (sampling + async CPU copy) always runs on default stream.
         fwd_output = self.postprocess(
             batch,

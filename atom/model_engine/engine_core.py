@@ -630,7 +630,7 @@ class PrefillEngineCore(EngineCore):
 
         # Maps seq_id → BlockAssignment, populated by the receiver thread.
         self._pending_assignments: dict = {}
-        #self._pending_lock = threading.Lock()
+        # self._pending_lock = threading.Lock()
 
         # ZMQ context for disagg sockets (separate from the main engine sockets).
         self._disagg_ctx = zmq.Context()
@@ -761,7 +761,6 @@ class PrefillEngineCore(EngineCore):
                     assignment = self._pending_assignments.pop(seq.id)
                     seq.block_table = list(assignment.block_table)
                     seq.num_cached_tokens = assignment.num_cached_tokens
-                    
 
     def _process_engine_step(self):
         from atom.model_engine.disagg_types import DisaggMsgType, PrefillDone
