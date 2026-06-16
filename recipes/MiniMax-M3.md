@@ -9,7 +9,7 @@ This recipe tracks the MiniMax-M3 BF16 support added in [ROCm/ATOM PR #1238](htt
 Pull the latest development image:
 
 ```bash
-docker pull rocm/atom-dev:vllm-latest
+docker pull rocm/atom-dev:latest
 ```
 
 All commands below should be run inside the container. The example assumes the model is available at:
