@@ -38,7 +38,7 @@
       "path": "deepseek-ai/DeepSeek-V4-Pro",
       "prefix": "deepseek-v4-pro",
       "runner": "atom-mi355-8gpu.predownload",
-      "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1",
+      "env_vars": "AITER_BF16_FP8_MOE_BOUND=0\nATOM_MOE_GU_ITLV=1\nGPU_MAX_HW_QUEUES=5",
       "config": {
         "tp": 8,
         "kv_cache_dtype": "fp8",
@@ -65,7 +65,6 @@
           "label": "DPA TBO",
           "suffix": "-dpa-tbo",
           "extra_args": "--enable-dp-attention --enable-tbo",
-          "env_vars": "GPU_MAX_HW_QUEUES=5",
           "conc_min": 256,
           "conc_max": 1024
         },
