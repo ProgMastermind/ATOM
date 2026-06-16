@@ -273,11 +273,16 @@ class MiniMaxM3MoE(nn.Module):
             )
 
     def process_weights_after_loading(self) -> None:
-        # The Triton MXFP4 path swizzles the loaded [w1 | w3] layout itself; the
-        # aiter fused_moe (FlyDSL/CK) path expects interleaved gate/up rows.
+        # The Triton MXFP4 path swizzles the loaded [w1 | w3] layout itself.
         if getattr(self.experts.quant_method, "use_triton", False):
             return
-        _interleave_swiglu_weights(self.experts)
+        # aiter's FlyDSL MoE reads gate/up interleaved ONLY for fp8 activations
+        # (a8w4); a4w4 (M3's case) uses the SEPARATED [w1 | w3] layout. The
+        # fused_moe gate_mode follows is_guinterleave (env ATOM_MOE_GU_ITLV), so
+        # interleave the loaded weights only when the kernel will read them
+        # interleaved -- keeping weight layout and gate_mode consistent (a4/a8).
+        if getattr(self.experts.quant_method, "is_guinterleave", False):
+            _interleave_swiglu_weights(self.experts)
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
