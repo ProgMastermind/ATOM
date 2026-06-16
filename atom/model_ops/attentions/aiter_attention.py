@@ -483,14 +483,10 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             kv_cache = runner.kv_cache[:, attn_idx].permute(1, 0, 2, 3, 4)
             module.kv_cache = kv_cache
             module.k_scale = (
-                runner.kv_scale[0, attn_idx]
-                if config.kv_cache_dtype == "fp8"
-                else None
+                runner.kv_scale[0, attn_idx] if config.kv_cache_dtype == "fp8" else None
             )
             module.v_scale = (
-                runner.kv_scale[1, attn_idx]
-                if config.kv_cache_dtype == "fp8"
-                else None
+                runner.kv_scale[1, attn_idx] if config.kv_cache_dtype == "fp8" else None
             )
             sparse_idx = runner._m3_sparse_attn_idx
             module.index_kv_cache = runner.m3_index_cache[sparse_idx]

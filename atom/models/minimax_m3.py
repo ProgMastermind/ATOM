@@ -9,7 +9,6 @@ imported here.
 """
 
 import copy
-import os
 from typing import Optional, Union
 
 import torch
@@ -229,11 +228,11 @@ class MiniMaxM3MoE(nn.Module):
         # experts and duplicate the standalone path.
         moe_config.n_shared_experts = 0
 
-        # MiniMax-M3 uses SwiGLU-OAI over MXFP4 routed experts. The generic
-        # non-Triton/CK MoE path is not a supported target for that activation,
-        # so force the Triton MXFP4 MoE path before FusedMoE chooses its
-        # quant_method implementation.
-        os.environ["ATOM_USE_TRITON_MOE"] = "1"
+        # MiniMax-M3 uses SwiGLU-OAI over MXFP4 routed experts. Route through
+        # ATOM's generic FusedMoE so the experts run on aiter's fused_moe kernel
+        # (the FlyDSL a4w4 MXFP4 path), or on aiter's Triton MXFP4 MoE when
+        # ATOM_USE_TRITON_MOE=1. Both honor activation=Swiglu + swiglu_limit and
+        # the sigmoid + routing-bias + routed_scaling routing FusedMoE performs.
         self.experts = FusedMoE(
             num_experts=config.num_local_experts,
             top_k=config.num_experts_per_tok,
@@ -255,115 +254,29 @@ class MiniMaxM3MoE(nn.Module):
         self.experts.swiglu_limit = getattr(config, "swiglu_limit", 7.0)
         if self.experts.swiglu_beta != 1.0:
             raise NotImplementedError(
-                "MiniMax-M3 Triton MoE currently supports swiglu_beta=1.0 "
+                "MiniMax-M3 MoE currently supports swiglu_beta=1.0 "
                 f"only, got {self.experts.swiglu_beta}."
             )
-        if hasattr(self.experts.quant_method, "use_triton"):
-            self.experts.quant_method.use_triton = True
-        self.routed_w13_weight = None
-        self.routed_w13_weight_scale = None
-        self.routed_w2_weight = None
-        self.routed_w2_weight_scale = None
 
     def process_weights_after_loading(self) -> None:
-        # Stash pre-swizzle MXFP4 expert weights/scales. The generic FusedMoE
-        # post-load path may transpose/swizzle for its own kernels, but native
-        # MiniMax-M3 computes routing itself and uses standalone Triton FP4 GEMMs
-        # plus swiglu_oai, so keep the checkpoint-facing layout here.
-        self.routed_w13_weight = self.experts.w13_weight.data.view(torch.uint8)
-        self.routed_w13_weight_scale = self.experts.w13_weight_scale.data
-        self.routed_w2_weight = self.experts.w2_weight.data.view(torch.uint8)
-        self.routed_w2_weight_scale = self.experts.w2_weight_scale.data
+        # The Triton MXFP4 path swizzles the loaded [w1 | w3] layout itself; the
+        # aiter fused_moe (FlyDSL/CK) path expects interleaved gate/up rows.
         if getattr(self.experts.quant_method, "use_triton", False):
             return
         _interleave_swiglu_weights(self.experts)
 
-    def _select_experts(
-        self,
-        router_logits: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        routing_weights = torch.sigmoid(router_logits.float())
-        scores_for_choice = routing_weights
-        if self.e_score_correction_bias is not None:
-            scores_for_choice = scores_for_choice + self.e_score_correction_bias
-        topk_ids = torch.topk(
-            scores_for_choice,
-            self.experts.top_k,
-            dim=-1,
-            sorted=False,
-        ).indices
-        topk_weights = routing_weights.gather(dim=-1, index=topk_ids)
-        topk_weights = topk_weights / topk_weights.sum(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-20)
-        return topk_weights.to(router_logits.dtype), topk_ids.to(torch.int32)
-
-    def _fp4_experts_forward(
-        self,
-        hidden_states: torch.Tensor,
-        topk_weights: torch.Tensor,
-        topk_ids: torch.Tensor,
-    ) -> torch.Tensor:
-        from aiter.ops.triton.gemm.basic.gemm_a16wfp4 import gemm_a16wfp4
-
-        if self.routed_w13_weight is None or self.routed_w2_weight is None:
-            raise RuntimeError("MiniMax-M3 FP4 expert weights are not initialized.")
-
-        output = torch.zeros(
-            hidden_states.shape,
-            dtype=torch.float32,
-            device=hidden_states.device,
-        )
-        flat_ids = topk_ids.reshape(-1)
-        flat_weights = topk_weights.reshape(-1)
-        token_ids = (
-            torch.arange(hidden_states.shape[0], device=hidden_states.device)
-            .view(-1, 1)
-            .expand_as(topk_ids)
-            .reshape(-1)
-        )
-
-        for expert_id in range(self.experts.global_num_experts):
-            selected = torch.nonzero(flat_ids == expert_id, as_tuple=False).flatten()
-            if selected.numel() == 0:
-                continue
-            selected_tokens = token_ids.index_select(0, selected)
-            expert_input = hidden_states.index_select(0, selected_tokens)
-            gate_up = gemm_a16wfp4(
-                expert_input,
-                self.routed_w13_weight[expert_id],
-                self.routed_w13_weight_scale[expert_id],
-                dtype=hidden_states.dtype,
-            )
-            activated = swiglu_oai_split(
-                gate_up,
-                alpha=self.experts.swiglu_alpha,
-                beta=self.experts.swiglu_beta,
-                limit=self.experts.swiglu_limit,
-                out_dtype=hidden_states.dtype,
-            )
-            expert_out = gemm_a16wfp4(
-                activated,
-                self.routed_w2_weight[expert_id],
-                self.routed_w2_weight_scale[expert_id],
-                dtype=hidden_states.dtype,
-            )
-            expert_out = expert_out.float() * flat_weights.index_select(
-                0, selected
-            ).float().view(-1, 1)
-            output.index_add_(0, selected_tokens, expert_out)
-        if getattr(self.experts, "routed_scaling_factor", 1.0) != 1.0:
-            output = output * self.experts.routed_scaling_factor
-        return output.to(hidden_states.dtype)
-
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
+        # fp32 router logits (matches the reference precision). FusedMoE applies
+        # the sigmoid scoring + routing-bias correction + renormalize +
+        # routed_scaling_factor routing, then dispatches the routed experts to
+        # aiter's fused_moe (default, FlyDSL a4w4) or aiter's Triton MXFP4 MoE
+        # (ATOM_USE_TRITON_MOE=1, the reference path).
         router_logits = torch.nn.functional.linear(
             hidden_states.float(), self.gate.weight.float()
         )
-        topk_weights, topk_ids = self._select_experts(router_logits)
-        routed_output = self._fp4_experts_forward(hidden_states, topk_weights, topk_ids)
+        routed_output = self.experts(hidden_states, router_logits)
 
         if self.shared_experts is not None:
             routed_output = routed_output + self.shared_experts(hidden_states)
@@ -438,9 +351,9 @@ class MiniMaxM3Attention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q_shape = q.shape
         k_shape = k.shape
-        q = self.q_norm(
-            q.view(*q_shape[:-1], self.num_heads, self.head_dim)
-        ).reshape(q_shape)
+        q = self.q_norm(q.view(*q_shape[:-1], self.num_heads, self.head_dim)).reshape(
+            q_shape
+        )
         k = self.k_norm(
             k.view(*k_shape[:-1], self.num_kv_heads, self.head_dim)
         ).reshape(k_shape)
@@ -656,9 +569,9 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
         q_shape = q.shape
         k_shape = k.shape
-        q = self.q_norm(
-            q.view(*q_shape[:-1], self.num_heads, self.head_dim)
-        ).reshape(q_shape)
+        q = self.q_norm(q.view(*q_shape[:-1], self.num_heads, self.head_dim)).reshape(
+            q_shape
+        )
         k = self.k_norm(
             k.view(*k_shape[:-1], self.num_kv_heads, self.head_dim)
         ).reshape(k_shape)
