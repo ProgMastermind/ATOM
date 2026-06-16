@@ -392,12 +392,20 @@ class EagleProposer:
         has_flat_kv = "kv_indices" in var
 
         # Target cudagraph replay may pass graph-sized Q into the Eagle3 draft.
-        # Match slot/block metadata to the graph-padded draft shape.
+        # Match slot/block metadata to the graph-padded draft shape only on
+        # that path; prefill/eager decode keep active-sized draft inputs.
+        use_graph_padded_draft = (
+            context.forward_mode is not None and context.forward_mode.use_cudagraph
+        )
         if draft_uses_mha:
-            attn_metadata.slot_mapping = var["slot_mapping"].gpu[
-                : context.graph_bs * attn_metadata.max_seqlen_q
-            ]
-            attn_metadata.block_tables = var["block_tables"].gpu[: context.graph_bs]
+            slot_len = (
+                context.graph_bs * attn_metadata.max_seqlen_q
+                if use_graph_padded_draft
+                else len(input_ids)
+            )
+            block_len = context.graph_bs if use_graph_padded_draft else bs
+            attn_metadata.slot_mapping = var["slot_mapping"].gpu[:slot_len]
+            attn_metadata.block_tables = var["block_tables"].gpu[:block_len]
 
         for i in range(self.mtp_k):
             with record_function(f"draft[{i}/{self.mtp_k} bs={bs}]"):

@@ -2123,10 +2123,19 @@ class ModelRunner:
                 self.tokenID_processor.prev_token_ids = next_token_ids
                 # self.debug(f"{sampled_tokens=}")
                 # self.debug(f"{next_token_locs=}")
+                fctx = get_forward_context()
+                token_ids_len = batch.total_tokens_num
+                if (
+                    fctx.context.forward_mode is not None
+                    and fctx.context.forward_mode.use_cudagraph
+                ):
+                    token_ids_len = (
+                        fctx.context.graph_bs * fctx.attn_metadata.max_seqlen_q
+                    )
                 draft_token_ids = self.propose_draft_token_ids(
                     batch,
                     self.tokenID_processor.input_ids.gpu[
-                        1 : batch.total_tokens_num + 1
+                        1 : token_ids_len + 1
                     ],
                     hidden_states,
                     next_token_ids,

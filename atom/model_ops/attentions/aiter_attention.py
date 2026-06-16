@@ -731,6 +731,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 :sum_scheduled_tokens
             ]
 
+        total_position_tokens = bs * max_seqlen_q
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:bs] = 0
@@ -779,7 +780,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         if mrope_positions is not None:
             positions = mrope_positions
         else:
-            positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+            positions = var["positions"].copy_to_gpu(total_position_tokens)
         if self.model_runner.config.enable_tbo_decode and bs >= 2:
             self._prepare_ubatch_decode(
                 scheduled_bs,

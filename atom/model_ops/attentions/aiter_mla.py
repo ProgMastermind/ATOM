@@ -933,6 +933,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
         var["slot_mapping"].np[: bs * max_seqlen_q] = -1
         if not batch.is_dummy_run:
             var["slot_mapping"].np[:sum_scheduled_tokens] = slot_mapping
+        total_position_tokens = bs * max_seqlen_q
         var["positions"].np[:sum_scheduled_tokens] = positions
         var["context_lens"].np[:scheduled_bs] = context_lens
         var["context_lens"].np[scheduled_bs:bs] = 0
@@ -1036,7 +1037,7 @@ class AiterMLAMetadataBuilder(CommonAttentionBuilder):
 
         is_sparse_mtp = self.is_sparse and max_seqlen_q > 1
         # metadata copies on main_stream
-        positions = var["positions"].copy_to_gpu(sum_scheduled_tokens)
+        positions = var["positions"].copy_to_gpu(total_position_tokens)
         ctx.update({el: var[el].copy_to_gpu(num) for el, num in vars_for_metadata})
 
         if is_sparse_mtp:
