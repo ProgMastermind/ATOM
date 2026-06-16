@@ -18,7 +18,8 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import GemmaRMSNorm, fused_allreduce_gemma_rms_norm
@@ -45,6 +46,7 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.topK import is_rocm_aiter_fusion_shared_expert_enabled
 from atom.model_ops.swiglu_oai import swiglu_oai_split
 from atom.model_ops.utils import atom_parameter
+from atom.utils import mark_spliting_op
 from atom.utils.forward_context import AttnState, get_forward_context
 from atom.models.utils import (
     IntermediateTensors,
@@ -272,6 +274,14 @@ class MiniMaxM3MoE(nn.Module):
                 f"only, got {self.experts.swiglu_beta}."
             )
 
+        # Expose this module to the FP4 MoE dispatch custom op via layer_name so
+        # the routed MoE stays a single graph piece (CUDA-graph capturable).
+        self.layer_name = prefix
+        compilation_config = get_current_atom_config().compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+
     def process_weights_after_loading(self) -> None:
         # The Triton MXFP4 path swizzles the loaded [w1 | w3] layout itself.
         if getattr(self.experts.quant_method, "use_triton", False):
@@ -284,7 +294,7 @@ class MiniMaxM3MoE(nn.Module):
         if getattr(self.experts.quant_method, "is_guinterleave", False):
             _interleave_swiglu_weights(self.experts)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         # fp32 router logits (matches the reference precision). FusedMoE applies
@@ -303,6 +313,13 @@ class MiniMaxM3MoE(nn.Module):
         if self.tp_size > 1:
             routed_output = tensor_model_parallel_all_reduce(routed_output)
         return routed_output.view(orig_shape)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Keep the routed MoE behind an opaque custom op (consistent with the
+        # other ATOM MoE models) so the piecewise model graph stays single-piece.
+        return torch.ops.aiter.minimax_m3_fp4_moe_forward(
+            hidden_states, self.layer_name
+        )
 
 
 class MiniMaxM3Attention(nn.Module):
@@ -384,10 +401,48 @@ class MiniMaxM3Attention(nn.Module):
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
         qkv = self.qkv_proj(hidden_states)
-        q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        # Use torch.split, not Tensor.split: the bound method traces as a
+        # call_function on torch._tensor, which AOTAutograd's cache treats as
+        # non-cacheable and bypasses (breaking standalone-compile artifact save).
+        # torch.split (torch.functional) is on the cache allowlist, matching the
+        # rest of the codebase (deepseek_v2, qwen3_next).
+        q, k, v = torch.split(qkv, [self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self._qk_norm_rope(positions, q, k)
         attn_output = self.attn(q, k, v)
         return self.o_proj(attn_output)
+
+
+def _minimax_m3_sparse_attention_fake(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    return torch.empty_like(q)
+
+
+# Mark the sparse-attention core as a splitting op so the piecewise compiler
+# cuts the model graph here (mirroring the dense `unified_attention_with_output_base`
+# boundary). Dynamo uses the fake impl while tracing and never inspects the
+# data-dependent block top-k / Triton kernels / KV-cache mutations inside; the
+# real impl (which also handles dummy/capture runs) runs eagerly at runtime.
+@mark_spliting_op(
+    is_custom=True, gen_fake=_minimax_m3_sparse_attention_fake, mutates_args=[]
+)
+def minimax_m3_sparse_attention(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    index_q: torch.Tensor,
+    index_k: torch.Tensor,
+    layer_name: str,
+) -> torch.Tensor:
+    self = get_current_atom_config().compilation_config.static_forward_context[
+        layer_name
+    ]
+    return self._sparse_attn_impl(q, k, v, index_q, index_k)
 
 
 class MiniMaxM3SparseAttention(nn.Module):
@@ -472,6 +527,13 @@ class MiniMaxM3SparseAttention(nn.Module):
         self.index_kv_cache = torch.tensor([])
         self.k_scale = self.v_scale = None
         self.kv_cache_dtype = cache_config
+
+        # Expose this layer to the sparse-attention splitting op via layer_name.
+        self.layer_name = prefix
+        compilation_config = get_current_atom_config().compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
 
     def _insert_kv(
         self,
@@ -566,17 +628,35 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
         return output
 
+    def _sparse_attn_impl(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        index_q: torch.Tensor,
+        index_k: torch.Tensor,
+    ) -> torch.Tensor:
+        # Runs eagerly inside the splitting op. Dummy/profile runs (CUDA graph
+        # capture warmup) have no real KV cache populated, so skip the sparse
+        # kernels and return a correctly shaped placeholder, mirroring the dense
+        # MHA backend's `is_dummy_run` handling.
+        fwd_ctx = get_forward_context()
+        if fwd_ctx.context.is_dummy_run:
+            return torch.empty_like(q)
+        attn_metadata = fwd_ctx.attn_metadata
+        self._insert_kv(k, v, index_k, attn_metadata.slot_mapping)
+        return self._run_sparse(q, index_q, attn_metadata)
+
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
     ) -> torch.Tensor:
-        fwd_ctx = get_forward_context()
-        if fwd_ctx.context.is_dummy_run:
-            return torch.empty_like(hidden_states)
-        attn_metadata = fwd_ctx.attn_metadata
         qkv = self.qkv_proj(hidden_states)
-        q, k, v, index_q, index_k = qkv.split(
+        # torch.split, not Tensor.split (see MiniMaxM3Attention.forward): the
+        # bound method bypasses the AOTAutograd cache and breaks artifact save.
+        q, k, v, index_q, index_k = torch.split(
+            qkv,
             [
                 self.q_size,
                 self.kv_size,
@@ -602,8 +682,11 @@ class MiniMaxM3SparseAttention(nn.Module):
         index_k = self.index_k_norm(index_k)
         index_q, index_k = self.rotary_emb(positions, index_q, index_k)
 
-        self._insert_kv(k, v, index_k, attn_metadata.slot_mapping)
-        attn_output = self._run_sparse(q, index_q, attn_metadata)
+        # Splitting op: the sparse-attention core (KV insert + block top-k +
+        # sparse attention) runs opaquely so the model graph stays single-piece.
+        attn_output = torch.ops.aiter.minimax_m3_sparse_attention(
+            q, k, v, index_q, index_k, self.layer_name
+        )
         return self.o_proj(attn_output)
 
 
