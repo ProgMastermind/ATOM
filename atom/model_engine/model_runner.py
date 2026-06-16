@@ -1294,11 +1294,9 @@ class ModelRunner:
         non_kv_overhead = peak_torch + cudagraph_overhead + safety_margin
         available_for_kv_budget = budget - non_kv_overhead
 
-        # Physical clamp: never consume all memory that is actually free on the
-        # GPU. Later collectives, graph pools, and allocator metadata still need
-        # small allocations after the KV tensors are created.
-        physical_free_for_kv = max(free - safety_margin, 0)
-        available_for_kv = min(available_for_kv_budget, physical_free_for_kv)
+        # Physical clamp: never exceed what's actually free on the GPU.
+        # This prevents OOM when other processes share the GPU.
+        available_for_kv = min(available_for_kv_budget, free)
 
         torch.set_default_device("cpu")
 
@@ -1329,13 +1327,12 @@ class ModelRunner:
                 f"({available_for_kv / (1 << 30):.2f}GB) at "
                 f"--gpu-memory-utilization {config.gpu_memory_utilization:.2f}."
             )
-            if available_for_kv_budget > physical_free_for_kv:
+            if available_for_kv_budget > free:
                 # The physical free-memory clamp is the binding limit, not the
                 # utilization budget — raising --gpu-memory-utilization won't help.
                 fix_msg = (
-                    f" Only {physical_free_for_kv / (1 << 30):.2f}GB is physically "
-                    f"available for KV after reserving safety memory "
-                    f"(free={free / (1 << 30):.2f}GB); raising "
+                    f" Only {free / (1 << 30):.2f}GB is physically free on the GPU "
+                    f"(other processes may be holding memory); raising "
                     f"--gpu-memory-utilization will NOT help. Free GPU memory or "
                     f"reduce --max-num-seqs (currently {config.max_num_seqs})."
                 )

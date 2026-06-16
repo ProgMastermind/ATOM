@@ -21,7 +21,12 @@ from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
-from atom.model_ops.layernorm import fused_allreduce_gemma_rms_norm
+from atom.model_ops.layernorm import (
+    GemmaRMSNorm,
+    fused_qk_norm,
+    fused_allreduce_gemma_rms_norm,
+)
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.linear import (
     MinimaxM3QKVParallelLinearWithIndexer,
     MergedColumnParallelLinear,
@@ -33,11 +38,6 @@ from atom.model_ops.moe import FusedMoE
 from atom.model_ops.minimax_m3.index_topk import (
     minimax_m3_index_topk,
     minimax_m3_index_topk_decode,
-)
-from atom.model_ops.minimax_m3.gemma_rmsnorm import (
-    gemma_fused_add_rmsnorm,
-    gemma_rmsnorm,
-    gemma_rmsnorm_heads,
 )
 from atom.model_ops.minimax_m3.moe import (
     make_minimax_m3_expert_params_mapping,
@@ -116,26 +116,27 @@ def _minimax_m3_cos_sin_cache(
     return torch.cat([cos_cache, sin_cache], dim=-1)
 
 
-class MiniMAXGemmaRMSNorm(nn.Module):
-    """MiniMax-M3 Gemma-style RMSNorm, matching the vLLM-ATOM wrapper."""
-
-    def __init__(
-        self,
-        hidden_size: int,
-        eps: float = 1e-6,
-    ) -> None:
-        super().__init__()
-        self.weight = nn.Parameter(torch.zeros(hidden_size))
-        self.variance_epsilon = eps
-
-    def forward(
-        self,
-        x: torch.Tensor,
-        residual: torch.Tensor | None = None,
-    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
-        if residual is None:
-            return gemma_rmsnorm(x, self.weight, self.variance_epsilon)
-        return gemma_fused_add_rmsnorm(x, residual, self.weight, self.variance_epsilon)
+def _minimax_m3_gemma_qk_norm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm: GemmaRMSNorm,
+    k_norm: GemmaRMSNorm,
+    num_q_heads: int,
+    num_kv_heads: int,
+    head_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    q, k = fused_qk_norm(
+        q.view(-1, num_q_heads, head_dim),
+        k.view(-1, num_kv_heads, head_dim),
+        q_norm.weight,
+        k_norm.weight,
+        q_norm.variance_epsilon,
+        add_unit_offset=True,
+    )
+    return (
+        q.view(-1, num_q_heads * head_dim),
+        k.view(-1, num_kv_heads * head_dim),
+    )
 
 
 class MiniMaxM3MLP(nn.Module):
@@ -311,8 +312,8 @@ class MiniMaxM3Attention(nn.Module):
             quant_config=quant_config,
             prefix=f"{prefix}.o_proj",
         )
-        self.q_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary_dim = int(self.head_dim * getattr(config, "partial_rotary_factor", 1.0))
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -337,19 +338,14 @@ class MiniMaxM3Attention(nn.Module):
     def _qk_norm_rope(
         self, positions: torch.Tensor, q: torch.Tensor, k: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        q = gemma_rmsnorm_heads(
+        q, k = _minimax_m3_gemma_qk_norm(
             q,
-            self.num_heads,
-            self.head_dim,
-            self.q_norm.weight,
-            self.q_norm.variance_epsilon,
-        )
-        k = gemma_rmsnorm_heads(
             k,
+            self.q_norm,
+            self.k_norm,
+            self.num_heads,
             self.num_kv_heads,
             self.head_dim,
-            self.k_norm.weight,
-            self.k_norm.variance_epsilon,
         )
         return self.rotary_emb(positions, q, k)
 
@@ -473,8 +469,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             prefix=f"{prefix}.o_proj",
         )
 
-        self.q_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
-        self.k_norm = MiniMAXGemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.q_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = GemmaRMSNorm(self.head_dim, eps=config.rms_norm_eps)
         rotary_dim = int(self.head_dim * getattr(config, "partial_rotary_factor", 1.0))
         self.rotary_emb = get_rope(
             self.head_dim,
@@ -483,12 +479,8 @@ class MiniMaxM3SparseAttention(nn.Module):
             base=_rope_theta(config),
             rope_scaling=getattr(config, "rope_scaling", None),
         )
-        self.index_q_norm = MiniMAXGemmaRMSNorm(
-            self.idx_head_dim, eps=config.rms_norm_eps
-        )
-        self.index_k_norm = MiniMAXGemmaRMSNorm(
-            self.idx_head_dim, eps=config.rms_norm_eps
-        )
+        self.index_q_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
+        self.index_k_norm = GemmaRMSNorm(self.idx_head_dim, eps=config.rms_norm_eps)
         self.index_rotary_emb = self.rotary_emb
         self.kv_cache = torch.tensor([])
         self.index_cache = torch.tensor([])
@@ -695,35 +687,25 @@ class MiniMaxM3SparseAttention(nn.Module):
             ],
             dim=-1,
         )
-        q = gemma_rmsnorm_heads(
+        q, k = _minimax_m3_gemma_qk_norm(
             q,
-            self.num_heads,
-            self.head_dim,
-            self.q_norm.weight,
-            self.q_norm.variance_epsilon,
-        )
-        k = gemma_rmsnorm_heads(
             k,
+            self.q_norm,
+            self.k_norm,
+            self.num_heads,
             self.num_kv_heads,
             self.head_dim,
-            self.k_norm.weight,
-            self.k_norm.variance_epsilon,
         )
         q, k = self.rotary_emb(positions, q, k)
 
-        index_q = gemma_rmsnorm_heads(
+        index_q, index_k = _minimax_m3_gemma_qk_norm(
             index_q,
-            self.num_idx_heads,
-            self.idx_head_dim,
-            self.index_q_norm.weight,
-            self.index_q_norm.variance_epsilon,
-        )
-        index_k = gemma_rmsnorm_heads(
             index_k,
+            self.index_q_norm,
+            self.index_k_norm,
+            self.num_idx_heads,
             1,
             self.idx_head_dim,
-            self.index_k_norm.weight,
-            self.index_k_norm.variance_epsilon,
         )
         index_q, index_k = self.index_rotary_emb(positions, index_q, index_k)
 
@@ -780,10 +762,8 @@ class MiniMaxM3DecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
 
-        self.input_layernorm = MiniMAXGemmaRMSNorm(
-            config.hidden_size, eps=config.rms_norm_eps
-        )
-        self.post_attention_layernorm = MiniMAXGemmaRMSNorm(
+        self.input_layernorm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.post_attention_layernorm = GemmaRMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
         )
 
@@ -847,7 +827,7 @@ class MiniMaxM3Model(nn.Module):
         )
 
         if get_pp_group().is_last_rank:
-            self.norm = MiniMAXGemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+            self.norm = GemmaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         else:
             self.norm = PPMissingLayer()
 

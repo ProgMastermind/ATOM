@@ -696,57 +696,65 @@ def get_generation_config(model: str) -> GenerationConfig:
         return None
 
 
-def _mirror_text_config_fields(hf_config: PretrainedConfig) -> None:
-    """Expose text-backbone fields on multimodal root configs when missing.
+_MINIMAX_M3_TEXT_FIELDS = (
+    "vocab_size",
+    "hidden_size",
+    "intermediate_size",
+    "dense_intermediate_size",
+    "shared_intermediate_size",
+    "num_hidden_layers",
+    "num_attention_heads",
+    "num_key_value_heads",
+    "head_dim",
+    "max_position_embeddings",
+    "rms_norm_eps",
+    "rope_theta",
+    "rotary_dim",
+    "partial_rotary_factor",
+    "rope_scaling",
+    "rope_parameters",
+    "hidden_act",
+    "swiglu_alpha",
+    "swiglu_beta",
+    "swiglu_limit",
+    "num_local_experts",
+    "num_experts_per_tok",
+    "n_shared_experts",
+    "scoring_func",
+    "use_routing_bias",
+    "routed_scaling_factor",
+    "moe_layer_freq",
+    "sparse_attention_config",
+    "tie_word_embeddings",
+    "quantization_config",
+)
 
-    Several native ATOM subsystems predate multimodal root configs and still
-    read structural LLM fields from ``hf_config`` directly. MiniMax-M3 keeps
-    those fields under ``text_config``; mirror only missing attributes so real
-    root-level values, if present, keep precedence.
-    """
 
+def _is_minimax_m3_config(hf_config: PretrainedConfig) -> bool:
+    architectures = getattr(hf_config, "architectures", None) or ()
+    if any("MiniMaxM3" in arch for arch in architectures):
+        return True
+    text_config = getattr(hf_config, "text_config", None)
+    return any(
+        "minimax_m3" in str(model_type).lower()
+        for model_type in (
+            getattr(hf_config, "model_type", ""),
+            getattr(text_config, "model_type", ""),
+        )
+    )
+
+
+def _normalize_minimax_m3_text_config(hf_config: PretrainedConfig) -> None:
+    if not _is_minimax_m3_config(hf_config):
+        return
     text_config = getattr(hf_config, "text_config", None)
     if text_config is None or text_config is hf_config:
         return
 
-    fields = (
-        "vocab_size",
-        "hidden_size",
-        "intermediate_size",
-        "dense_intermediate_size",
-        "shared_intermediate_size",
-        "num_hidden_layers",
-        "num_attention_heads",
-        "num_key_value_heads",
-        "head_dim",
-        "max_position_embeddings",
-        "rms_norm_eps",
-        "rope_theta",
-        "rotary_dim",
-        "partial_rotary_factor",
-        "rope_scaling",
-        "rope_parameters",
-        "hidden_act",
-        "swiglu_alpha",
-        "swiglu_beta",
-        "swiglu_limit",
-        "num_local_experts",
-        "num_experts_per_tok",
-        "n_shared_experts",
-        "scoring_func",
-        "use_routing_bias",
-        "routed_scaling_factor",
-        "moe_layer_freq",
-        "sparse_attention_config",
-        "tie_word_embeddings",
-        "quantization_config",
-    )
-    for attr_name in fields:
+    for attr_name in _MINIMAX_M3_TEXT_FIELDS:
         if not hasattr(hf_config, attr_name) and hasattr(text_config, attr_name):
             setattr(hf_config, attr_name, getattr(text_config, attr_name))
 
-    # MiniMax-M3 checkpoints omit swiglu_beta, while the reference/vLLM-ATOM
-    # config defines SwiGLU-OAI as beta=1.0, i.e. (up + 1).
     if getattr(text_config, "hidden_act", None) == "swigluoai":
         if getattr(text_config, "swiglu_beta", None) is None:
             text_config.swiglu_beta = 1.0
@@ -1110,7 +1118,7 @@ class Config:
         if self.hf_overrides:
             self.hf_config.update(self.hf_overrides)
             logger.info("Applied HF config overrides: %s", self.hf_overrides)
-        _mirror_text_config_fields(self.hf_config)
+        _normalize_minimax_m3_text_config(self.hf_config)
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
