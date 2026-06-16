@@ -20,7 +20,8 @@ from aiter.dist.parallel_state import (
     get_tensor_model_parallel_world_size,
 )
 from aiter.rotary_embedding import get_rope
-from atom.config import Config, QuantizationConfig
+from atom.config import Config, QuantizationConfig, get_current_atom_config
+from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import GemmaRMSNorm, fused_allreduce_gemma_rms_norm
@@ -265,6 +266,16 @@ class MiniMaxM3MoE(nn.Module):
         self.routed_w2_weight = None
         self.routed_w2_weight_scale = None
 
+        # Expose this module to the FP4 MoE dispatch custom op via layer_name.
+        # The routed forward uses data-dependent ops (torch.nonzero) that would
+        # graph-break the piecewise model graph; keeping the forward behind an
+        # opaque custom op keeps the model graph single-piece.
+        self.layer_name = prefix
+        compilation_config = get_current_atom_config().compilation_config
+        if prefix in compilation_config.static_forward_context:
+            raise ValueError(f"Duplicate layer name: {prefix}")
+        compilation_config.static_forward_context[prefix] = self
+
     def process_weights_after_loading(self) -> None:
         # Stash pre-swizzle MXFP4 expert weights/scales. The generic FusedMoE
         # post-load path may transpose/swizzle for its own kernels, but native
@@ -293,9 +304,9 @@ class MiniMaxM3MoE(nn.Module):
             sorted=False,
         ).indices
         topk_weights = routing_weights.gather(dim=-1, index=topk_ids)
-        topk_weights = topk_weights / topk_weights.sum(
-            dim=-1, keepdim=True
-        ).clamp_min(1e-20)
+        topk_weights = topk_weights / topk_weights.sum(dim=-1, keepdim=True).clamp_min(
+            1e-20
+        )
         return topk_weights.to(router_logits.dtype), topk_ids.to(torch.int32)
 
     def _fp4_experts_forward(
@@ -356,7 +367,7 @@ class MiniMaxM3MoE(nn.Module):
             output = output * self.experts.routed_scaling_factor
         return output.to(hidden_states.dtype)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         router_logits = torch.nn.functional.linear(
@@ -371,6 +382,13 @@ class MiniMaxM3MoE(nn.Module):
         if self.tp_size > 1:
             routed_output = tensor_model_parallel_all_reduce(routed_output)
         return routed_output.view(orig_shape)
+
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # Dispatch through an opaque custom op so the data-dependent routed
+        # expert path (torch.nonzero) stays out of the traced model graph.
+        return torch.ops.aiter.minimax_m3_fp4_moe_forward(
+            hidden_states, self.layer_name
+        )
 
 
 class MiniMaxM3Attention(nn.Module):
@@ -438,9 +456,9 @@ class MiniMaxM3Attention(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         q_shape = q.shape
         k_shape = k.shape
-        q = self.q_norm(
-            q.view(*q_shape[:-1], self.num_heads, self.head_dim)
-        ).reshape(q_shape)
+        q = self.q_norm(q.view(*q_shape[:-1], self.num_heads, self.head_dim)).reshape(
+            q_shape
+        )
         k = self.k_norm(
             k.view(*k_shape[:-1], self.num_kv_heads, self.head_dim)
         ).reshape(k_shape)
@@ -656,9 +674,9 @@ class MiniMaxM3SparseAttention(nn.Module):
         )
         q_shape = q.shape
         k_shape = k.shape
-        q = self.q_norm(
-            q.view(*q_shape[:-1], self.num_heads, self.head_dim)
-        ).reshape(q_shape)
+        q = self.q_norm(q.view(*q_shape[:-1], self.num_heads, self.head_dim)).reshape(
+            q_shape
+        )
         k = self.k_norm(
             k.view(*k_shape[:-1], self.num_kv_heads, self.head_dim)
         ).reshape(k_shape)
