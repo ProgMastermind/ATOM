@@ -366,6 +366,18 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
             * runner.physical_block_size
             * 4  # float32 kv_scale
         )
+        if getattr(hf_config, "model_type", None) == "minimax_m3_text":
+            sparse_cfg = getattr(hf_config, "sparse_attention_config", {}) or {}
+            sparse_freq = sparse_cfg.get("sparse_attention_freq", [])
+            num_sparse_layers = sum(1 for enabled in sparse_freq if enabled != 0)
+            index_dim = int(sparse_cfg.get("sparse_index_dim", hf_config.head_dim))
+            # Index cache stores one key vector per token for sparse layers.
+            block_bytes += (
+                num_sparse_layers
+                * runner.block_size
+                * index_dim
+                * torch.tensor([], dtype=config.torch_dtype).element_size()
+            )
         return block_bytes
 
     def allocate_kv_cache_tensors(
@@ -393,7 +405,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 "_kv_layer_cache_store": [],
             }
 
-        return {
+        tensors = {
             "kv_cache": torch.zeros(
                 2,
                 hf_config.num_hidden_layers,
@@ -414,6 +426,21 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 device="cuda",
             ),
         }
+        if getattr(hf_config, "model_type", None) == "minimax_m3_text":
+            sparse_cfg = getattr(hf_config, "sparse_attention_config", {}) or {}
+            sparse_freq = sparse_cfg.get("sparse_attention_freq", [])
+            num_sparse_layers = sum(1 for enabled in sparse_freq if enabled != 0)
+            index_dim = int(sparse_cfg.get("sparse_index_dim", hf_config.head_dim))
+            tensors["m3_index_cache"] = torch.zeros(
+                num_sparse_layers,
+                runner.num_physical_kvcache_blocks,
+                runner.physical_block_size,
+                index_dim,
+                dtype=config.torch_dtype,
+                device="cuda",
+            )
+            tensors["_m3_sparse_attn_idx"] = 0
+        return tensors
 
     def build_kv_cache_tensor(self, layer_id: int, module):
         """Bind one MHA (non-MLA) attention module to its KV slice.
@@ -429,7 +456,8 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
         from atom.config import KVCacheTensor
         from aiter import dtypes
 
-        if not (
+        is_m3_sparse_attn = getattr(module, "is_minimax_m3_sparse_attention", False)
+        if not is_m3_sparse_attn and not (
             hasattr(module, "base_attention")
             and hasattr(module, "use_mla")
             and not module.use_mla
@@ -450,6 +478,31 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 attn_idx = runner.num_full_attn + (layer_id - mtp_start)
         else:
             attn_idx = layer_id
+
+        if is_m3_sparse_attn:
+            kv_cache = runner.kv_cache[:, attn_idx].permute(1, 0, 2, 3, 4)
+            module.kv_cache = kv_cache
+            module.k_scale = (
+                runner.kv_scale[0, attn_idx]
+                if config.kv_cache_dtype == "fp8"
+                else None
+            )
+            module.v_scale = (
+                runner.kv_scale[1, attn_idx]
+                if config.kv_cache_dtype == "fp8"
+                else None
+            )
+            sparse_idx = runner._m3_sparse_attn_idx
+            module.index_kv_cache = runner.m3_index_cache[sparse_idx]
+            runner._m3_sparse_attn_idx += 1
+            module.max_model_len = config.max_model_len
+            return KVCacheTensor(
+                layer_num=layer_id,
+                k_cache=kv_cache[:, 0],
+                v_cache=kv_cache[:, 1],
+                k_scale=module.k_scale,
+                v_scale=module.v_scale,
+            )
 
         if runner.is_mimo_v2():
             # Per-layer allocation: each module gets its own correctly-sized

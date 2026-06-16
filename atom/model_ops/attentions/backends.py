@@ -373,7 +373,12 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                     else block_size
                 )
                 slot_mapping.extend(range(blk_start + off_start, blk_start + off_end))
-        if has_cached:
+        need_block_tables = (
+            has_cached
+            or getattr(self.model_runner.config.hf_config, "model_type", None)
+            == "minimax_m3_text"
+        )
+        if need_block_tables:
             self.prepare_block_tables(batch)
         # Validate metadata consistency
         assert (
@@ -400,7 +405,7 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
             ("slot_mapping", sum_scheduled_tokens),
             ("context_lens", bs),
         ]
-        if has_cached:
+        if need_block_tables:
             vars_used.append(("block_tables", bs))
             vars_used.append(("seq_starts", bs))
 

@@ -17,7 +17,11 @@ feed the block-sparse attention kernels in ``sparse_attn``.
 
 import torch
 
-from vllm.triton_utils import tl, triton
+try:
+    from vllm.triton_utils import tl, triton
+except ModuleNotFoundError:
+    import triton
+    import triton.language as tl
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128

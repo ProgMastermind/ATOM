@@ -1126,6 +1126,7 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                     a2_scale=layer.w2_input_scale,
                     w1_bias=layer.w13_bias,
                     w2_bias=layer.w2_bias,
+                    swiglu_alpha=getattr(layer, "swiglu_alpha", 1.702),
                     swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
                     apply_router_weight_on_input=layer.apply_router_weight_on_input,
                     global_num_experts=n_expts_tot,
@@ -1166,6 +1167,8 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
                 apply_router_weight_on_input=layer.apply_router_weight_on_input,
                 global_num_experts=global_num_experts,
                 act_quant=self.act_quant,
+                swiglu_alpha=getattr(layer, "swiglu_alpha", 1.702),
+                swiglu_limit=getattr(layer, "swiglu_limit", 0.0),
             )
 
         topk_weights, topk_ids = FusedMoE.select_experts(

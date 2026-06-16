@@ -579,6 +579,7 @@ _CONFIG_REGISTRY: dict[str, str] = {
 _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
     # Maps multimodal model_type -> key in config_dict for the text sub-config
     "kimi_k25": "text_config",
+    "minimax_m3_vl": "text_config",
     "qwen3_5": "text_config",
     "qwen3_5_moe": "text_config",
 }
@@ -586,6 +587,7 @@ _MULTIMODAL_MODEL_TYPES: dict[str, str] = {
 # multimodal models fully supported by plugin mode
 _PLUGIN_SUPPORTED_MULTIMODAL_MODELS: set[str] = {
     "kimi_k25",
+    "minimax_m3_vl",
     "qwen3_5",
     "qwen3_5_moe",
 }
@@ -625,10 +627,18 @@ def get_hf_config(model: str, trust_remote_code: bool = False) -> PretrainedConf
             and "quantization_config" in config_dict
         ):
             text_config_dict["quantization_config"] = config_dict["quantization_config"]
-        text_model_type = text_config_dict.get("model_type", "deepseek_v3")
-        mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
-        config_class = AutoConfig.for_model(mapped_type)
-        hf_config = config_class.from_dict(text_config_dict)
+        text_model_type = text_config_dict.get("model_type")
+        if text_model_type is None and model_type == "minimax_m3_vl":
+            text_model_type = "minimax_m3_text"
+        if text_model_type == "minimax_m3_text":
+            from atom.model_config.minimax_m3 import MiniMaxM3TextConfig
+
+            hf_config = MiniMaxM3TextConfig(**text_config_dict)
+        else:
+            text_model_type = text_model_type or "deepseek_v3"
+            mapped_type = _CONFIG_REGISTRY.get(text_model_type, text_model_type)
+            config_class = AutoConfig.for_model(mapped_type)
+            hf_config = config_class.from_dict(text_config_dict)
         # Override architectures so that ATOM selects the correct model class
         # which can handle the multimodal weight prefix during loading.
         original_arch = config_dict.get("architectures", [])
@@ -1055,6 +1065,35 @@ class Config:
         # Multimodal config (full config with vision_config) for vision encoder init
         self.multimodal_config = getattr(self.hf_config, "_multimodal_config", None)
         _normalize_moe_config_fields(self.hf_config, self.model)
+        if (
+            not is_plugin_mode()
+            and getattr(self.hf_config, "model_type", None) == "minimax_m3_text"
+        ):
+            if self.kv_cache_block_size != 128:
+                logger.warning(
+                    "MiniMax-M3 native sparse attention requires KV block size "
+                    "128; overriding kv_cache_block_size=%s.",
+                    self.kv_cache_block_size,
+                )
+                self.kv_cache_block_size = 128
+            if self.enable_prefix_caching:
+                logger.warning(
+                    "MiniMax-M3 native sparse/index cache restore is not "
+                    "implemented yet; disabling prefix caching."
+                )
+                self.enable_prefix_caching = False
+            if self.compilation_config.level != CompilationLevel.NO_COMPILATION:
+                logger.warning(
+                    "MiniMax-M3 native path is not torch.compile-ready yet; "
+                    "disabling compilation for this model."
+                )
+                self.compilation_config.level = CompilationLevel.NO_COMPILATION
+            if not self.enforce_eager:
+                logger.warning(
+                    "MiniMax-M3 native sparse/indexer attention is not CUDA graph "
+                    "capture-ready yet; enabling eager execution."
+                )
+                self.enforce_eager = True
         # transformers 5+ exposes rope_parameters; <5 often only rope_scaling + rope_theta.
         # Synthesize when missing or None so GPT-OSS YaRN (rope_type in rope_scaling) is preserved.
         if getattr(self.hf_config, "rope_parameters", None) is None:

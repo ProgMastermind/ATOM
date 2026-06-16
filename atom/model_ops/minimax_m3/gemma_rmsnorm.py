@@ -21,7 +21,11 @@ contiguous.
 
 import torch
 
-from vllm.triton_utils import tl, triton
+try:
+    from vllm.triton_utils import tl, triton
+except ModuleNotFoundError:
+    import triton
+    import triton.language as tl
 
 
 @triton.jit
