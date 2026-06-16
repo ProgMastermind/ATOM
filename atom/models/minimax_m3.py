@@ -19,7 +19,6 @@ from aiter.dist.parallel_state import (
 )
 from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig, get_current_atom_config
-from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.model_ops.base_attention import Attention
 from atom.model_ops.embed_head import ParallelLMHead, VocabParallelEmbedding
 from atom.model_ops.layernorm import GemmaRMSNorm, fused_allreduce_gemma_rms_norm
@@ -274,14 +273,6 @@ class MiniMaxM3MoE(nn.Module):
                 f"only, got {self.experts.swiglu_beta}."
             )
 
-        # Expose this module to the FP4 MoE dispatch custom op via layer_name so
-        # the routed MoE stays a single graph piece (CUDA-graph capturable).
-        self.layer_name = prefix
-        compilation_config = get_current_atom_config().compilation_config
-        if prefix in compilation_config.static_forward_context:
-            raise ValueError(f"Duplicate layer name: {prefix}")
-        compilation_config.static_forward_context[prefix] = self
-
     def process_weights_after_loading(self) -> None:
         # The Triton MXFP4 path swizzles the loaded [w1 | w3] layout itself.
         if getattr(self.experts.quant_method, "use_triton", False):
@@ -294,14 +285,16 @@ class MiniMaxM3MoE(nn.Module):
         if getattr(self.experts.quant_method, "is_guinterleave", False):
             _interleave_swiglu_weights(self.experts)
 
-    def forward_impl(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
         # fp32 router logits (matches the reference precision). FusedMoE applies
         # the sigmoid scoring + routing-bias correction + renormalize +
         # routed_scaling_factor routing, then dispatches the routed experts to
         # aiter's fused_moe (default, FlyDSL a4w4) or aiter's Triton MXFP4 MoE
-        # (ATOM_USE_TRITON_MOE=1, the reference path).
+        # (ATOM_USE_TRITON_MOE=1, the reference path). self.experts is
+        # torch.ops.aiter.moe_forward (a custom op), so it is already an opaque,
+        # graph-capturable node -- no extra MoE wrapper op is needed.
         router_logits = torch.nn.functional.linear(
             hidden_states.float(), self.gate.weight.float()
         )
@@ -313,13 +306,6 @@ class MiniMaxM3MoE(nn.Module):
         if self.tp_size > 1:
             routed_output = tensor_model_parallel_all_reduce(routed_output)
         return routed_output.view(orig_shape)
-
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
-        # Keep the routed MoE behind an opaque custom op (consistent with the
-        # other ATOM MoE models) so the piecewise model graph stays single-piece.
-        return torch.ops.aiter.minimax_m3_fp4_moe_forward(
-            hidden_states, self.layer_name
-        )
 
 
 class MiniMaxM3Attention(nn.Module):
