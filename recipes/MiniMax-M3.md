@@ -115,6 +115,30 @@ python -m atom.benchmarks.benchmark_serving \
   --percentile-metrics="ttft,tpot,itl,e2el"
 ```
 
+Reference result from the validated run on 8xMI355X GPUs:
+
+```text
+Successful requests:                     160
+Benchmark duration (s):                  233.51
+Total input tokens:                      1175032
+Total generated tokens:                  146426
+Request throughput (req/s):              0.69
+Output token throughput (tok/s):         627.05
+Total Token throughput (tok/s):          5658.99
+Mean TTFT (ms):                          556.88
+Median TTFT (ms):                        335.52
+P99 TTFT (ms):                           3610.92
+Mean TPOT (ms):                          24.02
+Median TPOT (ms):                        24.12
+P99 TPOT (ms):                           27.21
+Mean ITL (ms):                           24.01
+Median ITL (ms):                         20.16
+P99 ITL (ms):                            235.31
+Mean E2EL (ms):                          22530.64
+Median E2EL (ms):                        22406.40
+P99 E2EL (ms):                           26977.54
+```
+
 ## Accuracy Test
 
 Run GSM8K 5-shot with `lm_eval`:
