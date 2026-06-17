@@ -1,6 +1,6 @@
 # MiniMax-M3 BF16 Usage Guide
 
-[MiniMax-M3](https://huggingface.co/amd/MiniMax-M3) is a MiniMax-M3 BF16 checkpoint supported by the native ATOM OpenAI-compatible server path.
+[MiniMax-M3](https://huggingface.co/amd/MiniMax-M3) and [MiniMax-M3-MXFP4](https://huggingface.co/amd/MiniMax-M3-MXFP4) are supported by the native ATOM OpenAI-compatible server path.
 
 This recipe tracks the MiniMax-M3 BF16 support added in [ROCm/ATOM PR #1238](https://github.com/ROCm/ATOM/pull/1238). The validated setup also uses the AITER branch `M3_mi355`.
 
@@ -12,16 +12,11 @@ Pull the latest development image:
 docker pull rocm/atom-dev:latest
 ```
 
-All commands below should be run inside the container. The example assumes the model is available at:
+All commands below should be run inside the container. The example uses the
+Hugging Face model id:
 
 ```bash
-model_path=/shared/data/amd_int/models/MiniMax-M3/
-```
-
-If `/shared/data/amd_int/models` is mounted as `/models` inside the container, use:
-
-```bash
-model_path=/models/MiniMax-M3/
+model_path=amd/MiniMax-M3
 ```
 
 ## Launching Server
@@ -32,7 +27,7 @@ Native ATOM enables CUDAGraph by default. The command below lists the decode
 CUDAGraph capture sizes explicitly.
 
 ```bash
-model_path=/shared/data/amd_int/models/MiniMax-M3/
+model_path=amd/MiniMax-M3
 export ATOM_USE_TRITON_MOE="${ATOM_USE_TRITON_MOE:-1}"
 
 python -m atom.entrypoints.openai_server \
@@ -41,12 +36,6 @@ python -m atom.entrypoints.openai_server \
   --block-size 128 \
   --no-enable_prefix_caching \
   --cudagraph-capture-sizes '[1,2,4,8,16,32,48,64,128,256,512]'
-```
-
-Use the container path if the model directory is mounted at `/models`:
-
-```bash
-model_path=/models/MiniMax-M3/
 ```
 
 ## Smoke Test
@@ -74,7 +63,7 @@ Reference response from the validated run:
 
 ```json
 {
-  "model": "/models/MiniMax-M3/",
+  "model": "amd/MiniMax-M3",
   "choices": [
     {
       "text": " Beijing. The the capital of China is Beijing.",
@@ -94,7 +83,7 @@ Reference response from the validated run:
 The following script can be used to benchmark online serving throughput and latency:
 
 ```bash
-model_path=/shared/data/amd_int/models/MiniMax-M3/
+model_path=amd/MiniMax-M3
 ISL=8192
 OSL=1024
 CONC=16
@@ -144,7 +133,7 @@ P99 E2EL (ms):                           26977.54
 Run GSM8K 5-shot with `lm_eval`:
 
 ```bash
-model_path=/shared/data/amd_int/models/MiniMax-M3/
+model_path=amd/MiniMax-M3
 
 lm_eval --model local-completions \
         --model_args model=$model_path,base_url=http://localhost:8013/v1/completions,num_concurrent=65,max_retries=1,tokenized_requests=False,trust_remote_code=True \
@@ -155,10 +144,54 @@ lm_eval --model local-completions \
 Validated GSM8K result:
 
 ```text
-local-completions ({'model': '/models/MiniMax-M3/', 'base_url': 'http://localhost:8013/v1/completions', 'num_concurrent': 65, 'max_retries': 1, 'tokenized_requests': False}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 1
+local-completions ({'model': 'amd/MiniMax-M3', 'base_url': 'http://localhost:8013/v1/completions', 'num_concurrent': 65, 'max_retries': 1, 'tokenized_requests': False}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 1
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9181|±  |0.0076|
 |     |       |strict-match    |     5|exact_match|↑  |0.9181|±  |0.0076|
 ```
 
+## MXFP4 Accuracy Test
+
+The following command starts the MiniMax-M3-MXFP4 checkpoint on 4xMI355X GPUs:
+
+```bash
+model_path=amd/MiniMax-M3-MXFP4
+
+python -m atom.entrypoints.openai_server \
+  --model "$model_path" \
+  --tensor-parallel-size 4 \
+  --server-port 8000 \
+  --trust-remote-code \
+  --gpu-memory-utilization 0.8 \
+  --block-size 128 \
+  --max-model-len 32768 \
+  --max-num-seqs 128 \
+  --max-num-batched-tokens 32768 2>&1 | tee m3-mxfp4-server.log
+```
+
+Run GSM8K 5-shot with `lm_eval`:
+
+```bash
+model_path=amd/MiniMax-M3-MXFP4
+BS=65
+
+lm_eval \
+  --model local-chat-completions \
+  --model_args "model=$model_path,base_url=http://127.0.0.1:8000/v1/chat/completions,num_concurrent=32,max_gen_toks=16384" \
+  --tasks gsm8k \
+  --num_fewshot 5 \
+  --batch_size "${BS}" \
+  --apply_chat_template \
+  --fewshot_as_multiturn 2>&1 | tee m3-mxfp4-bs65-accuracy.log
+```
+
+Validated GSM8K result:
+
+```text
+local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP4', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9386|±  |0.0066|
+|     |       |strict-match    |     5|exact_match|↑  |0.9393|±  |0.0066|
+```
