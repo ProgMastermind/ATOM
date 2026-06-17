@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1781633851673,
+  "lastUpdate": 1781706073181,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -186,6 +186,42 @@ window.BENCHMARK_DATA = {
             "value": 0.8961,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/27636884966 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202606151651 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3328 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "email": "carlus.huang@amd.com",
+            "name": "carlushuang",
+            "username": "carlushuang"
+          },
+          "committer": {
+            "email": "noreply@github.com",
+            "name": "GitHub",
+            "username": "web-flow"
+          },
+          "distinct": true,
+          "id": "e66dc33f66925382fe28be22be8d6fb47d779c2c",
+          "message": "glm_moe_dsa: support GLM-5.2 IndexShare (FP8) (#1260)\n\n* glm_moe_dsa: support GLM-5.2 IndexShare (FP8)\n\nGLM-5.2 (glm_moe_dsa) extends the DeepSeek-V3.2-style DSA stack with\nIndexShare: layers marked \"shared\" in `indexer_types` reuse the preceding\n\"full\" layer's indexer/topk and carry no indexer weights of their own in\nthe checkpoint.\n\n- models/deepseek_v2.py:\n  - Make `indexer_types` the authoritative source for the per-layer\n    indexer-skip decision (supersedes index_topk_pattern / index_topk_freq).\n  - Honor `index_skip_topk_offset` in the freq-based fallback (default 1\n    preserves existing DeepSeek behavior).\n  - Reuse the cached topk for the MTP layer when\n    `index_share_for_mtp_iteration` is set.\n  - Do not build indexer weights for \"shared\" layers; otherwise their\n    parameters load nothing from the checkpoint, stay at init values and\n    corrupt the indexer (the forward and the index-cache binding already\n    guard on `indexer is not None`).\n- config.py: auto-enable `use_index_cache` for glm_moe_dsa when the model\n  declares an IndexShare schedule, so serving works without passing an\n  --hf-overrides flag.\n- plugin/vllm/model_wrapper.py: re-apply the auto-enable after vLLM\n  replaces ATOM's hf_config.\n\nValidated on 8x MI355X (TP=8, FP8): native ATOM loads all weights with no\nunloaded params and generates correctly for 1k/1k and 8k/1k inputs.\n\n* docs: document GLM-5.2 (IndexShare) serving + add News entry\n\n- recipes/GLM-5.md: add a GLM-5.2 (IndexShare) section with the TP8 serve\n  command, configuration tips (bf16 KV, gpu-mem-util 0.8), and 8xMI355X\n  perf baselines for 1k/1k and 8k/1k; add a pointer from the intro.\n- README.md: add a News entry announcing GLM-5.2 FP8 support.\n\n* docs: note GLM-5.2 in README Supported Models table\n\n* style: black formatting for indexer_types skip return\n\n* style: condense GLM-5.2 code comments\n\n* refactor: move maybe_enable_glm_dsa_index_cache into deepseek_v2\n\nOwn the indexer-cache auto-enable in the model: call it once in\nDeepseekV2ForCausalLM.__init__ (covers native + vLLM plugin) instead of\nin config.get_hf_config and the vLLM wrapper.\n\n* refactor: inline index-cache enable into _should_skip_index_topk\n\nDrop maybe_enable_glm_dsa_index_cache; instead, when index_topk_freq > 1\n(IndexShare) turn on use_index_cache directly in _should_skip_index_topk.\nNo model_type gating needed.\n\n* refactor: gate index_topk_freq check under the use_index_cache branch\n\n* refactor: drop redundant 'or 1' guard on index_topk_freq\n\n* benchmark: add GLM-5.2-FP8 to dashboard (perf + accuracy)\n\nNative-engine catalog entries for the nightly dashboard:\n- models.json: TP8 FP8, kv_cache_dtype fp8, --gpu-memory-utilization 0.8\n  (DSA index cache OOMs at default 0.9), conc up to 256.\n- models_accuracy.json: gsm8k threshold 0.92 (measured 3-shot\n  flexible-extract 0.9447 on 8x MI355X).",
+          "timestamp": "2026-06-17T21:35:46+08:00",
+          "tree_id": "f9a0d69afe3773e3827fdc11b5f146fea9e77a27",
+          "url": "https://github.com/ROCm/ATOM/commit/e66dc33f66925382fe28be22be8d6fb47d779c2c"
+        },
+        "date": 1781706065392,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-R1-0528 accuracy (GSM8K)",
+            "value": 0.9469,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/27692965736 | Threshold: 0.94 | Baseline: 0.9553 | BaselineModel: deepseek-ai/DeepSeek-R1-0528 | BaselineNote: CI measured FP8 baseline (GSM8K 3-shot flexible-extract) | Docker: rocm/atom-dev:nightly_202606161823 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9447 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-R1-0528"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7491,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/27692965736 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202606161823 | GPU: AMD Instinct MI355X | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.7475 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
           }
         ]
       }
