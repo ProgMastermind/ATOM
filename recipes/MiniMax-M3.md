@@ -102,7 +102,6 @@ The following command starts the MiniMax-M3-MXFP4 checkpoint:
 
 ```bash
 model_path=amd/MiniMax-M3-MXFP4
-export ATOM_M3_SPARSE_USE_ASM_PA=1
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
@@ -122,7 +121,6 @@ Run GSM8K 5-shot with `lm_eval`:
 
 ```bash
 model_path=amd/MiniMax-M3-MXFP4
-export ATOM_M3_SPARSE_USE_ASM_PA=1
 BS=65
 
 lm_eval \
@@ -151,7 +149,6 @@ The following script can be used to benchmark online serving throughput and late
 
 ```bash
 model_path=amd/MiniMax-M3-MXFP4
-export ATOM_M3_SPARSE_USE_ASM_PA=1
 ISL=8192
 OSL=1024
 CONC=16
