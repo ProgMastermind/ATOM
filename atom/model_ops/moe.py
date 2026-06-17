@@ -7,7 +7,6 @@ from abc import abstractmethod
 from dataclasses import dataclass
 from enum import Enum
 from typing import Callable, List, Optional, Tuple
-import logging
 
 import torch
 from aiter import ActivationType, QuantType, dtypes, get_hip_quant, topk_gating
@@ -1014,54 +1013,37 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         layer.w2_weight.is_shuffled = True
 
         # shuffle scale
-        if self.is_gfx1250:
-            # gfx1250 grouped a8w4 MoE kernel reads the weight (B) e8m0 scale in
-            # the "N32K4" layout produced by _grouped_b_scale_prepare_batch: a
-            # 64-row x 256-K super-block is folded into one row so each lane
-            # reads its full WMMA scaleB operand with one contiguous load. The
-            # layout is fixed by the WMMA scale contract (no warp_tile/tile_k
-            # knobs). w13 is the (gate|up) operand (rows = 2*inter,
-            # k_dim = model_dim); w2 (down) has rows = model_dim, k_dim = inter.
-            # The 256 pad_align on hidden_size/intermediate_size guarantees
-            # rows % 64 == 0 and k_dim % 256 == 0, as the layout requires.
-            from aiter.ops.flydsl.grouped_moe_gfx1250 import (
-                _grouped_b_scale_prepare_batch,
-            )
+        #
+        # shuffle_scale dispatches on is_n32k4 first: when True it folds the raw
+        # per-expert e8m0 scale into the gfx1250 grouped-MoE "N32K4" layout (a
+        # 32-row super-block folds its k_scale columns into k_scale*32 cols so
+        # each lane reads its full WMMA scaleB operand with one contiguous load),
+        # ignoring is_guinterleave/gate_up. The 256 pad_align on
+        # hidden_size/intermediate_size guarantees rows % 32 == 0 and
+        # (K//32) % 4 == 0, as that layout requires. Otherwise it applies the
+        # gate_up-aware (guinterleave) shuffle. (gfx1250 already rejects
+        # is_guinterleave in __init__, so the two layouts never combine.)
+        w13_scale_2d = layer.w13_weight_scale.reshape(
+            -1, layer.w13_weight_scale.shape[-1]
+        )
+        w2_scale_2d = layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1])
 
-            layer.w13_weight_scale = atom_parameter(
-                _grouped_b_scale_prepare_batch(
-                    layer.w13_weight_scale.data,
-                    experts=self.num_experts,
-                    rows=2 * self.intermediate_size,
-                    k_dim=self.hidden_size,
-                    device=layer.w13_weight_scale.device,
-                )
-            )
-            layer.w2_weight_scale = atom_parameter(
-                _grouped_b_scale_prepare_batch(
-                    layer.w2_weight_scale.data,
-                    experts=self.num_experts,
-                    rows=self.hidden_size,
-                    k_dim=self.intermediate_size,
-                    device=layer.w2_weight_scale.device,
-                )
-            )
-        else:
-            w13_scale_2d = layer.w13_weight_scale.reshape(
-                -1, layer.w13_weight_scale.shape[-1]
-            )
-            w2_scale_2d = layer.w2_weight_scale.reshape(
-                -1, layer.w2_weight_scale.shape[-1]
-            )
-
-            shuffled_w13_scale = shuffle_scale(
-                w13_scale_2d, self.num_experts, self.is_guinterleave, True
-            )
-            shuffled_w2_scale = shuffle_scale(
-                w2_scale_2d, self.num_experts, self.is_guinterleave, False
-            )
-            layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
-            layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
+        shuffled_w13_scale = shuffle_scale(
+            w13_scale_2d,
+            self.num_experts,
+            is_guinterleave=self.is_guinterleave,
+            gate_up=True,
+            is_n32k4=self.is_gfx1250,
+        )
+        shuffled_w2_scale = shuffle_scale(
+            w2_scale_2d,
+            self.num_experts,
+            is_guinterleave=self.is_guinterleave,
+            gate_up=False,
+            is_n32k4=self.is_gfx1250,
+        )
+        layer.w13_weight_scale = atom_parameter(shuffled_w13_scale)
+        layer.w2_weight_scale = atom_parameter(shuffled_w2_scale)
 
     def get_fused_moe_quant_config(
         self, layer: torch.nn.Module
