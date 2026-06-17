@@ -4,9 +4,8 @@
 
 Index queries score each 128-token block of index keys (max over the block),
 then the top-k blocks (plus forced init/local blocks) are selected per query
-token. Ported from the sglang reference (minimax_sparse_ops), adapted to vLLM's
-paged KV cache: the KV page size is forced to equal the sparse block size (128),
-so one sparse block maps to exactly one page.
+token. Adapted to vLLM's paged KV cache: the KV page size is forced to equal the
+sparse block size (128), so one sparse block maps to exactly one page.
 
 Index-K cache layout (vLLM): ``(num_blocks, 128, idx_head_dim)`` (single head).
 
@@ -17,14 +16,16 @@ feed the block-sparse attention kernels in ``sparse_attn``.
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
+from vllm.utils.math_utils import round_up
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 
 
 # ---------------------------------------------------------------------------
-# Bitonic top-k helpers (layout-agnostic; ported verbatim from sglang).
+# Bitonic top-k helpers (layout-agnostic).
 # ---------------------------------------------------------------------------
 @triton.jit
 def _compare_and_swap(x, ids, flip, i: tl.constexpr, n_dims: tl.constexpr):
@@ -74,7 +75,10 @@ def _bitonic_merge(
 # 128-token block of (idx_q . index_k), causal-masked. BLOCK_SIZE_K == 128 so
 # each K-tile is exactly one page (BLOCKS_PER_K_BLOCK == 1).
 # ---------------------------------------------------------------------------
-@triton.jit
+# since prefill metadata is sliced from mixed batch metadata, seq_lens and prefix_lens
+# might lose pointer alignment, which trigger Triton recompiles. we don't actually
+# need pointer alignment for those tensors anyway because we do scalar load.
+@triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
 def _index_block_score_kernel(
     q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
     ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
@@ -165,6 +169,9 @@ def _index_block_score_kernel(
 # Top-k selection over per-token block scores (layout-agnostic). block_size_q
 # is 1 for M3, so top-k is computed per query token.
 # ---------------------------------------------------------------------------
+# since prefill metadata is sliced from mixed batch metadata, prefix_lens
+# might lose pointer alignment, which trigger Triton recompiles. we don't actually
+# need pointer alignment for those tensors anyway because we do scalar load.
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
 @triton.autotune(
     configs=[
@@ -177,7 +184,7 @@ def _index_block_score_kernel(
     ],
     key=["BLOCK_SIZE_T"],
 )
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["prefix_lens"])
 def _topk_index_kernel(
     s_ptr,  # [num_heads, total_q, max_block]
     ti_ptr,  # [num_heads, total_q, topk]
@@ -280,27 +287,25 @@ def _topk_index_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Decode index-score kernel (split-K over seq blocks). Decode == one query
-# token per request, so this parallelizes over the KV dimension instead of the
-# query dimension. Chunk counts depend only on shape constants so the grid is
-# fixed within a cuda graph. Base-2 (exp2/log2) softmax matches prefill.
+# Decode index-score kernel (split-K over seq blocks). Decode batches are
+# flattened request-major, with a runtime query length used to map each query
+# token back to its request metadata. Chunk counts depend only on shape
+# constants so the grid is fixed within a cuda graph. Base-2 (exp2/log2)
+# softmax matches prefill.
 # ---------------------------------------------------------------------------
-@triton.heuristics(
-    {"BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"])}
-)
-@triton.jit
+@triton.jit(do_not_specialize=["num_kv_chunks", "decode_query_len"])
 def _decode_index_score_kernel(
-    q_ptr,  # idx_q: [total_q (== batch), num_idx_heads, head_dim]
+    q_ptr,  # idx_q: [total_q, num_idx_heads, head_dim]
     ik_cache_ptr,  # index-K cache: [num_blocks, 128, head_dim]
     score_ptr,  # [num_idx_heads, total_q, max_block]
     block_table_ptr,  # [num_reqs, max_blocks]
-    seq_lens,  # [batch]
-    num_idx_heads,
-    batch_size,
-    head_dim,
+    seq_lens,  # [num_reqs]
+    num_idx_heads: tl.constexpr,
+    head_dim: tl.constexpr,
     init_blocks,
     local_blocks,
     sm_scale,
+    decode_query_len,
     stride_q_n,
     stride_q_h,
     stride_q_d,
@@ -312,92 +317,97 @@ def _decode_index_score_kernel(
     stride_s_k,
     stride_bt_b,
     BLOCK_SIZE_K: tl.constexpr,  # == SPARSE_BLOCK_SIZE (128)
-    NUM_KV_CHUNKS: tl.constexpr,
-    BLOCK_SIZE_D: tl.constexpr,
+    num_kv_chunks,
+    USE_PDL: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
-    pid_bc, pid_h = tl.program_id(0), tl.program_id(1)
-    pid_b = pid_bc % batch_size
-    pid_c = pid_bc // batch_size
-    seq_len = tl.load(seq_lens + pid_b)
-    num_blocks = (seq_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+    pid_b = tl.program_id(0)  # flattened query-token id
+    pid_c = tl.program_id(1)
+    req_id = pid_b // decode_query_len
+    q_offset = pid_b - req_id * decode_query_len
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    seq_len = tl.load(seq_lens + req_id)
+    query_pos = seq_len - decode_query_len + q_offset
+    # Full-CG padding uses zero-length request rows. Clamp to an empty
+    # attention range instead of letting padded rows produce negative lengths.
+    kv_len = tl.maximum(query_pos + 1, 0)
+    num_blocks = (kv_len + BLOCK_SIZE_K - 1) // BLOCK_SIZE_K
+
     # block-aligned fixed-count split: grid independent of seq_len (cuda graph).
-    chunk_size_blocks = (num_blocks + NUM_KV_CHUNKS - 1) // NUM_KV_CHUNKS
+    chunk_size_blocks = (num_blocks + num_kv_chunks - 1) // num_kv_chunks
     chunk_start_block = pid_c * chunk_size_blocks
     chunk_end_block = tl.minimum(chunk_start_block + chunk_size_blocks, num_blocks)
     if chunk_start_block >= chunk_end_block:
         return
     off_k = tl.arange(0, BLOCK_SIZE_K)  # positions within a 128-block
-    off_d = tl.arange(0, BLOCK_SIZE_D)
-    d_mask = off_d < head_dim
-    bt_row = block_table_ptr + pid_b * stride_bt_b
+    off_d = tl.arange(0, head_dim)
+    bt_row = block_table_ptr + req_id * stride_bt_b
     # Force-select init (1e30) and local (1e29, higher priority) blocks.
     local_start = tl.maximum(0, num_blocks - local_blocks)
-    # single query vector for this (token, index head)
+    # query vectors across all heads
     q = tl.load(
-        q_ptr + pid_b * stride_q_n + pid_h * stride_q_h + off_d * stride_q_d,
-        mask=d_mask,
-        other=0.0,
-    ).to(
-        tl.float32
-    )  # [D]
+        q_ptr
+        + pid_b * stride_q_n
+        + tl.arange(0, num_idx_heads) * stride_q_h
+        + off_d[:, None] * stride_q_d,
+    )  # [D,H]
     for blk in tl.range(chunk_start_block, chunk_end_block):
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = blk * BLOCK_SIZE_K + off_k
-        pos_mask = pos < seq_len
+        pos_mask = pos < kv_len
+        # we don't need masked load for K, because KV cache ensures
+        # allocation is multiple of BLOCK_SIZE_K.
+        # for tokens beyond seqlen, they will be masked in qk later.
         k = tl.load(
             ik_cache_ptr
             + page * stride_ik_blk
-            + off_k[None, :] * stride_ik_pos
-            + off_d[:, None] * stride_ik_d,
-            mask=d_mask[:, None] & pos_mask[None, :],
-            other=0.0,
-        ).to(
-            tl.float32
-        )  # [D, N]
-        qk = tl.sum(q[:, None] * k, axis=0) * sm_scale_log2e  # [N]
-        qk = tl.where(pos_mask, qk, float("-inf"))
-        score = tl.max(qk, axis=0)  # one score for this 128-block
+            + off_k[:, None] * stride_ik_pos
+            + off_d * stride_ik_d,
+        )  # [N,D]
+        kq = tl.dot(k, q) * sm_scale_log2e  # [N,H]
+        kq = tl.where(pos_mask[:, None], kq, float("-inf"))
+        score = tl.max(kq, axis=0)  # [H]
         is_init = blk < init_blocks
         is_local = (blk >= local_start) & (blk < num_blocks)
         score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
         tl.store(
-            score_ptr + pid_h * stride_s_h + pid_b * stride_s_n + blk * stride_s_k,
+            score_ptr
+            + tl.arange(0, num_idx_heads) * stride_s_h
+            + pid_b * stride_s_n
+            + blk * stride_s_k,
             score,
         )
 
 
 # ---------------------------------------------------------------------------
 # Decode top-k (split-K): per-chunk partial top-k + merge. Forced init/local
-# blocks are already encoded in the scores. Ported from the sglang reference.
+# blocks are already encoded in the scores.
 # ---------------------------------------------------------------------------
 @triton.heuristics({"BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"])})
 @triton.autotune(
-    # IMPORTANT: keep this to a SINGLE config. This kernel runs in the decode
-    # path, which is captured into a FULL cudagraph. Triton's autotuner only
-    # benchmarks (and calls torch.cuda.synchronize()) when len(configs) > 1; a
-    # sync is illegal while a stream is capturing and aborts capture with
-    # `hipErrorStreamCaptureUnsupported`. The decode path is first reached
-    # during capture (warmup runs prefill metadata), so there's no opportunity
-    # to autotune beforehand. With one config the autotuner skips the benchmark
-    # entirely and is capture-safe. All configs are numerically identical
-    # (BLOCK_SIZE_K only affects the seq-block tiling), so this is correctness-
-    # neutral. The prefill `_topk_index_kernel` keeps its full autotune list
-    # because prefill is never captured.
     configs=[
         triton.Config({"BLOCK_SIZE_K": 256}, num_warps=8, num_stages=2),
+        triton.Config({"BLOCK_SIZE_K": 256}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=2),
+        triton.Config({"BLOCK_SIZE_K": 128}, num_warps=4, num_stages=3),
+        triton.Config({"BLOCK_SIZE_K": 64}, num_warps=2, num_stages=2),
     ],
     key=["topk"],
 )
-@triton.jit
+@triton.jit(do_not_specialize=["chunk_blocks", "decode_query_len"])
 def _topk_index_partial_kernel(
-    s_ptr,  # score: [num_idx_heads, batch, max_block]
-    ts_partial_ptr,  # partial scores out: [NUM_TOPK_CHUNKS, num_idx_heads, batch, T]
+    s_ptr,  # score: [num_idx_heads, total_q, max_block]
+    ts_partial_ptr,  # partial scores out: [NUM_TOPK_CHUNKS, num_idx_heads, total_q, T]
     ti_partial_ptr,  # partial idx out (1-indexed global, 0=invalid): same shape
-    seq_lens,  # [batch]
+    seq_lens,  # [num_reqs]
     block_size: tl.constexpr,  # sparse block size (128)
     topk: tl.constexpr,
-    chunk_blocks: tl.constexpr,  # how many score-blocks each chunk owns
+    chunk_blocks,  # how many score-blocks each chunk owns
+    decode_query_len,
     stride_s_h,
     stride_s_b,
     stride_s_k,
@@ -411,14 +421,24 @@ def _topk_index_partial_kernel(
     stride_ti_t,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     tl.static_assert(topk < BLOCK_SIZE_K)
-    pid_b = tl.program_id(0)
+    pid_b = tl.program_id(0)  # flattened query-token id
     pid_h = tl.program_id(1)
     pid_chunk = tl.program_id(2)
+    req_id = pid_b // decode_query_len
+    q_offset = pid_b - req_id * decode_query_len
 
-    seq_len = tl.load(seq_lens + pid_b)
-    num_blocks = (seq_len + block_size - 1) // block_size
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    seq_len = tl.load(seq_lens + req_id)
+    query_pos = seq_len - decode_query_len + q_offset
+    # Full-CG padding uses zero-length request rows. Clamp to an empty
+    # attention range instead of letting padded rows produce negative lengths.
+    kv_len = tl.maximum(query_pos + 1, 0)
+    num_blocks = (kv_len + block_size - 1) // block_size
 
     # Slice this chunk owns within [0, num_blocks).
     chunk_start = pid_chunk * chunk_blocks
@@ -474,6 +494,9 @@ def _topk_index_partial_kernel(
                 topk_score, topk_idx.to(tl.int32), n_dims, True, n_dims
             )
 
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
     # Extract first BLOCK_SIZE_T entries (top-K of this chunk after the sort).
     topk_mask_extract = tl.arange(0, BLOCK_SIZE_K // BLOCK_SIZE_T) == 0
     final_score = tl.sum(
@@ -511,18 +534,19 @@ def _topk_index_partial_kernel(
     {
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["topk"]),
         "BLOCK_SIZE_K": lambda args: triton.next_power_of_2(
-            args["NUM_TOPK_CHUNKS"] * triton.next_power_of_2(args["topk"])
+            args["num_topk_chunks"] * triton.next_power_of_2(args["topk"])
         ),
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=["num_topk_chunks", "decode_query_len"])
 def _topk_index_merge_kernel(
-    ts_partial_ptr,  # partial scores: [NUM_TOPK_CHUNKS, num_idx_heads, batch, T]
+    ts_partial_ptr,  # partial scores: [NUM_TOPK_CHUNKS, num_idx_heads, total_q, T]
     ti_partial_ptr,  # partial idx (1-indexed global, 0=invalid): same shape
-    ti_final_ptr,  # final idx (0-indexed, -1=invalid): [num_idx_heads, batch, topk]
-    seq_lens,  # [batch]
+    ti_final_ptr,  # final idx (0-indexed, -1=invalid): [num_idx_heads, total_q, topk]
+    seq_lens,  # [num_reqs]
     block_size: tl.constexpr,  # sparse block size (128)
     topk: tl.constexpr,
+    decode_query_len,
     stride_ts_c,
     stride_ts_h,
     stride_ts_b,
@@ -534,15 +558,26 @@ def _topk_index_merge_kernel(
     stride_tif_h,
     stride_tif_b,
     stride_tif_t,
-    NUM_TOPK_CHUNKS: tl.constexpr,
+    num_topk_chunks,
     BLOCK_SIZE_K: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
-    pid_b = tl.program_id(0)
+    pid_b = tl.program_id(0)  # flattened query-token id
     pid_h = tl.program_id(1)
+    req_id = pid_b // decode_query_len
+    q_offset = pid_b - req_id * decode_query_len
 
-    seq_len = tl.load(seq_lens + pid_b)
-    num_blocks = (seq_len + block_size - 1) // block_size
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
+    seq_len = tl.load(seq_lens + req_id)
+    query_pos = seq_len - decode_query_len + q_offset
+    # Full-CG padding uses zero-length request rows. Clamp to an empty
+    # attention range instead of letting padded rows produce negative lengths.
+    kv_len = tl.maximum(query_pos + 1, 0)
+    num_blocks = (kv_len + block_size - 1) // block_size
 
     # Load NUM_TOPK_CHUNKS * BLOCK_SIZE_T candidates, padded to BLOCK_SIZE_K.
     # Candidate at flat position p comes from chunk = p // BLOCK_SIZE_T,
@@ -550,7 +585,7 @@ def _topk_index_merge_kernel(
     off = tl.arange(0, BLOCK_SIZE_K)
     chunk_idx = off // BLOCK_SIZE_T
     in_chunk_idx = off % BLOCK_SIZE_T
-    valid = chunk_idx < NUM_TOPK_CHUNKS
+    valid = chunk_idx < num_topk_chunks
 
     score_offset = (
         chunk_idx * stride_ts_c
@@ -603,7 +638,7 @@ def _topk_index_merge_kernel(
 # Python wrappers
 # ---------------------------------------------------------------------------
 @torch.no_grad()
-def minimax_m3_index_topk(
+def minimax_m3_index_score(
     idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
     index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
     block_table: torch.Tensor,  # [batch, max_blocks]
@@ -612,17 +647,13 @@ def minimax_m3_index_topk(
     prefix_lens: torch.Tensor,  # [batch] int32
     max_query_len: int,
     max_seq_len: int,
-    topk: int,
-    init_blocks: int,
-    local_blocks: int,
     num_kv_heads: int,
     sm_scale: float,
 ) -> torch.Tensor:
-    """Index block-score + top-k selection. block_size_q == 1 (per-token).
+    """Compute per-token index scores for each visible sparse block.
 
-    Returns topk_idx [num_kv_heads, total_q, topk] of 0-indexed block ids
-    (right-padded with -1). M3 has num_idx_heads == num_kv_heads, so the
-    per-index-head top-k maps 1:1 to kv heads (no index-head reduction needed).
+    Returns score [num_kv_heads, total_q, max_block], where each score is the
+    max over a 128-token index-K block. M3 has num_idx_heads == num_kv_heads.
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
@@ -631,8 +662,10 @@ def minimax_m3_index_topk(
     batch = cu_seqlens_q.shape[0] - 1
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
 
+    # Keep score strides 16-divisible to avoid Triton recompiles.
+    score_block_stride = round_up(max_block, 16)
     score = torch.empty(
-        (num_idx_heads, total_q, max_block),
+        (num_idx_heads, total_q, score_block_stride),
         dtype=torch.float32,
         device=idx_q.device,
     )
@@ -662,11 +695,27 @@ def minimax_m3_index_topk(
         BLOCK_SIZE_Q=BLOCK_SIZE_Q,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
     )
+    return score
 
+
+@torch.no_grad()
+def minimax_m3_index_topk(
+    score: torch.Tensor,  # [num_idx_heads, total_q, max_block]
+    cu_seqlens_q: torch.Tensor,  # [batch+1] int32
+    prefix_lens: torch.Tensor,  # [batch] int32
+    max_query_len: int,
+    topk: int,
+    init_blocks: int,
+    local_blocks: int,
+) -> torch.Tensor:
+    """Select index top-k from a precomputed score tensor."""
+    num_idx_heads = score.shape[0]
+    batch = cu_seqlens_q.shape[0] - 1
+    total_q = score.shape[1]
     topk_idx = torch.empty(
         (num_idx_heads, total_q, topk),
         dtype=torch.int32,
-        device=idx_q.device,
+        device=score.device,
     )
     # block_size_q == 1 -> query blocks coincide with query tokens.
     grid_topk = (max_query_len, batch, num_idx_heads)
@@ -694,30 +743,41 @@ def minimax_m3_index_topk(
 
 
 @torch.no_grad()
-def minimax_m3_index_topk_decode(
-    idx_q: torch.Tensor,  # [batch, num_idx_heads, head_dim]
+def minimax_m3_index_decode(
+    idx_q: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
     index_kv_cache: torch.Tensor,  # [num_blocks, 128, head_dim]
-    block_table: torch.Tensor,  # [batch, max_blocks]
-    seq_lens: torch.Tensor,  # [batch] int32
+    block_table: torch.Tensor,  # [num_reqs, max_blocks]
+    seq_lens: torch.Tensor,  # [num_reqs] int32
     max_seq_len: int,
     topk: int,
     init_blocks: int,
     local_blocks: int,
     num_kv_heads: int,
     sm_scale: float,
+    decode_query_len: int,
 ) -> torch.Tensor:
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
-    Returns topk_idx [num_kv_heads, batch, topk] (0-indexed block ids, -1 pad).
+    Returns topk_idx [num_kv_heads, total_q, topk] (0-indexed block ids, -1 pad).
     """
     total_q, num_idx_heads, head_dim = idx_q.shape
     assert (
         num_idx_heads == num_kv_heads
     ), "M3 expects num_idx_heads == num_kv_heads (no topk index reduce)"
+    assert total_q == seq_lens.shape[0] * decode_query_len
     batch = total_q
     max_block = triton.cdiv(max_seq_len, SPARSE_BLOCK_SIZE)
+    use_pdl = current_platform.is_arch_support_pdl()
+    # `launch_pdl` is a Triton runtime kwarg only some backends accept (CUDA
+    # SM9+); this ROCm Triton rejects it even when False ("Keyword argument
+    # launch_pdl was specified but unrecognised"). Only pass it when PDL is
+    # actually supported -- on ROCm use_pdl is always False, so it's omitted.
+    pdl_launch = {"launch_pdl": True} if use_pdl else {}
+
+    # Keep score strides 16-divisible to avoid Triton recompiles.
+    score_block_stride = round_up(max_block, 16)
     score = torch.empty(
-        (num_idx_heads, total_q, max_block),
+        (num_idx_heads, total_q, score_block_stride),
         dtype=torch.float32,
         device=idx_q.device,
     )
@@ -729,7 +789,7 @@ def minimax_m3_index_topk_decode(
         1, min(MAX_NUM_KV_CHUNKS, TARGET_GRID // max(1, batch * num_idx_heads))
     )
     num_kv_chunks = 1 << (target.bit_length() - 1)
-    grid_score = (batch * num_kv_chunks, num_idx_heads)
+    grid_score = (batch, num_kv_chunks)
     _decode_index_score_kernel[grid_score](
         idx_q,
         index_kv_cache,
@@ -737,11 +797,11 @@ def minimax_m3_index_topk_decode(
         block_table,
         seq_lens,
         num_idx_heads,
-        batch,
         head_dim,
         init_blocks,
         local_blocks,
         sm_scale,
+        decode_query_len,
         idx_q.stride(0),
         idx_q.stride(1),
         idx_q.stride(2),
@@ -753,7 +813,9 @@ def minimax_m3_index_topk_decode(
         score.stride(2),
         block_table.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        NUM_KV_CHUNKS=num_kv_chunks,
+        num_kv_chunks=num_kv_chunks,
+        USE_PDL=use_pdl,
+        **pdl_launch,
     )
 
     topk_idx = torch.empty(
@@ -795,6 +857,7 @@ def minimax_m3_index_topk_decode(
         SPARSE_BLOCK_SIZE,
         topk,
         chunk_blocks,
+        decode_query_len,
         score.stride(0),
         score.stride(1),
         score.stride(2),
@@ -806,6 +869,8 @@ def minimax_m3_index_topk_decode(
         topk_idx_partial.stride(1),
         topk_idx_partial.stride(2),
         topk_idx_partial.stride(3),
+        USE_PDL=use_pdl,
+        **pdl_launch,
     )
     _topk_index_merge_kernel[(batch, num_idx_heads)](
         topk_score_partial,
@@ -814,6 +879,7 @@ def minimax_m3_index_topk_decode(
         seq_lens,
         SPARSE_BLOCK_SIZE,
         topk,
+        decode_query_len,
         topk_score_partial.stride(0),
         topk_score_partial.stride(1),
         topk_score_partial.stride(2),
@@ -825,6 +891,8 @@ def minimax_m3_index_topk_decode(
         topk_idx.stride(0),
         topk_idx.stride(1),
         topk_idx.stride(2),
-        NUM_TOPK_CHUNKS=num_topk_chunks,
+        num_topk_chunks=num_topk_chunks,
+        USE_PDL=use_pdl,
+        **pdl_launch,
     )
     return topk_idx

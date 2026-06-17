@@ -3,9 +3,9 @@
 """Triton kernels for MiniMax M3 block-sparse GQA attention.
 
 The main heads attend only to the blocks selected by the lightning indexer (see
-``index_topk``). Ported from the sglang reference (minimax_sparse_ops), adapted
-to vLLM's paged KV cache: the KV page size is forced to equal the sparse block
-size (128), so one selected block maps to exactly one page.
+``index_topk``). Adapted to vLLM's paged KV cache: the KV page size is forced to
+equal the sparse block size (128), so one selected block maps to exactly one
+page.
 
 Main K/V cache layout (vLLM):
   ``(num_blocks, 2, 128, num_kv_heads, head_dim)``  K=[:,0] V=[:,1]
@@ -18,25 +18,45 @@ leaves the prefill kernels (which parallelize over the query dim) idle.
 
 import torch
 
+from vllm.platforms import current_platform
 from vllm.triton_utils import tl, triton
 
 # One sparse block == one KV page.
 SPARSE_BLOCK_SIZE = 128
 
 
-def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
-    fp8_dtypes = (
-        getattr(torch, "float8_e4m3fn", None),
-        getattr(torch, "float8_e4m3fnuz", None),
-        getattr(torch, "float8_e5m2", None),
-    )
-    return kv_cache.dtype in {dtype for dtype in fp8_dtypes if dtype is not None}
+_SPARSE_ATTN_NUM_STAGES_KWARG: dict | None = None
+
+
+def _sparse_attn_num_stages_kwarg() -> dict:
+    """Triton ``num_stages`` override for the sparse-attn GEMM kernels.
+
+    Forced only where required: CDNA3 (gfx942) caps LDS at
+    64 KB, and the default 2-stage pipeline double-buffers the 128x128 K/V tiles
+    to ~66 KB ("out of resource: shared memory"), so pin gfx942 to a single
+    stage (~32 KB, which fits). Everywhere else (NVIDIA, CDNA4 gfx950) return an
+    empty kwarg and let Triton keep its own default -- don't second-guess it.
+    Cached: the arch is fixed per process.
+    """
+    global _SPARSE_ATTN_NUM_STAGES_KWARG
+    if _SPARSE_ATTN_NUM_STAGES_KWARG is None:
+        kwarg: dict = {}
+        if current_platform.is_rocm():
+            from vllm.platforms.rocm import on_gfx942
+
+            if on_gfx942():
+                kwarg = {"num_stages": 1}
+        _SPARSE_ATTN_NUM_STAGES_KWARG = kwarg
+    return _SPARSE_ATTN_NUM_STAGES_KWARG
 
 
 # ---------------------------------------------------------------------------
 # GQA block-sparse attention (paged). Main heads attend only to the selected
 # blocks. BLOCK_SIZE_K == 128 so each selected block is one page.
 # ---------------------------------------------------------------------------
+# since prefill metadata is sliced from mixed batch metadata, seq_lens and prefix_lens
+# might lose pointer alignment, which trigger Triton recompiles. we don't actually
+# need pointer alignment for those tensors anyway because we do scalar load.
 @triton.heuristics(
     {
         "BLOCK_SIZE_D": lambda args: triton.next_power_of_2(args["head_dim"]),
@@ -46,7 +66,7 @@ def _is_fp8_kv_cache_tensor(kv_cache: torch.Tensor) -> bool:
         * triton.next_power_of_2(args["gqa_group_size"]),
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize_on_alignment=["seq_lens", "prefix_lens"])
 def _gqa_sparse_fwd_kernel(
     q_ptr,  # [total_q, num_heads, head_dim]
     kv_cache_ptr,  # main cache: [num_blocks, 2, 128, num_kv_heads, head_dim]
@@ -84,7 +104,7 @@ def _gqa_sparse_fwd_kernel(
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
     BLOCK_SIZE_QH: tl.constexpr,
-    FP8_KV_CACHE: tl.constexpr,
+    USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
     pid_q = tl.program_id(0)
@@ -146,8 +166,7 @@ def _gqa_sparse_fwd_kernel(
                 mask=d_mask[:, None] & pos_mask[None, :],
                 other=0.0,
             )
-            if FP8_KV_CACHE:
-                # Triton/ROCm does not support fp8 as RHS for tl.dot here.
+            if USE_FP8:
                 k = k.to(q.dtype)
             qk = tl.zeros((BLOCK_SIZE_Q, BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
             # causal: q_abs_pos - k_off >= block_start (c)
@@ -169,7 +188,7 @@ def _gqa_sparse_fwd_kernel(
                 mask=pos_mask[:, None] & d_mask[None, :],
                 other=0.0,
             )
-            if FP8_KV_CACHE:
+            if USE_FP8:
                 v = v.to(q.dtype)
             acc_o += tl.dot(p.to(v.dtype), v)
             m_i = m_ij
@@ -188,12 +207,12 @@ def _gqa_sparse_fwd_kernel(
 
 
 # ---------------------------------------------------------------------------
-# Decode kernels (split-K). Decode == one query token per request, so the
-# prefill kernel (which parallelizes over the query dim) leaves the GPU idle.
-# This instead parallelizes over the selected top-k blocks, producing partials
-# that the merge kernel combines (flash-decoding). All chunk counts depend only
-# on shape constants so the grid is fixed within a cuda graph. Base-2
-# (exp2/log2) softmax matches the prefill kernel.
+# Decode kernels (split-K). Decode batches are flattened request-major, with a
+# runtime query length used to map each query token back to its request metadata.
+# This parallelizes over the selected top-k blocks, producing partials that the
+# merge kernel combines (flash-decoding). All chunk counts depend only on shape
+# constants so the grid is fixed within a cuda graph. Base-2 (exp2/log2)
+# softmax matches the prefill kernel.
 # ---------------------------------------------------------------------------
 @triton.heuristics(
     {
@@ -204,20 +223,21 @@ def _gqa_sparse_fwd_kernel(
         "BLOCK_SIZE_T": lambda args: triton.next_power_of_2(args["max_topk"]),
     }
 )
-@triton.jit
+@triton.jit(do_not_specialize=["decode_query_len"])
 def _gqa_sparse_decode_kernel(
-    q_ptr,  # [total_q (== batch), num_heads, head_dim]
+    q_ptr,  # [total_q, num_heads, head_dim]
     kv_cache_ptr,  # main cache: [num_blocks, 2, 128, num_kv_heads, head_dim]
-    t_ptr,  # topk_idx: [num_kv_heads, batch, topk]
-    o_ptr,  # partial out: [NUM_TOPK_CHUNKS, batch, num_heads, head_dim]
-    lse_ptr,  # partial lse (log2): [NUM_TOPK_CHUNKS, batch, num_heads]
+    t_ptr,  # topk_idx: [num_kv_heads, total_q, topk]
+    o_ptr,  # partial out: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
+    lse_ptr,  # partial lse (log2): [NUM_TOPK_CHUNKS, total_q, num_heads]
     block_table_ptr,  # [num_reqs, max_blocks]
-    seq_lens,  # [batch]
-    batch_size,
+    seq_lens,  # [num_reqs]
+    total_q,
     gqa_group_size,
     head_dim,
     max_topk,
     sm_scale,
+    decode_query_len,
     stride_qn,
     stride_qh,
     stride_qd,
@@ -242,19 +262,31 @@ def _gqa_sparse_decode_kernel(
     BLOCK_SIZE_H: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
     BLOCK_SIZE_T: tl.constexpr,
-    FP8_KV_CACHE: tl.constexpr,
+    USE_FP8: tl.constexpr,  # fp8 KV cache: dequantize K/V to q.dtype on load
+    USE_PDL: tl.constexpr,
 ):
     sm_scale_log2e = sm_scale * 1.4426950409
-    # split-K over the topk dimension: pid(0) folds (batch, chunk) together.
+    # split-K over the topk dimension: pid(0) folds (query-token, chunk).
     pid_bc, pid_kh = tl.program_id(0), tl.program_id(1)
-    pid_b = pid_bc % batch_size
-    pid_c = pid_bc // batch_size
+    pid_b = pid_bc % total_q
+    pid_c = pid_bc // total_q
+    req_id = pid_b // decode_query_len
+    q_offset = pid_b - req_id * decode_query_len
     pid_h = pid_kh * gqa_group_size
     chunk_size_topk = (max_topk + NUM_TOPK_CHUNKS - 1) // NUM_TOPK_CHUNKS
     chunk_start_topk = pid_c * chunk_size_topk
     chunk_end_compiletime = chunk_start_topk + chunk_size_topk
-    seq_len = tl.load(seq_lens + pid_b)
-    # number of valid (non-padded) selected blocks for this request
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+
+    seq_len = tl.load(seq_lens + req_id)
+    query_pos = seq_len - decode_query_len + q_offset
+    # Full-CG padding uses zero-length request rows. Clamp to an empty
+    # attention range instead of letting padded rows produce negative lengths.
+    kv_len = tl.maximum(query_pos + 1, 0)
+
+    # number of valid (non-padded) selected blocks for this query token
     off_t = tl.arange(0, BLOCK_SIZE_T)
     idx_base = t_ptr + pid_kh * stride_th + pid_b * stride_tn
     topk_idx = tl.load(idx_base + off_t * stride_tk, mask=off_t < max_topk, other=-1)
@@ -264,7 +296,7 @@ def _gqa_sparse_decode_kernel(
     off_n = tl.arange(0, BLOCK_SIZE_K)
     off_d = tl.arange(0, BLOCK_SIZE_D)
     d_mask = off_d < head_dim
-    bt_row = block_table_ptr + pid_b * stride_bt_b
+    bt_row = block_table_ptr + req_id * stride_bt_b
 
     m_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
     lse_i = tl.full((BLOCK_SIZE_H,), float("-inf"), dtype=tl.float32)
@@ -286,7 +318,7 @@ def _gqa_sparse_decode_kernel(
         c = blk * BLOCK_SIZE_K
         page = tl.load(bt_row + blk).to(tl.int64)
         pos = c + off_n
-        pos_mask = pos < seq_len  # decode query is the last token: attend all valid
+        pos_mask = pos < kv_len
         k = tl.load(
             kv_cache_ptr
             + page * stride_kv_blk
@@ -297,8 +329,7 @@ def _gqa_sparse_decode_kernel(
             mask=d_mask[:, None] & pos_mask[None, :],
             other=0.0,
         )
-        if FP8_KV_CACHE:
-            # Triton/ROCm does not support fp8 as RHS for tl.dot here.
+        if USE_FP8:
             k = k.to(q.dtype)
         qk = tl.zeros((BLOCK_SIZE_H, BLOCK_SIZE_K), dtype=tl.float32)
         qk += tl.where(pos_mask[None, :], 0, float("-inf"))
@@ -317,12 +348,17 @@ def _gqa_sparse_decode_kernel(
             mask=pos_mask[:, None] & d_mask[None, :],
             other=0.0,
         )
-        if FP8_KV_CACHE:
+        if USE_FP8:
             v = v.to(q.dtype)
         acc_o += tl.dot(p.to(v.dtype), v)
         m_i = m_ij
         lse_i = m_ij + tl.log2(tl.exp2(lse_i - m_ij) + l_ij)
-    # empty chunks (chunk_start >= real_topk) keep lse_i = -inf -> weight 0 in merge
+
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+
+    # Empty chunks for active rows must store zero output; otherwise the merge
+    # can hit 0 * NaN. All-empty padded rows may still produce NaNs in merge.
     scale = tl.where(lse_i > float("-inf"), tl.exp2(m_i - lse_i), tl.zeros_like(lse_i))
     acc_o = acc_o * scale[:, None]
     o_ptrs = tl.make_block_ptr(
@@ -350,9 +386,9 @@ def _gqa_sparse_decode_kernel(
 )
 @triton.jit
 def _merge_topk_attn_out_kernel(
-    o_ptr,  # partials: [NUM_TOPK_CHUNKS, batch, num_heads, head_dim]
-    lse_ptr,  # partials (log2): [NUM_TOPK_CHUNKS, batch, num_heads]
-    out_ptr,  # merged out: [total_q (== batch), num_heads, head_dim]
+    o_ptr,  # partials: [NUM_TOPK_CHUNKS, total_q, num_heads, head_dim]
+    lse_ptr,  # partials (log2): [NUM_TOPK_CHUNKS, total_q, num_heads]
+    out_ptr,  # merged out: [total_q, num_heads, head_dim]
     head_dim,
     stride_o_c,
     stride_o_b,
@@ -366,8 +402,15 @@ def _merge_topk_attn_out_kernel(
     stride_out_d,
     NUM_TOPK_CHUNKS: tl.constexpr,
     BLOCK_SIZE_D: tl.constexpr,
+    USE_PDL: tl.constexpr,
 ):
     pid_b, pid_h = tl.program_id(0), tl.program_id(1)
+
+    # NOTE: assume seq_lens is safe to load before gdc_wait()
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+        tl.extra.cuda.gdc_launch_dependents()
+
     off_c = tl.arange(0, NUM_TOPK_CHUNKS)
     off_d = tl.arange(0, BLOCK_SIZE_D)
     o_ptrs = tl.make_block_ptr(
@@ -413,6 +456,7 @@ def minimax_m3_sparse_attn(
     batch = cu_seqlens_q.shape[0] - 1
     topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
+    use_fp8 = kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
     grid = (max_query_len, num_kv_heads, batch)
     _gqa_sparse_fwd_kernel[grid](
         q,
@@ -447,37 +491,46 @@ def minimax_m3_sparse_attn(
         block_table.stride(0),
         BLOCK_SIZE_Q=1,
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
-        FP8_KV_CACHE=_is_fp8_kv_cache_tensor(kv_cache),
-        num_stages=1,
+        USE_FP8=use_fp8,
+        **_sparse_attn_num_stages_kwarg(),
     )
 
 
 @torch.no_grad()
 def minimax_m3_sparse_attn_decode(
-    q: torch.Tensor,  # [batch, num_heads, head_dim]
+    q: torch.Tensor,  # [total_q, num_heads, head_dim]
     kv_cache: torch.Tensor,  # [num_blocks, 2, 128, num_kv_heads, head_dim]
-    topk_idx: torch.Tensor,  # [num_kv_heads, batch, topk]
-    block_table: torch.Tensor,  # [batch, max_blocks]
-    seq_lens: torch.Tensor,  # [batch] int32
+    topk_idx: torch.Tensor,  # [num_kv_heads, total_q, topk]
+    block_table: torch.Tensor,  # [num_reqs, max_blocks]
+    seq_lens: torch.Tensor,  # [num_reqs] int32
     num_kv_heads: int,
     sm_scale: float,
-    output: torch.Tensor,  # [batch, num_heads, head_dim]
+    output: torch.Tensor,  # [total_q, num_heads, head_dim]
+    decode_query_len: int,
 ) -> None:
     """GQA block-sparse attention for decode (split-K over the top-k blocks)."""
-    batch, num_heads, head_dim = q.shape
+    total_q, num_heads, head_dim = q.shape
+    assert total_q == seq_lens.shape[0] * decode_query_len
     max_topk = topk_idx.shape[-1]
     gqa_group_size = num_heads // num_kv_heads
+    use_fp8 = kv_cache.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    use_pdl = current_platform.is_arch_support_pdl()
+    # `launch_pdl` is a Triton runtime kwarg only some backends accept (CUDA
+    # SM9+); this ROCm Triton rejects it even when False ("Keyword argument
+    # launch_pdl was specified but unrecognised"). Only pass it when PDL is
+    # actually supported -- on ROCm use_pdl is always False, so it's omitted.
+    pdl_launch = {"launch_pdl": True} if use_pdl else {}
     # split-K over the selected blocks; chunk count is shape-constant (cuda graph).
     TARGET_GRID = 256
-    target = max(1, min(max_topk, TARGET_GRID // max(1, batch * num_kv_heads)))
+    target = max(1, min(max_topk, TARGET_GRID // max(1, total_q * num_kv_heads)))
     num_topk_chunks = 1 << (target.bit_length() - 1)
     o_partial = torch.empty(
-        num_topk_chunks, batch, num_heads, head_dim, dtype=q.dtype, device=q.device
+        num_topk_chunks, total_q, num_heads, head_dim, dtype=q.dtype, device=q.device
     )
     lse_partial = torch.empty(
-        num_topk_chunks, batch, num_heads, dtype=torch.float32, device=q.device
+        num_topk_chunks, total_q, num_heads, dtype=torch.float32, device=q.device
     )
-    grid = (batch * num_topk_chunks, num_kv_heads)
+    grid = (total_q * num_topk_chunks, num_kv_heads)
     _gqa_sparse_decode_kernel[grid](
         q,
         kv_cache,
@@ -486,11 +539,12 @@ def minimax_m3_sparse_attn_decode(
         lse_partial,
         block_table,
         seq_lens,
-        batch,
+        total_q,
         gqa_group_size,
         head_dim,
         max_topk,
         sm_scale,
+        decode_query_len,
         q.stride(0),
         q.stride(1),
         q.stride(2),
@@ -512,10 +566,12 @@ def minimax_m3_sparse_attn_decode(
         block_table.stride(0),
         BLOCK_SIZE_K=SPARSE_BLOCK_SIZE,
         NUM_TOPK_CHUNKS=num_topk_chunks,
-        FP8_KV_CACHE=_is_fp8_kv_cache_tensor(kv_cache),
-        num_stages=1,
+        USE_FP8=use_fp8,
+        USE_PDL=use_pdl,
+        **_sparse_attn_num_stages_kwarg(),
+        **pdl_launch,
     )
-    merge_grid = (batch, num_heads)
+    merge_grid = (total_q, num_heads)
     _merge_topk_attn_out_kernel[merge_grid](
         o_partial,
         lse_partial,
@@ -532,4 +588,6 @@ def minimax_m3_sparse_attn_decode(
         output.stride(1),
         output.stride(2),
         NUM_TOPK_CHUNKS=num_topk_chunks,
+        USE_PDL=use_pdl,
+        **pdl_launch,
     )

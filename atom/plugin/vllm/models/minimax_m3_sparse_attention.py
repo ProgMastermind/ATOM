@@ -22,8 +22,9 @@ from vllm.forward_context import get_forward_context
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from atom.model_ops.minimax_m3.index_topk import (
+    minimax_m3_index_decode,
+    minimax_m3_index_score,
     minimax_m3_index_topk,
-    minimax_m3_index_topk_decode,
 )
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
@@ -225,10 +226,14 @@ class MiniMaxM3SparsePrefillMetadata:
 
 @dataclass
 class MiniMaxM3SparseDecodeMetadata:
-    """Per-decode state (cudagraph-safe); split-K kernels key only on seq_lens."""
+    """Per-decode state (cudagraph-safe). ``decode_query_len`` is the uniform
+    per-request query length (1, or 1 + num_speculative_tokens for spec-decode
+    verify); the split-K kernels flatten the batch request-major and use it to
+    map each query token back to its request."""
 
     seq_lens: torch.Tensor  # [num_decodes] int32
     block_table: torch.Tensor
+    decode_query_len: int
 
 
 @dataclass
@@ -253,23 +258,14 @@ class MiniMaxM3SparseMetadata(AttentionMetadata):
 
 
 class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMetadata]):
-    # Full cudagraphs ONLY for uniform single-query (q_len==1) decode batches.
-    # Must NOT be UNIFORM_BATCH: that level tells vLLM to also full-capture
-    # spec-decode verify batches (uniform q_len == 1 + num_speculative_tokens).
-    # Those multi-query batches route through the prefill kernels (see
-    # reorder_batch_threshold below), whose per-step metadata is rebuilt with
-    # fresh tensor allocations and runtime-dependent shapes -- not stable across
-    # cudagraph replays. Capturing them yields a graph that reads stale pointers
-    # on replay and emits corrupted tokens (null/token-0 spam). With
-    # UNIFORM_SINGLE_TOKEN_DECODE the verify path runs piecewise (attention
-    # eager via the splitting op), while true q_len==1 decode -- which uses the
-    # stable-buffer decode kernel -- is still full-captured.
-    _cudagraph_support: ClassVar[AttentionCGSupport] = (
-        AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
-    )
-    # The split-K decode kernel doesn't support spec decode yet (it handles one
-    # query token per request only). Keep the threshold at 1 so multi-query
-    # verify batches route to the prefill kernels instead of the decode kernel.
+    # Full cudagraphs for uniform decode batches, including spec-decode verify
+    # batches with >1 query token/request: the split-K decode kernels run the
+    # verify window as decode (request-major flatten + decode_query_len), with
+    # only stable, shape-constant buffers, so the captured graph replays safely.
+    _cudagraph_support: ClassVar[AttentionCGSupport] = AttentionCGSupport.UNIFORM_BATCH
+    # Raised to 1 + num_speculative_tokens by _init_reorder_batch_threshold when
+    # spec decode is on, so multi-query verify batches route to the decode
+    # kernels (verify-as-decode) instead of the prefill path.
     reorder_batch_threshold: int = 1
 
     def __init__(
@@ -280,6 +276,7 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
         device: torch.device,
     ) -> None:
         super().__init__(kv_cache_spec, layer_names, vllm_config, device)
+        self._init_reorder_batch_threshold(1, supports_spec_as_decode=True)
 
         # Stable per-request context-length buffer for decode cudagraph replays.
         # Sized to max_num_batched_tokens (>= num_reqs).
@@ -305,6 +302,7 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
             split_decodes_and_prefills(
                 common_attn_metadata,
                 decode_threshold=self.reorder_batch_threshold,
+                require_uniform=True,
             )
         )
         assert num_decodes + num_prefills == num_reqs
@@ -348,9 +346,23 @@ class MiniMaxM3SparseMetadataBuilder(AttentionMetadataBuilder[MiniMaxM3SparseMet
 
         decode_metadata: MiniMaxM3SparseDecodeMetadata | None = None
         if num_decodes > 0:
+            # Uniform per-request query length (1 for plain decode, or
+            # 1 + num_speculative_tokens for spec-decode verify). require_uniform
+            # above guarantees every decode request shares this length, so it is
+            # exactly num_decode_tokens / num_decodes. Deriving it this way (vs
+            # diffing query_start_loc_cpu) is sync-free and cudagraph-safe: during
+            # full-CG capture this vLLM leaves query_start_loc_cpu zeroed, but
+            # num_decodes / num_decode_tokens are still set from the captured size.
+            assert num_decode_tokens % num_decodes == 0, (
+                f"non-uniform decode batch: {num_decode_tokens} tokens / "
+                f"{num_decodes} decodes"
+            )
+            decode_query_len = num_decode_tokens // num_decodes
+            assert decode_query_len > 0
             decode_metadata = MiniMaxM3SparseDecodeMetadata(
                 seq_lens=seq_lens[:num_decodes],
                 block_table=block_table[:num_decodes],
+                decode_query_len=decode_query_len,
             )
 
         return MiniMaxM3SparseMetadata(
@@ -423,8 +435,8 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
         max_seq_len: int,
         total_kv_blocks: int,
     ) -> None:
-        # 1. Index block-score + top-k (reads the index-K cache).
-        topk_idx = minimax_m3_index_topk(
+        # 1. Index block scoring, then top-k selection (reads the index-K cache).
+        score = minimax_m3_index_score(
             iq,
             index_kv_cache,
             index_block_table,
@@ -433,11 +445,17 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
             context_lens,
             max_query_len,
             max_seq_len,
+            self.num_kv_heads,
+            self.scale,
+        )
+        topk_idx = minimax_m3_index_topk(
+            score,
+            cu_seqlens_q,
+            context_lens,
+            max_query_len,
             self.topk_blocks,
             self.init_blocks,
             self.local_blocks,
-            self.num_kv_heads,
-            self.scale,
         )
         # 2. GQA block-sparse attention over the selected blocks (main cache).
         self._prefill_gqa_sparse_triton(
@@ -486,19 +504,23 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
 
     def _run_decode(
         self,
-        q: torch.Tensor,  # [batch, num_heads, head_dim]
-        iq: torch.Tensor,  # [batch, num_idx_heads, head_dim]
-        out: torch.Tensor,  # [batch, num_heads, head_dim]
+        q: torch.Tensor,  # [total_q, num_heads, head_dim]
+        iq: torch.Tensor,  # [total_q, num_idx_heads, head_dim]
+        out: torch.Tensor,  # [total_q, num_heads, head_dim]
         kv_cache: torch.Tensor,
         index_kv_cache: torch.Tensor,
-        seq_lens: torch.Tensor,
+        seq_lens: torch.Tensor,  # [num_decodes]
         main_block_table: torch.Tensor,
         index_block_table: torch.Tensor,
         max_seq_len: int,
+        decode_query_len: int,
     ) -> None:
-        # Split-K decode kernels (parallelize over KV; one query token/request).
+        # Split-K decode kernels: the batch is flattened request-major
+        # (total_q == num_decodes * decode_query_len) and decode_query_len maps
+        # each query token back to its request. decode_query_len > 1 is the
+        # spec-decode verify window (verify-as-decode).
         # 1. Index block-score + top-k.
-        topk_idx = minimax_m3_index_topk_decode(
+        topk_idx = minimax_m3_index_decode(
             iq,
             index_kv_cache,
             index_block_table,
@@ -509,6 +531,7 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
             self.local_blocks,
             self.num_kv_heads,
             self.scale,
+            decode_query_len,
         )
         # 2. GQA block-sparse attention (split-K over the selected blocks).
         minimax_m3_sparse_attn_decode(
@@ -520,6 +543,7 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
             self.num_kv_heads,
             self.scale,
             out,
+            decode_query_len,
         )
 
     @eager_break_during_capture
@@ -568,8 +592,9 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
         )
         out = output[:num_tokens].view(-1, self.num_heads, hd)
 
-        # Decode slice [:nd]: each token is a 1-token "prefill" at seq_len-1.
-        # All kernel args are precomputed in the builder (cudagraph-safe).
+        # Decode slice [:nd]: request-major flattened (nd == num_decodes *
+        # decode_query_len). All kernel args are precomputed in the builder
+        # (cudagraph-safe).
         if main_md.num_decodes > 0:
             d, idx_d = main_md.decode, index_md.decode
             assert d is not None and idx_d is not None
@@ -583,6 +608,7 @@ class MiniMaxM3SparseImpl(AttentionImplBase[MiniMaxM3SparseMetadata]):
                 d.block_table,
                 idx_d.block_table,
                 main_md.max_seq_len,
+                d.decode_query_len,
             )
 
         # Prefill slice [nd:]: cu_seqlens_q already rebased to 0.

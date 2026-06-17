@@ -1004,7 +1004,7 @@ class MiniMaxM3SparseForCausalLM(NativeMiniMaxM3ForCausalLM):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
         **_: object,
-    ) -> torch.Tensor | IntermediateTensors:
+    ) -> torch.Tensor | IntermediateTensors | tuple[torch.Tensor, list[torch.Tensor]]:
         model = self.model
         if get_pp_group().is_first_rank:
             hidden_states = (
@@ -1018,7 +1018,17 @@ class MiniMaxM3SparseForCausalLM(NativeMiniMaxM3ForCausalLM):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for layer in model.layers[model.start_layer : model.end_layer]:
+        # EAGLE3 target interface: export the residual-stream hidden state
+        # entering each selected layer as an aux hidden state. The fused
+        # add-norm convention means ``hidden_states + residual`` is the full
+        # (already all-reduced) hidden state, matching the native model.
+        aux_hidden_states: list[torch.Tensor] = []
+        for idx, layer in enumerate(model.layers[model.start_layer : model.end_layer]):
+            if idx in model.aux_hidden_state_layers:
+                aux_state = (
+                    hidden_states if residual is None else hidden_states + residual
+                )
+                aux_hidden_states.append(aux_state)
             hidden_states, residual = layer(positions, hidden_states, residual)
 
         if not get_pp_group().is_last_rank:
@@ -1029,6 +1039,8 @@ class MiniMaxM3SparseForCausalLM(NativeMiniMaxM3ForCausalLM):
         hidden_states, _ = fused_allreduce_gemma_rms_norm(
             hidden_states, residual, model.norm
         )
+        if len(aux_hidden_states) > 0:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
 
@@ -1214,7 +1226,8 @@ class MiniMaxM3SparseForConditionalGeneration_(nn.Module, SupportsMultiModal):
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         logits = self.language_model.compute_logits(hidden_states)
-        return None if logits is None else logits[..., : self.vocab_size]
+        logits = None if logits is None else logits[..., : self.vocab_size]
+        return logits
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.language_model.get_expert_mapping()
