@@ -983,9 +983,17 @@ def _build_sparse_block_table_kernel(
     base_phys = logical_page * pages_per_block  # [BLOCK_SIZE_T]
     dst_base = slot * pages_per_block  # [BLOCK_SIZE_T]
 
+    # Write EVERY destination slot so the output buffer can be torch.empty (no
+    # memset): valid selected blocks -> their physical pages; all remaining slots
+    # (padding beyond n_valid, or BLOCK_SIZE_T > max_topk) -> 0 (an in-bounds page
+    # id; masked out by context_lens at attention time). Avoids the per-call
+    # torch.zeros memset that dominates at low concurrency.
     for j in range(pages_per_block):
-        write_mask = valid & (dst_base + j < BLOCK_SIZE_T * pages_per_block)
-        tl.store(sbt_row + dst_base + j, base_phys + j, mask=write_mask)
+        tl.store(sbt_row + dst_base + j, base_phys + j, mask=valid)
+    # zero the unused tail [n_valid*pages_per_block : width).
+    n_used = n_valid * pages_per_block
+    off_w = tl.arange(0, BLOCK_SIZE_T * pages_per_block)
+    tl.store(sbt_row + off_w, tl.zeros_like(off_w), mask=off_w >= n_used)
 
     # true valid token count: full blocks contribute 128 each, tail the remainder.
     tail_tokens = seq_len - last_blk * sm_block_size
@@ -1016,8 +1024,11 @@ def minimax_m3_build_sparse_block_table(
     batch = topk_idx.shape[1]
     topk = topk_idx.shape[-1]
     width = topk * PAGES_PER_SPARSE_BLOCK
-    sparse_bt = torch.zeros((batch, width), dtype=torch.int32, device=topk_idx.device)
-    sparse_ctx = torch.zeros((batch,), dtype=torch.int32, device=topk_idx.device)
+    # Both buffers are FULLY written by the kernel (sparse_bt: every slot incl.
+    # padding -> 0; sparse_ctx: one entry per program), so torch.empty is safe and
+    # skips the per-call memset that hurts low-concurrency decode.
+    sparse_bt = torch.empty((batch, width), dtype=torch.int32, device=topk_idx.device)
+    sparse_ctx = torch.empty((batch,), dtype=torch.int32, device=topk_idx.device)
     _build_sparse_block_table_kernel[(batch,)](
         topk_idx,
         block_table,
@@ -1050,6 +1061,8 @@ def minimax_m3_sparse_attn_decode_asm(
     output: torch.Tensor,  # [batch, num_heads, head_dim]
     k_scale: torch.Tensor | None = None,
     v_scale: torch.Tensor | None = None,
+    sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
+    sparse_ctx: torch.Tensor | None = None,
 ) -> None:
     """Block-sparse decode attention via the AITER Gluon paged-attention kernel.
 
@@ -1060,6 +1073,9 @@ def minimax_m3_sparse_attn_decode_asm(
     split-KV (flash-decoding) implementation is more efficient than the monolithic
     ASM kernel at low concurrency (few decode sequences), where it parallelizes
     over KV partitions to keep the GPU busy.
+
+    If ``sparse_bt`` / ``sparse_ctx`` are provided (built fused inside the topk
+    merge kernel), the standalone compaction launch is skipped.
 
     Requires per-rank num_kv_heads == 1 (the indexer top-k is per-kv-head; one
     shared block_table cannot express per-kv-head selection) and head_dim == 128.
@@ -1073,9 +1089,10 @@ def minimax_m3_sparse_attn_decode_asm(
     )
     assert q.shape[-1] == 128, "Gluon paged-attention requires head_dim == 128."
 
-    sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table(
-        topk_idx, block_table, seq_lens
-    )
+    if sparse_bt is None or sparse_ctx is None:
+        sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table(
+            topk_idx, block_table, seq_lens
+        )
 
     # Gluon split-KV decode setup (mirrors the standard MHA path in
     # attention_mha.py::paged_attention_triton). q is [batch, num_heads, 128];
@@ -1183,9 +1200,14 @@ def _build_sparse_block_table_prefill_kernel(
     base_phys = logical_page * pages_per_block
     dst_base = slot * pages_per_block
 
+    # Write EVERY destination slot so the output buffer can be torch.empty (no
+    # memset): valid selected blocks -> their physical pages; the unused tail ->
+    # 0 (in-bounds page id, masked out by context_lens at attention time).
     for j in range(pages_per_block):
-        write_mask = valid & (dst_base + j < BLOCK_SIZE_T * pages_per_block)
-        tl.store(sbt_row + dst_base + j, base_phys + j, mask=write_mask)
+        tl.store(sbt_row + dst_base + j, base_phys + j, mask=valid)
+    n_used = n_valid * pages_per_block
+    off_w = tl.arange(0, BLOCK_SIZE_T * pages_per_block)
+    tl.store(sbt_row + off_w, tl.zeros_like(off_w), mask=off_w >= n_used)
 
     # full blocks contribute 128 each; tail (self-block) contributes p%128 + 1.
     tail_tokens = causal_len - self_blk * sm_block_size
@@ -1218,8 +1240,10 @@ def minimax_m3_build_sparse_block_table_prefill(
     device = topk_idx.device
 
     width = topk * PAGES_PER_SPARSE_BLOCK
-    sparse_bt = torch.zeros((total_q, width), dtype=torch.int32, device=device)
-    sparse_ctx = torch.zeros((total_q,), dtype=torch.int32, device=device)
+    # Fully written by the kernel (every slot incl. padding -> 0; one ctx per
+    # program), so torch.empty is safe and skips the per-call memset.
+    sparse_bt = torch.empty((total_q, width), dtype=torch.int32, device=device)
+    sparse_ctx = torch.empty((total_q,), dtype=torch.int32, device=device)
     _build_sparse_block_table_prefill_kernel[(total_q,)](
         topk_idx,
         block_table,
@@ -1260,6 +1284,8 @@ def minimax_m3_sparse_attn_prefill_asm(
     v_scale: torch.Tensor | None = None,
     cu_seqlens_q: torch.Tensor | None = None,  # [batch+1] int32, for the fallback
     prefix_lens: torch.Tensor | None = None,  # [batch] int32, for the fallback
+    sparse_bt: torch.Tensor | None = None,  # prebuilt (fused topk) -> skip build
+    sparse_ctx: torch.Tensor | None = None,
 ) -> None:
     """Block-sparse PREFILL via AITER ASM pa_fwd_asm, per-token-as-decode.
 
@@ -1283,23 +1309,24 @@ def minimax_m3_sparse_attn_prefill_asm(
 
     total_q = q.shape[0]
     device = q.device
-    if query_req_id is None or query_abs_pos is None:
-        # Sync-free on-device derivation: req_id[n] = #(cu_seqlens_q[1:] <= n),
-        # abs_pos[n] = prefix_lens[req] + (n - cu_seqlens_q[req]).
-        assert cu_seqlens_q is not None and prefix_lens is not None
-        pos = torch.arange(total_q, dtype=torch.int32, device=device)
-        query_req_id = torch.searchsorted(
-            cu_seqlens_q[1:].contiguous(), pos, right=True
-        ).to(torch.int32)
-        query_abs_pos = (
-            prefix_lens[query_req_id] + (pos - cu_seqlens_q[query_req_id])
-        ).to(torch.int32)
     if qo_indptr is None:
         qo_indptr = torch.arange(total_q + 1, dtype=torch.int32, device=device)
 
-    sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_prefill(
-        topk_idx, block_table, query_req_id, query_abs_pos
-    )
+    if sparse_bt is None or sparse_ctx is None:
+        if query_req_id is None or query_abs_pos is None:
+            # Sync-free on-device derivation: req_id[n] = #(cu_seqlens_q[1:] <= n),
+            # abs_pos[n] = prefix_lens[req] + (n - cu_seqlens_q[req]).
+            assert cu_seqlens_q is not None and prefix_lens is not None
+            pos = torch.arange(total_q, dtype=torch.int32, device=device)
+            query_req_id = torch.searchsorted(
+                cu_seqlens_q[1:].contiguous(), pos, right=True
+            ).to(torch.int32)
+            query_abs_pos = (
+                prefix_lens[query_req_id] + (pos - cu_seqlens_q[query_req_id])
+            ).to(torch.int32)
+        sparse_bt, sparse_ctx = minimax_m3_build_sparse_block_table_prefill(
+            topk_idx, block_table, query_req_id, query_abs_pos
+        )
     run_pa_fwd_asm(
         q=q,
         k_cache=k_cache,
