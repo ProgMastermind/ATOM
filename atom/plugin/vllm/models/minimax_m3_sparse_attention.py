@@ -119,7 +119,24 @@ class MiniMaxM3SparseBackend(AttentionBackend):
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
         # `stride_order` indicates the permutation that gets us from
-        # `get_kv_cache_shape` to the actual memory layout we want.
+        # `get_kv_cache_shape` (NB, 2, block, n_kv, hd) to the actual memory
+        # layout we want. This sparse backend keeps its own KV-interleaved layout
+        # with a 128-token kernel block; the sparse insert/attention kernels
+        # depend on it.
+        #
+        # The dense vs sparse layout/block-size mismatch is ONLY a hazard if
+        # vLLM packs dense and sparse layers into one shared KVCacheTensor. That
+        # happened under Eagle3 because the draft layer was registered as a
+        # SlidingWindowSpec (ATOM's MHA layer used a -1 "no sliding window"
+        # sentinel that still tripped the `is not None` check), which is NOT a
+        # FullAttentionSpec subclass and so broke vLLM's uniform-type grouping
+        # and dropped M3 onto the hybrid/general (shared-buffer) allocator. The
+        # fix lives in atom/plugin/vllm/attention/layer_mha.py: a non-windowed
+        # layer now registers FullAttentionSpec, matching native vLLM. Because
+        # the sparse indexer's MLAAttentionSpec subclasses FullAttentionSpec,
+        # the spec set is then uniform-type and vLLM gives every layer its own
+        # separate KV tensor (the same per-layer path used without spec decode),
+        # so the layouts never alias and this backend needs no layout change.
         if include_num_layers_dimension:
             # M3 does not use cross-layer (per-layer-stacked) KV blocks for now.
             raise NotImplementedError
