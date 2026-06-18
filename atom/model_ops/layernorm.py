@@ -702,6 +702,45 @@ class GemmaRMSNorm(nn.Module):
             return out, res_out.view(ori_shape)
         return out
 
+    def forward_cuda_with_fp32_out(
+        self,
+        x: torch.Tensor,
+        residual: torch.Tensor | None = None,
+    ) -> (
+        tuple[torch.Tensor, torch.Tensor]
+        | tuple[torch.Tensor, torch.Tensor, torch.Tensor]
+    ):
+        from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
+
+        ori_shape = x.shape
+        x_2d = x.view(-1, ori_shape[-1])
+
+        out = torch.empty_like(x_2d)
+        out_fp32 = torch.empty(x_2d.shape, dtype=torch.float32, device=x_2d.device)
+        if residual is not None:
+            residual_2d = residual.view(-1, ori_shape[-1])
+            res_out = torch.empty_like(x_2d)
+        else:
+            residual_2d = None
+            res_out = None
+
+        fused_qk_rmsnorm_group_quant(
+            q=x_2d,
+            q_weight=self.weight.data,
+            q_epsilon=self.variance_epsilon,
+            q_out_unquantized=out,
+            q_out_unquantized_fp32=out_fp32,
+            q_res_out=res_out,
+            q_residual=residual_2d,
+            gemma_norm=True,
+        )
+
+        out = out.view(ori_shape)
+        out_fp32 = out_fp32.view(ori_shape)
+        if residual is not None:
+            return out, res_out.view(ori_shape), out_fp32
+        return out, out_fp32
+
     def _forward_fused_fp8(self, x, residual=None):
         from aiter.ops.fused_qk_rmsnorm_group_quant import fused_qk_rmsnorm_group_quant
         from aiter.utility.dtypes import fp8

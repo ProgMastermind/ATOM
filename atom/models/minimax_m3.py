@@ -17,6 +17,7 @@ from aiter.dist.parallel_state import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
 )
+from aiter.dist.communication_op import tensor_model_parallel_all_reduce
 from aiter.rotary_embedding import get_rope
 from atom.config import Config, QuantizationConfig, get_current_atom_config
 from atom.model_ops.base_attention import Attention
@@ -323,11 +324,20 @@ class MiniMaxM3MoE(nn.Module):
                 prefix=f"{prefix}.shared_experts",
             )
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        router_hidden_states: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, orig_shape[-1])
+        router_hidden_states = (
+            hidden_states
+            if router_hidden_states is None
+            else router_hidden_states.view(-1, orig_shape[-1])
+        )
         router_logits = torch.nn.functional.linear(
-            hidden_states.float(), self.gate.weight.float()
+            router_hidden_states.float(), self.gate.weight
         )
         if self.use_dedicated_bf16_experts:
             # Dedicated experts apply routed_scaling_factor internally and return
@@ -1012,11 +1022,20 @@ class MiniMaxM3DecoderLayer(nn.Module):
             )
 
         hidden_states = self.self_attn(positions=positions, hidden_states=hidden_states)
-        hidden_states, residual = fused_allreduce_gemma_rms_norm(
-            hidden_states, residual, self.post_attention_layernorm
-        )
-        ffn = self.block_sparse_moe if self.is_moe_layer else self.mlp
-        hidden_states = ffn(hidden_states)
+        if get_tensor_model_parallel_world_size() > 1:
+            hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+        if self.is_moe_layer:
+            hidden_states, residual, router_hidden_states = (
+                self.post_attention_layernorm.forward_cuda_with_fp32_out(
+                    hidden_states, residual
+                )
+            )
+            hidden_states = self.block_sparse_moe(hidden_states, router_hidden_states)
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
+            hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
 
 
