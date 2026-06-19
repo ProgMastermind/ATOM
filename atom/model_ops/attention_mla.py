@@ -19,6 +19,7 @@ from aiter import (
     fused_qk_rope_concat_and_cache_mla_seg,
     get_hip_quant,
 )
+from aiter.dist.parallel_state import get_dp_group
 from aiter.mla import mla_decode_fwd, mla_prefill_fwd
 from aiter.ops.triton.attention.mla import (
     mla_decode_fwd as triton_shuffle_mla_decode_fwd,
@@ -978,7 +979,10 @@ class MLAAttention(nn.Module):
                     paged_kv_indptr = attn_metadata.sparse_kv_indptr
                     paged_kv_indices = self.sparse_kv_indices_buffer
 
-            use_persistent_mode = False
+            dp_size = get_dp_group().world_size
+            use_persistent_mode = not (dp_size > 1)
+            if envs.ATOM_MLA_PAGE_SIZE > 1:
+                use_persistent_mode = False
 
             # Sparse layers in MTP verify use separate persistent metadata
             # (per-token, max_seqlen_qo=1) while dense layers use normal metadata
@@ -1007,7 +1011,7 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
-            page_size = get_current_atom_config().kv_cache_block_size
+            page_size = attn_metadata.block_size
             seg_kv_buffer_4d = kv_buffer.view(-1, page_size, 1, q.shape[-1])
             mla_decode_fwd(
                 q,
