@@ -1011,7 +1011,12 @@ class MLAAttention(nn.Module):
                 reduce_final_map = attn_metadata.reduce_final_map
                 reduce_partial_map = attn_metadata.reduce_partial_map
 
-            page_size = attn_metadata.block_size
+            # TODO refactor this
+            if envs.ATOM_MLA_PAGE_SIZE is not None:
+                page_size = envs.ATOM_MLA_PAGE_SIZE
+            else:
+                page_size = 1
+
             seg_kv_buffer_4d = kv_buffer.view(-1, page_size, 1, q.shape[-1])
             mla_decode_fwd(
                 q,
