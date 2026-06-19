@@ -223,6 +223,7 @@ server command above plus the three speculative-decoding flags):
 
 ```bash
 model_path=amd/MiniMax-M3-MXFP4
+model_path=amd/MiniMax-M3-MXFP8
 draft_path=Inferact/MiniMax-M3-EAGLE3
 
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
@@ -248,6 +249,7 @@ Run GSM8K 5-shot with `lm_eval` (identical to the non-speculative test):
 
 ```bash
 model_path=amd/MiniMax-M3-MXFP4
+model_path=amd/MiniMax-M3-MXFP8
 BS=65
 
 lm_eval \
@@ -260,14 +262,71 @@ lm_eval \
   --fewshot_as_multiturn 2>&1 | tee m3-mxfp4-eagle3-bs65-accuracy.log
 ```
 
-Validated GSM8K result (strict-match matches the non-speculative MXFP4 baseline):
+Validated MXFP4+EAGLE GSM8K result:
 
 ```text
+local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP4', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
 |Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
 |-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
-|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9439|±  |0.0064|
-|     |       |strict-match    |     5|exact_match|↑  |0.9447|±  |0.0063|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9416|±  |0.0062|
+|     |       |strict-match    |     5|exact_match|↑  |0.9419|±  |0.0062|
 ```
+
+Validated MXFP8+EAGLE GSM8K result:
+
+```text
+local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP8', 'base_url': 'http://127.0.0.1:8000/v1/chat/completions', 'num_concurrent': 32, 'max_gen_toks': 16384}), gen_kwargs: ({}), limit: None, num_fewshot: 5, batch_size: 65
+|Tasks|Version|     Filter     |n-shot|  Metric   |   |Value |   |Stderr|
+|-----|------:|----------------|-----:|-----------|---|-----:|---|-----:|
+|gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9500|±  |0.0061|
+|     |       |strict-match    |     5|exact_match|↑  |0.9494|±  |0.0061|
+```
+
+### Serving Benchmark
+
+The following script can be used to benchmark online serving throughput and latency:
+
+```bash
+model_path=${model_path:-amd/MiniMax-M3-MXFP4}
+ISL=8192
+OSL=1024
+CONC=16
+
+python -m atom.benchmarks.benchmark_serving \
+  --model="$model_path" \
+  --backend=vllm \
+  --base-url=http://localhost:8000 \
+  --dataset-name=random \
+  --random-input-len="${ISL}" \
+  --random-output-len="${OSL}" \
+  --random-range-ratio=0.8 \
+  --num-prompts=$(( CONC * 10 )) \
+  --max-concurrency="${CONC}" \
+  --request-rate=inf \
+  --ignore-eos \
+  --save-result \
+  --percentile-metrics="ttft,tpot,itl,e2el"
+```
+
+Reference MXFP4 EAGLE3 results from our run on 4xMI355 GPUs:
+
+| CONC | Requests | Duration (s) | Mean TTFT (ms) | P99 TTFT (ms) | Mean TPOT (ms) | P99 TPOT (ms) | Output tok/s | Total tok/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 40 | 60.37 | 317.29 | 960.98 | 6.05 | 11.85 | 610.59 | 5581.65 |
+| 8 | 80 | 77.51 | 352.55 | 1414.16 | 7.77 | 18.81 | 957.06 | 8602.10 |
+| 16 | 160 | 103.68 | 498.39 | 4218.43 | 10.03 | 22.49 | 1414.41 | 13210.97 |
+| 32 | 320 | 139.89 | 642.88 | 5327.78 | 13.91 | 33.04 | 2120.00 | 19933.90 |
+| 64 | 640 | 213.19 | 979.37 | 10432.72 | 21.05 | 51.05 | 2771.30 | 24947.04 |
+
+Reference MXFP8 EAGLE3 results from our run on 4xMI355 GPUs:
+
+| CONC | Requests | Duration (s) | Mean TTFT (ms) | P99 TTFT (ms) | Mean TPOT (ms) | P99 TPOT (ms) | Output tok/s | Total tok/s |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 4 | 40 | 71.58 | 305.42 | 725.69 | 7.17 | 13.13 | 514.96 | 4723.03 |
+| 8 | 80 | 92.76 | 761.62 | 5615.31 | 8.83 | 19.75 | 799.67 | 7211.16 |
+| 16 | 160 | 118.81 | 502.76 | 2852.45 | 11.45 | 24.82 | 1234.39 | 12124.02 |
+| 32 | 320 | 165.54 | 681.16 | 5616.00 | 16.37 | 34.57 | 1791.67 | 16501.51 |
+| 64 | 640 | 249.99 | 1026.47 | 11151.09 | 24.90 | 59.52 | 2363.39 | 22374.37 |
 
 ### Acceptance Rate
 
