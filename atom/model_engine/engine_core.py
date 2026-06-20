@@ -891,11 +891,24 @@ class DecodeEngineCore(EngineCore):
 
         # --- Capture CUDA graphs now that kvcache is real ---
         config.num_kvcache_blocks = num_kvcache_blocks
+        # if not config.enforce_eager:
+        #     cap_cost, bs = self.runner_mgr.call_func("capture_cudagraph", wait_out=True)
+        #     logger.info(
+        #         f"DecodeEngineCore: cudagraph capture{bs} cost: {cap_cost:.2f}s"
+        #     )
+
         if not config.enforce_eager:
+            if self.profile_enbaled and self.mark_trace:
+                self.runner_mgr.call_func(
+                    "start_profiler", "capture_graph", wait_out=True
+                )
             cap_cost, bs = self.runner_mgr.call_func("capture_cudagraph", wait_out=True)
             logger.info(
                 f"DecodeEngineCore: cudagraph capture{bs} cost: {cap_cost:.2f}s"
             )
+            if self.profile_enbaled and self.mark_trace:
+                # Persist a dedicated capture-graph trace immediately.
+                self.runner_mgr.call_func("stop_profiler", wait_out=True)
 
         # --- Create DecodeScheduler now that num_kvcache_blocks is set ---
         self.scheduler = DecodeScheduler(

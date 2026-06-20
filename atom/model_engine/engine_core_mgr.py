@@ -651,6 +651,16 @@ class DisaggCoreManager(CoreManager):
         # prefill via CUDA IPC after prefill's READY signal.
         decode_config.disagg_is_decode = True
 
+        if config.torch_profiler_dir:
+            prefill_config.torch_profiler_dir = os.path.join(
+                config.torch_profiler_dir, "prefill"
+            )
+            decode_config.torch_profiler_dir = os.path.join(
+                config.torch_profiler_dir, "decode"
+            )
+            os.makedirs(prefill_config.torch_profiler_dir, exist_ok=True)
+            os.makedirs(decode_config.torch_profiler_dir, exist_ok=True)
+
         # Addresses for the standard CoreManager input/output sockets.
         prefill_input_addr = get_open_zmq_ipc_path()
         prefill_output_addr = get_open_zmq_ipc_path()
@@ -684,6 +694,7 @@ class DisaggCoreManager(CoreManager):
         self.ctx = zmq.Context(io_threads=2)
         self.outputs_queue = queue.Queue()
         self.stream_outputs_queue = queue.Queue()
+        self.utility_response_queue = queue.Queue()
         self._seq_id_to_callback = {}
         self.engine_core_processes = []
         self.input_sockets = []
