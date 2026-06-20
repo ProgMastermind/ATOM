@@ -15,7 +15,7 @@ from aiter.fused_moe import fused_moe
 from aiter.jit.utils.chip_info import get_gfx
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.ops.flydsl.moe_common import GateMode
-from aiter.ops.shuffle import shuffle_scale, shuffle_weight
+from aiter.ops.shuffle import moe_shuffle_scale, shuffle_weight
 from atom.config import (
     Config,
     QuantizationConfig,
@@ -1018,13 +1018,13 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         w2_scale_2d = layer.w2_weight_scale.reshape(-1, layer.w2_weight_scale.shape[-1])
 
-        shuffled_w13_scale = shuffle_scale(
+        shuffled_w13_scale = moe_shuffle_scale(
             w13_scale_2d,
             self.num_experts,
             is_guinterleave=self.is_guinterleave,
             gate_up=True,
         )
-        shuffled_w2_scale = shuffle_scale(
+        shuffled_w2_scale = moe_shuffle_scale(
             w2_scale_2d,
             self.num_experts,
             is_guinterleave=self.is_guinterleave,
