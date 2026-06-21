@@ -232,10 +232,6 @@ def triton_kernel_fused_experts(
             assert a13_scale is not None
             assert a2_scale is not None
 
-            # vllm-like processing
-            a13_scale = a13_scale.max().to(torch.float32)
-            a2_scale = a2_scale.max().to(torch.float32)
-
             quant_dtype = torch.float8_e4m3fn
             if get_arch() == "gfx942":
                 quant_dtype = torch.float8_e4m3fnuz

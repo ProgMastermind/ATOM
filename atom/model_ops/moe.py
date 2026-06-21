@@ -922,6 +922,14 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if layer.w2_bias is not None:
             layer.w2_bias.data = layer.w2_bias.data.to(torch.float32)
 
+        if self.static_input_scales:
+            layer.w13_input_scale = atom_parameter(
+                layer.w13_input_scale.max().to(torch.float32)
+            )
+            layer.w2_input_scale = atom_parameter(
+                layer.w2_input_scale.max().to(torch.float32)
+            )
+
         if os.environ.get("ATOM_V4_TORCH_MOE"):
             return
 
