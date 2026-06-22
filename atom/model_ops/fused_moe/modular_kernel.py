@@ -332,32 +332,40 @@ class FusedMoEModularKernel(torch.nn.Module):
             quant_type,
         )
 
-        # optimize fused_moe hidden_states
-        # mori dispatch expands buffer to (max_tokens * world_size, hidden_dim)
-        # but actual valid tokens = graph_bs * topk * dp_size
+        # optimize fused_moe hidden_states: mori dispatch expands the receive
+        # buffer to (max_tokens * world_size, hidden_dim); only the first
+        # `expert_num_tokens` rows are valid and fused_moe is driven by that
+        # count via num_local_tokens, so the buffer must never be trimmed below
+        # it.
         context = get_forward_context().context
-        if context is None:
-            if is_vllm():
-                from atom.plugin.vllm.mori_dispatch import (
-                    trim_vllm_mori_dispatch_tensors,
-                )
+        if is_vllm():
+            # vLLM: always use the exact-recv trim. It internally trims to the
+            # graph_bs*topk*ep bound only under a uniform FULL-cudagraph batch
+            # (where that bound >= recv by construction), skips trimming during
+            # graph capture, and otherwise trims to the exact received-token
+            # count. The graph_bs bound below is unsafe for DP+EP mixed batches:
+            # a decoding rank (graph_bs small) can still receive many tokens via
+            # all-to-all from prefilling peers, so the bound under-counts recv
+            # and fused_moe reads past the trimmed buffer -> illegal access.
+            from atom.plugin.vllm.mori_dispatch import (
+                trim_vllm_mori_dispatch_tensors,
+            )
 
-                (
-                    dispatch_a1,
-                    dispatch_scale,
-                    dispatch_ids,
-                    dispatch_weights,
-                ) = trim_vllm_mori_dispatch_tensors(
-                    dispatch_a1,
-                    dispatch_scale,
-                    dispatch_ids,
-                    dispatch_weights,
-                    topk_ids,
-                    self.prepare_finalize.num_dispatchers(),
-                    expert_tokens_meta.expert_num_tokens,
-                )
-
-        else:
+            (
+                dispatch_a1,
+                dispatch_scale,
+                dispatch_ids,
+                dispatch_weights,
+            ) = trim_vllm_mori_dispatch_tensors(
+                dispatch_a1,
+                dispatch_scale,
+                dispatch_ids,
+                dispatch_weights,
+                topk_ids,
+                self.prepare_finalize.num_dispatchers(),
+                expert_tokens_meta.expert_num_tokens,
+            )
+        elif context is not None:
             dp_size = get_dp_group().world_size
             topk = topk_ids.shape[1]
             # Use graph_bs for cudagraph compatibility (consistent shape during capture/replay)
