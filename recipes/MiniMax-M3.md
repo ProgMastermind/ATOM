@@ -1,7 +1,8 @@
-# MiniMax-M3 MXFP4 Usage Guide
+# MiniMax-M3 MXFP4/MXFP8 Usage Guide
 
-[MiniMax-M3-MXFP4](https://huggingface.co/amd/MiniMax-M3-MXFP4) is supported by
-the native ATOM OpenAI-compatible server path.
+[MiniMax-M3-MXFP4](https://huggingface.co/amd/MiniMax-M3-MXFP4) and
+[MiniMax-M3-MXFP8](https://huggingface.co/MiniMaxAI/MiniMax-M3-MXFP8) are
+supported by the native ATOM OpenAI-compatible server path.
 
 ## Preparing Environment
 
@@ -11,9 +12,13 @@ Pull the latest development image:
 docker pull rocm/atom-dev:latest
 ```
 
-## MXFP4 on 4xMI355 GPUs
+## MXFP4/MXFP8 on 4xMI355 GPUs
 
 ### Launching Server
+
+MXFP4 and MXFP8 use the same launch path. Set
+`model_path=MiniMaxAI/MiniMax-M3-MXFP8 run_name=m3-mxfp8` to run the MXFP8
+checkpoint.
 
 ```bash
 model_path=${model_path:-amd/MiniMax-M3-MXFP4}
@@ -62,6 +67,9 @@ local-chat-completions ({'model': 'amd/MiniMax-M3-MXFP4', 'base_url': 'http://12
 |gsm8k|      3|flexible-extract|     5|exact_match|↑  |0.9363|±  |0.0067|
 |     |       |strict-match    |     5|exact_match|↑  |0.9371|±  |0.0067|
 ```
+
+For MXFP8, run the same command with
+`model_path=MiniMaxAI/MiniMax-M3-MXFP8 run_name=m3-mxfp8`.
 
 ### Serving Benchmark
 
