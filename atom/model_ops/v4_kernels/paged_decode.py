@@ -916,6 +916,19 @@ def sparse_attn_v4_paged_decode(
     When ``kv_scales`` is provided, ``unified_kv`` must be fp8 (e4m3fnuz) and
     will be dequantized in-kernel using 1xGROUP_SIZE (default 64) block scales.
     """
+    # CUDAGraph/piecewise (DP+EP): q is padded to the captured bucket while the
+    # per-token kv_indptr is built at the real token count (the bridge builds
+    # metadata before the DP-coordinated cudagraph dispatch). Pad kv_indptr to
+    # T+1 by repeating its last value so pad-token query rows get empty KV
+    # ranges (their attention output is discarded). Guarded -> a no-op when
+    # already T+1-sized (prefill / FULL-graph capture / native ATOM).
+    _T = q.shape[0]
+    if kv_indptr.numel() < _T + 1:
+        _n = kv_indptr.numel()
+        _ind = kv_indptr.new_empty((_T + 1,))
+        _ind[:_n] = kv_indptr
+        _ind[_n:] = kv_indptr[-1]
+        kv_indptr = _ind
     if os.environ.get("ATOM_USE_TRITON_ATTN", "1") == "1":
         return _sparse_attn_v4_paged_decode_triton(
             q,

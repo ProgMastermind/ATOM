@@ -1366,6 +1366,19 @@ class Indexer(nn.Module):
         # get errors if we try to use the padded rows.
         next_n = max(1, int(get_forward_context().attn_metadata.max_seqlen_q))
         bs = total_tokens // next_n
+        # Pad per-seq tensors to the padded seq count so the deepgemm view +
+        # paged kernels address the captured grid. Pad rows carry n_committed=0
+        # (no KV selected) and block id 0 (inert). Guarded on bs > real -> a
+        # no-op when the builder already bucket-sized the metadata (TBO /
+        # FULL-graph capture); load-bearing for the plain DP+EP graph path where
+        # q_fp8 is padded to the bucket but block_tables/n_committed are not.
+        if bs > block_tables.size(0):
+            _pad_bt = block_tables.new_zeros((bs, block_tables.size(1)))
+            _pad_bt[: block_tables.size(0)] = block_tables
+            block_tables = _pad_bt
+            _pad_nc = n_committed_per_seq_gpu.new_zeros((bs,))
+            _pad_nc[: n_committed_per_seq_gpu.size(0)] = n_committed_per_seq_gpu
+            n_committed_per_seq_gpu = _pad_nc
         # deepgemm requires Q in [bs, next_n, heads, head_dim], KV in
         # [num_blocks, block_size, n_head=1, hidden_dim+scale_dim] (4D).
         q_4d = q_fp8.view(

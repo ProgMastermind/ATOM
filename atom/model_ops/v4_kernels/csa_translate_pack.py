@@ -203,6 +203,33 @@ def csa_translate_pack(
     if T == 0:
         return
 
+    # CUDAGraph/piecewise (DP+EP): topk_local is sized to the padded bucket T
+    # while the per-token CSA metadata is built at the real token count (vLLM
+    # pads q/positions to the bucket but the bridge builds metadata before the
+    # DP-coordinated cudagraph dispatch). Pad the per-token inputs to T so the
+    # kernel addresses the padded grid; pad tokens carry empty CSA ranges
+    # (indptr repeats its last value -> valid_k == 0) and -1 batch ids (masked).
+    # Guarded on size < T -> a no-op for prefill / FULL-graph capture / native
+    # ATOM (metadata already T-sized there).
+    if batch_id_per_token.numel() < T:
+        _bid = batch_id_per_token.new_full((T,), -1)
+        _bid[: batch_id_per_token.numel()] = batch_id_per_token
+        batch_id_per_token = _bid
+    if kv_indptr_csa.numel() < T + 1:
+        n = kv_indptr_csa.numel()
+        _ind = kv_indptr_csa.new_empty((T + 1,))
+        _ind[:n] = kv_indptr_csa
+        _ind[n:] = kv_indptr_csa[-1]  # repeat last -> empty ranges for pad tokens
+        kv_indptr_csa = _ind
+    if positions.numel() < T:
+        _pos = positions.new_zeros((T,))
+        _pos[: positions.numel()] = positions
+        positions = _pos
+    if skip_prefix_len_per_token is not None and skip_prefix_len_per_token.numel() < T:
+        _skip = skip_prefix_len_per_token.new_zeros((T,))
+        _skip[: skip_prefix_len_per_token.numel()] = skip_prefix_len_per_token
+        skip_prefix_len_per_token = _skip
+
     inline_skip = window_size > 0
     if not inline_skip and skip_prefix_len_per_token is None:
         raise ValueError("skip_prefix_len_per_token is required when window_size == 0")

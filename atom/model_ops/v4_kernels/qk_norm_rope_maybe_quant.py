@@ -372,6 +372,16 @@ def qk_norm_rope_maybe_quant(
         q.dim() == 2 and kv.dim() == 2
     ), f"q/kv must be 2-D; got q={tuple(q.shape)} kv={tuple(kv.shape)}"
     T = q.shape[0]
+    # CUDAGraph/piecewise (DP+EP): `q` is padded to the captured bucket while the
+    # V4 attention runs eager (splitting op), so per-token metadata built at the
+    # real token count can be shorter than T. Pad batch_id_per_token to T with the
+    # -1 sentinel (the kernel gates the SWA cache-write on batch_id >= 0, so pad
+    # rows are inert). Guarded on numel() < T -> a no-op during FULL-graph capture
+    # (metadata is already bucket-sized there), keeping capture/replay shapes stable.
+    if batch_id_per_token is not None and batch_id_per_token.numel() < T:
+        _bid_padded = batch_id_per_token.new_full((T,), -1)
+        _bid_padded[: batch_id_per_token.numel()] = batch_id_per_token
+        batch_id_per_token = _bid_padded
     assert (
         q.shape[1] == n_local_heads * head_dim
     ), f"q last dim {q.shape[1]} != H*D = {n_local_heads * head_dim}"
