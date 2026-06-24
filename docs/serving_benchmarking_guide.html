@@ -1228,6 +1228,9 @@ the programmatic API.</p>
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_PROFILER_MORE=1</span></code> env var</p></td>
 <td><p>Enables detailed profiling: <code class="docutils literal notranslate"><span class="pre">record_shapes</span></code>, <code class="docutils literal notranslate"><span class="pre">with_stack</span></code>, <code class="docutils literal notranslate"><span class="pre">profile_memory</span></code></p></td>
 </tr>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">ATOM_PROFILER_TIMEOUT=&lt;seconds&gt;</span></code> env var</p></td>
+<td><p>Overrides the <code class="docutils literal notranslate"><span class="pre">stop_profile</span></code> timeout; default is 300 seconds</p></td>
+</tr>
 </tbody>
 </table>
 <p>When a profiler directory is configured, each worker saves traces to a
@@ -1252,7 +1255,8 @@ curl<span class="w"> </span>-s<span class="w"> </span>-S<span class="w"> </span>
 </pre></div>
 </div>
 <p>The server must be started with <code class="docutils literal notranslate"><span class="pre">--torch-profiler-dir</span></code> or with
-<code class="docutils literal notranslate"><span class="pre">ATOM_TORCH_PROFILER_DIR</span></code> set for these endpoints to produce traces.</p>
+<code class="docutils literal notranslate"><span class="pre">ATOM_TORCH_PROFILER_DIR</span></code> set for these endpoints to produce traces.
+For large traces, set <code class="docutils literal notranslate"><span class="pre">ATOM_PROFILER_TIMEOUT</span></code> higher before starting the server.</p>
 </section>
 <section id="programmatic-profiling">
 <h3>5.3 Programmatic Profiling<a class="headerlink" href="#programmatic-profiling" title="Link to this heading"></a></h3>
