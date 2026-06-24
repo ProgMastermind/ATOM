@@ -80,6 +80,47 @@ else:
 
 from atom.model_ops.utils import MXFP4_QUANT_BLOCK_SIZE  # noqa
 
+# aiter CK gemm_a8w8 is gfx9-only; on RDNA (gfx11/12) route INT8 W8A8 to the
+# Triton a8w8 kernel. Resolved at import so the torch.compile-traced forward has
+# no imports / runtime arch probes (which break Dynamo).
+from atom.utils.arch import aiter_hip_kernels_supported as _aiter_hip_ok  # noqa: E402
+
+_A8W8_USE_TRITON = not _aiter_hip_ok()
+if _A8W8_USE_TRITON:
+    from aiter.ops.triton.gemm.basic.gemm_a8w8 import gemm_a8w8 as _gemm_a8w8_triton
+    from atom.utils.custom_register import (
+        direct_register_custom_op as _direct_register_custom_op,
+    )
+
+    def _atom_gemm_a8w8_triton_impl(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        x_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        otype: torch.dtype,
+    ) -> torch.Tensor:
+        return _gemm_a8w8_triton(x, weight, x_scale, weight_scale, bias, dtype=otype)
+
+    def _atom_gemm_a8w8_triton_fake(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+        x_scale: torch.Tensor,
+        weight_scale: torch.Tensor,
+        bias: Optional[torch.Tensor],
+        otype: torch.dtype,
+    ) -> torch.Tensor:
+        return torch.empty((x.shape[0], weight.shape[0]), dtype=otype, device=x.device)
+
+    _direct_register_custom_op(
+        op_name="atom_gemm_a8w8_triton",
+        op_func=_atom_gemm_a8w8_triton_impl,
+        mutates_args=[],
+        fake_impl=_atom_gemm_a8w8_triton_fake,
+    )
+else:
+    _gemm_a8w8_triton = None
+
 
 def divide(numerator, denominator):
     assert (
@@ -462,6 +503,7 @@ class LinearBase(nn.Module):
         assert online_quant_dtype in [
             torch.float8_e4m3fn,
             torch.float4_e2m1fn_x2,
+            torch.int8,
         ], (
             f"Unsupported online quant: "
             f"dtype={online_quant_dtype}, type={online_quant_type}"
@@ -634,14 +676,24 @@ class LinearBase(nn.Module):
                 )
             elif self.quant_type.value == QuantType.per_Token.value:
                 if self.params_dtype == dtypes.i8:
-                    y = gemm_a8w8(
-                        x,
-                        self.weight,
-                        x_scale,
-                        self.weight_scale,
-                        self.bias,
-                        dtype=otype,
-                    )
+                    if _A8W8_USE_TRITON:
+                        y = torch.ops.aiter.atom_gemm_a8w8_triton(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            self.bias,
+                            otype,
+                        )
+                    else:
+                        y = gemm_a8w8(
+                            x,
+                            self.weight,
+                            x_scale,
+                            self.weight_scale,
+                            self.bias,
+                            dtype=otype,
+                        )
                 else:
                     y = gemm_a8w8_bpreshuffle(
                         x,
