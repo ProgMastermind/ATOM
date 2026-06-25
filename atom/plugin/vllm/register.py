@@ -2,6 +2,7 @@ from typing import Optional
 import logging
 
 import torch
+from transformers import AutoConfig, PretrainedConfig
 from atom.plugin.prepare import _set_framework_backbone
 from atom.utils import envs
 from atom.plugin.vllm.spec_decode_patch import apply_vllm_spec_decode_patch
@@ -35,11 +36,42 @@ _VLLM_MODEL_REGISTRY_OVERRIDES: dict[str, str] = {
     "KimiK25ForConditionalGeneration": "atom.plugin.vllm.models.kimi_k25:KimiK25ForConditionalGeneration",
     "MiniMaxM2ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
     "DeepseekV4ForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "MiniMaxM3SparseForCausalLM": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
+    "MiniMaxM3SparseForConditionalGeneration": ATOM_MOE_CAUSAL_LM_MODEL_WRAPPER,
 }
+
+
+class MiniMaxM3Config(PretrainedConfig):
+    """Minimal local config shim for MiniMax-M3 VL checkpoints."""
+
+    model_type = "minimax_m3_vl"
+
+    def __init__(
+        self,
+        text_config: dict | PretrainedConfig | None = None,
+        vision_config: dict | None = None,
+        **kwargs,
+    ):
+        if isinstance(text_config, dict):
+            text_config = PretrainedConfig(**text_config)
+
+        self.text_config = text_config
+        self.vision_config = vision_config
+        self.hidden_size = getattr(text_config, "hidden_size", None)
+
+        super().__init__(**kwargs)
 
 
 def _set_plugin_mode() -> None:
     _set_framework_backbone("vllm")
+
+
+def _register_hf_configs() -> None:
+    try:
+        AutoConfig.register(MiniMaxM3Config.model_type, MiniMaxM3Config)
+    except ValueError as exc:
+        if "already used by a Transformers config" not in str(exc):
+            raise
 
 
 def register_platform() -> Optional[str]:
@@ -55,6 +87,8 @@ def register_platform() -> Optional[str]:
     # importing SGLang plugin modules — then atom.models.qwen3_5's ``if is_vllm():``
     # branch runs and requires vllm.model_executor.models.qwen3_5, which may be
     # absent. Backbone is set in register_model() for real vLLM runs.
+
+    _register_hf_configs()
 
     # return the ATOM platform to vllm
     return "atom.plugin.vllm.platform.ATOMPlatform"
