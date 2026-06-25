@@ -335,93 +335,41 @@ def _decode_index_score_kernel(
     off_d = tl.arange(0, BLOCK_SIZE_D)
     d_mask = off_d < head_dim
     bt_row = block_table_ptr + pid_b * stride_bt_b
-    # Force-select init/local blocks without touching the K cache.  Split the
-    # ranges so the dot-product hot path does not branch per block.
+    # Force-select init (1e30) and local (1e29, higher priority) blocks.
     local_start = tl.maximum(0, num_blocks - local_blocks)
-    init_only_end = tl.minimum(tl.minimum(chunk_end_block, init_blocks), local_start)
-    if chunk_start_block < init_only_end:
-        for blk in tl.range(chunk_start_block, init_only_end):
-            tl.store(
-                score_ptr
-                + pid_h * stride_s_h
-                + pid_b * stride_s_n
-                + blk * stride_s_k,
-                1e30,
-            )
-
-    normal_start = tl.maximum(chunk_start_block, init_blocks)
-    normal_end = tl.minimum(chunk_end_block, local_start)
-    if normal_start < normal_end:
-        num_full_blocks = seq_len // BLOCK_SIZE_K
-        q = tl.load(
-            q_ptr + pid_b * stride_q_n + pid_h * stride_q_h + off_d * stride_q_d,
-            mask=d_mask,
+    # single query vector for this (token, index head)
+    q = tl.load(
+        q_ptr + pid_b * stride_q_n + pid_h * stride_q_h + off_d * stride_q_d,
+        mask=d_mask,
+        other=0.0,
+    ).to(
+        tl.float32
+    )  # [D]
+    for blk in tl.range(chunk_start_block, chunk_end_block):
+        page = tl.load(bt_row + blk).to(tl.int64)
+        pos = blk * BLOCK_SIZE_K + off_k
+        pos_mask = pos < seq_len
+        is_init = blk < init_blocks
+        is_local = (blk >= local_start) & (blk < num_blocks)
+        score_override = is_init | is_local
+        k = tl.load(
+            ik_cache_ptr
+            + page * stride_ik_blk
+            + off_k[None, :] * stride_ik_pos
+            + off_d[:, None] * stride_ik_d,
+            mask=d_mask[:, None] & pos_mask[None, :] & (~score_override),
             other=0.0,
         ).to(
             tl.float32
-        )  # [D]
-
-        full_end = tl.minimum(normal_end, num_full_blocks)
-        if normal_start < full_end:
-            for blk in tl.range(normal_start, full_end):
-                page = tl.load(bt_row + blk).to(tl.int64)
-                k = tl.load(
-                    ik_cache_ptr
-                    + page * stride_ik_blk
-                    + off_k[None, :] * stride_ik_pos
-                    + off_d[:, None] * stride_ik_d,
-                    mask=d_mask[:, None],
-                    other=0.0,
-                ).to(
-                    tl.float32
-                )  # [D, N]
-                qk = tl.sum(q[:, None] * k, axis=0) * sm_scale_log2e  # [N]
-                score = tl.max(qk, axis=0)  # one score for this 128-block
-                tl.store(
-                    score_ptr
-                    + pid_h * stride_s_h
-                    + pid_b * stride_s_n
-                    + blk * stride_s_k,
-                    score,
-                )
-
-        tail_start = tl.maximum(normal_start, num_full_blocks)
-        if tail_start < normal_end:
-            for blk in tl.range(tail_start, normal_end):
-                page = tl.load(bt_row + blk).to(tl.int64)
-                pos = blk * BLOCK_SIZE_K + off_k
-                pos_mask = pos < seq_len
-                k = tl.load(
-                    ik_cache_ptr
-                    + page * stride_ik_blk
-                    + off_k[None, :] * stride_ik_pos
-                    + off_d[:, None] * stride_ik_d,
-                    mask=d_mask[:, None] & pos_mask[None, :],
-                    other=0.0,
-                ).to(
-                    tl.float32
-                )  # [D, N]
-                qk = tl.sum(q[:, None] * k, axis=0) * sm_scale_log2e  # [N]
-                qk = tl.where(pos_mask, qk, float("-inf"))
-                score = tl.max(qk, axis=0)  # one score for this 128-block
-                tl.store(
-                    score_ptr
-                    + pid_h * stride_s_h
-                    + pid_b * stride_s_n
-                    + blk * stride_s_k,
-                    score,
-                )
-
-    local_begin = tl.maximum(chunk_start_block, local_start)
-    if local_begin < chunk_end_block:
-        for blk in tl.range(local_begin, chunk_end_block):
-            tl.store(
-                score_ptr
-                + pid_h * stride_s_h
-                + pid_b * stride_s_n
-                + blk * stride_s_k,
-                1e29,
-            )
+        )  # [D, N]
+        qk = tl.sum(q[:, None] * k, axis=0) * sm_scale_log2e  # [N]
+        qk = tl.where(pos_mask, qk, float("-inf"))
+        score = tl.max(qk, axis=0)  # one score for this 128-block
+        score = tl.where(is_local, 1e29, tl.where(is_init, 1e30, score))
+        tl.store(
+            score_ptr + pid_h * stride_s_h + pid_b * stride_s_n + blk * stride_s_k,
+            score,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -755,7 +703,6 @@ def minimax_m3_index_topk_decode(
     local_blocks: int,
     num_kv_heads: int,
     sm_scale: float,
-    emit_sparse_block_table: bool = False,
 ) -> torch.Tensor:
     """Decode index block-score + top-k, both split-K (cudagraph-safe).
 
@@ -878,33 +825,4 @@ def minimax_m3_index_topk_decode(
         topk_idx.stride(2),
         NUM_TOPK_CHUNKS=num_topk_chunks,
     )
-    if not emit_sparse_block_table:
-        return topk_idx
-
-    # Optional compatibility path for generic paged-attention callers: emit a
-    # per-index-head physical block table for the selected sparse blocks.
-    valid = topk_idx >= 0
-    invalid = torch.full_like(topk_idx, max_block)
-    logical_idx = torch.where(valid, topk_idx, invalid)
-    logical_idx = torch.sort(logical_idx, dim=-1).values
-    valid = logical_idx < max_block
-    safe_logical_idx = logical_idx.masked_fill(~valid, 0).long()
-
-    expanded_block_table = block_table.unsqueeze(0).expand(num_idx_heads, -1, -1)
-    sparse_block_table = torch.gather(
-        expanded_block_table, dim=2, index=safe_logical_idx
-    )
-    sparse_block_table = sparse_block_table.masked_fill(~valid, 0)
-
-    block_token_lens = (
-        seq_lens.view(1, batch, 1).to(torch.int64)
-        - safe_logical_idx.to(torch.int64) * SPARSE_BLOCK_SIZE
-    ).clamp(min=0, max=SPARSE_BLOCK_SIZE)
-    sparse_context_lens = block_token_lens.masked_fill(~valid, 0).sum(dim=-1)
-    sparse_context_lens = sparse_context_lens.to(seq_lens.dtype)
-
-    return (
-        topk_idx,
-        sparse_block_table.reshape(num_idx_heads * batch, topk).contiguous(),
-        sparse_context_lens.reshape(num_idx_heads * batch).contiguous(),
-    )
+    return topk_idx
