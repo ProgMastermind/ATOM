@@ -401,6 +401,7 @@ class AiterMlaSparseMetadataForVllm:
 
 @dataclass
 class SparseMHAPrefillMetadata:
+    qo_indptr: torch.Tensor
     cu_seqlens_q: torch.Tensor
     seq_lens: torch.Tensor
     context_lens: torch.Tensor
@@ -492,10 +493,13 @@ class SparseMHAPagedAttentionMetadataBuilder(AttentionMetadataBuilder):
 
         prefill_metadata: SparseMHAPrefillMetadata | None = None
         if num_prefills_total > 0:
-            prefill_start = num_decodes
+            # MiniMax-M3 sparse attention uses the prefill kernel for any mixed
+            # decode+prefill batch, because it builds per-token causal sparse
+            # block tables. Only pure decode batches use the decode kernel.
+            prefill_start = 0
             prefill_seq_lens = seq_lens[prefill_start:]
             prefill_query_start = (
-                common_attn_metadata.query_start_loc[prefill_start:] - num_decode_tokens
+                common_attn_metadata.query_start_loc[prefill_start:]
             ).to(torch.int32)
             context_lens = common_attn_metadata.compute_num_computed_tokens()[
                 prefill_start:
@@ -517,7 +521,11 @@ class SparseMHAPagedAttentionMetadataBuilder(AttentionMetadataBuilder):
                 raise ValueError(
                     f"MiniMax-M3 sparse block size must be {SPARSE_BLOCK_SIZE}."
                 )
+            qo_indptr = torch.arange(
+                num_tokens + 1, dtype=torch.int32, device=seq_lens.device
+            )
             prefill_metadata = SparseMHAPrefillMetadata(
+                qo_indptr=qo_indptr,
                 cu_seqlens_q=prefill_query_start,
                 seq_lens=prefill_seq_lens,
                 context_lens=context_lens,

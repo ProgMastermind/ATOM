@@ -389,22 +389,13 @@ class SparseMHAPagedAttentionBackend:
             raise ValueError(
                 f"MiniMax-M3 sparse block size must be {SPARSE_BLOCK_SIZE}."
             )
-        return (num_blocks, 2, block_size, num_kv_heads, head_size)
+        return (2, num_blocks, block_size, num_kv_heads, head_size)
 
     @staticmethod
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
-        from vllm.v1.attention.backends.utils import get_kv_cache_layout
-
-        if include_num_layers_dimension:
-            raise NotImplementedError
-        cache_layout = get_kv_cache_layout()
-        if cache_layout == "NHD":
-            return (0, 1, 2, 3, 4)
-        if cache_layout == "HND":
-            return (0, 1, 3, 2, 4)
-        raise ValueError(f"Unknown cache layout format {cache_layout}.")
+        raise NotImplementedError
 
     @staticmethod
     def get_impl_cls():
