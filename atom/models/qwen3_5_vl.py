@@ -114,6 +114,16 @@ class Qwen3VisionAttention(nn.Module):
         ):
             # Per-image flash attention over (tokens, heads, head_dim) contiguous q/k/v.
             b_start_loc, b_seq_len, max_seqlen = cu_seqlens
+            # WMMA-align head_dim: the Triton kernel is ~2x slower when head_dim
+            # is not a multiple of 16 (e.g. 72 -> unaligned masked loads). Pad q/k/v
+            # with zeros to the next multiple of 16 (72 -> 80); the padded dims
+            # contribute nothing to QK^T / AV, so the result is unchanged.
+            d = self.head_dim
+            d_pad = ((d + 15) // 16) * 16
+            if d_pad != d:
+                q = F.pad(q, (0, d_pad - d))
+                k = F.pad(k, (0, d_pad - d))
+                v = F.pad(v, (0, d_pad - d))
             q = q.contiguous()
             k = k.contiguous()
             v = v.contiguous()
@@ -121,7 +131,7 @@ class Qwen3VisionAttention(nn.Module):
             context_attention_fwd(
                 q, k, v, out, b_start_loc, b_seq_len, max_seqlen, is_causal=False
             )
-            out = out.reshape(seq_len, self.embed_dim)
+            out = out[:, :, :d].reshape(seq_len, self.embed_dim)
         else:
             # Reshape for SDPA: [batch, heads, seq_len, head_dim]
             qh = q.unsqueeze(0).transpose(1, 2)  # [1, num_heads, seq_len, head_dim]
