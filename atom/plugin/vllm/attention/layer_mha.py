@@ -1,3 +1,4 @@
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Optional
 
 import aiter
@@ -7,19 +8,16 @@ from aiter.ops.triton.fused_kv_cache import fused_qk_rope_reshape_and_cache
 from aiter.ops.triton.gluon.pa_decode_gluon import get_recommended_splits
 from atom.config import get_current_atom_config
 from atom.model_ops.attention_mla import MLAModules
+from atom.model_ops.attention_mha import (
+    SparseMHAPagedAttentionImpl as AtomSparseMHAPagedAttentionImpl,
+)
 from atom.model_ops.base_attention import (
     cp_mha_gather_cache,
     run_pa_decode_gluon,
     run_pa_fwd_asm,
 )
-from atom.model_ops.minimax_m3.index_topk import (
-    minimax_m3_index_topk,
-    minimax_m3_index_topk_decode,
-)
 from atom.model_ops.minimax_m3.sparse_attn import (
     SPARSE_BLOCK_SIZE,
-    minimax_m3_sparse_attn,
-    minimax_m3_sparse_attn_decode,
 )
 from atom.plugin.vllm.attention.backend import (
     AiterMhaBackendForVllm,
@@ -1007,7 +1005,9 @@ class SparseMHAIndexerCache(nn.Module, AttentionLayerBase):
 AttentionLayerBase.register(SparseMHAIndexerCache)
 
 
-class SparseMHAPagedAttentionImplForVllm(AttentionForVllmMHA):
+class SparseMHAPagedAttentionImplForVllm(
+    AttentionForVllmMHA, AtomSparseMHAPagedAttentionImpl
+):
     """MiniMax-M3 sparse MHA adapter for vLLM plugin mode."""
 
     def __init__(
@@ -1025,7 +1025,7 @@ class SparseMHAPagedAttentionImplForVllm(AttentionForVllmMHA):
         **kwargs,
     ) -> None:
         del impl_cls
-        super().__init__(*args, **kwargs)
+        AttentionForVllmMHA.__init__(self, *args, **kwargs)
         if self.head_dim != 128:
             raise ValueError("MiniMax-M3 sparse attention requires head_dim == 128.")
         if index_q_norm is None or index_k_norm is None:
@@ -1063,13 +1063,13 @@ class SparseMHAPagedAttentionImplForVllm(AttentionForVllmMHA):
         else:
             raise ValueError(f"Duplicate layer name: {index_prefix}")
 
-    def _validate_raw_kv_cache(self, kv_cache: torch.Tensor) -> None:
-        if kv_cache.ndim != 5 or kv_cache.shape[1] != 2:
+    def _page16_shuffle_kv_cache(self, kv_cache: torch.Tensor):
+        if kv_cache.ndim != 5 or kv_cache.shape[0] != 2:
             raise ValueError(
                 "MiniMax-M3 sparse adapter expects vLLM KV cache shape "
-                "(num_blocks, 2, block_size, num_kv_heads, head_dim)."
+                "(2, num_blocks, block_size, num_kv_heads, head_dim)."
             )
-        _num_blocks, _kv, block_size, num_kv_heads, head_dim = kv_cache.shape
+        _kv, num_blocks, block_size, num_kv_heads, head_dim = kv_cache.shape
         if block_size != SPARSE_BLOCK_SIZE:
             raise ValueError(
                 f"MiniMax-M3 sparse block size must be {SPARSE_BLOCK_SIZE}."
@@ -1080,6 +1080,40 @@ class SparseMHAPagedAttentionImplForVllm(AttentionForVllmMHA):
                 f"cache=({num_kv_heads}, {head_dim}) "
                 f"layer=({self.num_kv_heads}, {self.head_dim})."
             )
+        key_cache, value_cache = kv_cache.unbind(0)
+        if self.kv_cache_dtype == "fp8":
+            target_dtype = dtypes.d_dtypes[self.kv_cache_dtype]
+            key_cache = key_cache.view(target_dtype)
+            value_cache = value_cache.view(target_dtype)
+            if self.k_scale is None or self.v_scale is None:
+                self.kv_scale = torch.zeros(
+                    2,
+                    num_blocks,
+                    num_kv_heads,
+                    block_size,
+                    dtype=dtypes.fp32,
+                    device=kv_cache.device,
+                )
+                self.k_scale = self.kv_scale[0]
+                self.v_scale = self.kv_scale[1]
+
+        x = 16 // key_cache.element_size()
+        key_cache = key_cache.view(
+            num_blocks, num_kv_heads, head_dim // x, block_size, x
+        )
+        value_cache = value_cache.view(
+            num_blocks, num_kv_heads, block_size // x, head_dim, x
+        )
+        k_scale = v_scale = None
+        if self.k_scale is not None and self.v_scale is not None:
+            k_scale = self.k_scale.view(num_blocks, num_kv_heads, block_size)
+            v_scale = self.v_scale.view(num_blocks, num_kv_heads, block_size)
+        return self._to_page16_shuffle(
+            key_cache,
+            value_cache,
+            k_scale,
+            v_scale,
+        )
 
     def _rope_index_cache(
         self,
@@ -1090,7 +1124,10 @@ class SparseMHAPagedAttentionImplForVllm(AttentionForVllmMHA):
         position: torch.Tensor,
         main_metadata,
         index_metadata,
-        kv_cache: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k_scale: Optional[torch.Tensor],
+        v_scale: Optional[torch.Tensor],
     ):
         del q, k, v
         if qkv is None:
@@ -1112,7 +1149,8 @@ class SparseMHAPagedAttentionImplForVllm(AttentionForVllmMHA):
         from atom.models.minimax_m3 import _minimax_m3_cos_sin_cache
 
         cos_sin_cache = _minimax_m3_cos_sin_cache(self.rotary_emb, qkv)
-        key_cache, value_cache = kv_cache.unbind(1)
+        is_fp8 = self.kv_cache_dtype == "fp8"
+        kv_cache_dtype = self.kv_cache_dtype if is_fp8 else "auto"
         aiter.fused_qknorm_idxrqknorm(
             qkv,
             self.q_norm.weight,
@@ -1127,15 +1165,17 @@ class SparseMHAPagedAttentionImplForVllm(AttentionForVllmMHA):
             self.index_k_norm.weight,
             self.num_idx_heads,
             slot_mapping=main_metadata.slot_mapping,
-            kv_cache_k=key_cache,
-            kv_cache_v=value_cache,
+            kv_cache_k=k_cache,
+            kv_cache_v=v_cache,
             index_cache=index_cache,
-            block_size=kv_cache.shape[2],
+            block_size=k_cache.shape[3],
             q_out=q_out,
             index_q_out=index_q,
             index_slot_mapping=index_metadata.slot_mapping,
-            kv_cache_dtype=self.kv_cache_dtype,
-            asm_layout=False,
+            kv_cache_dtype=kv_cache_dtype,
+            k_scale=k_scale if is_fp8 else None,
+            v_scale=v_scale if is_fp8 else None,
+            asm_layout=True,
         )
         self._index_q = index_q.view(-1, self.num_idx_heads, self.index_head_dim)
         q_view = q_out.view(-1, self.num_heads, self.head_dim)
@@ -1159,86 +1199,6 @@ class SparseMHAPagedAttentionImplForVllm(AttentionForVllmMHA):
         if index_metadata is None:
             index_metadata = main_metadata
         return main_metadata, index_metadata
-
-    def _sparse_prefill(
-        self,
-        q: torch.Tensor,
-        index_q: torch.Tensor,
-        kv_cache: torch.Tensor,
-        main_metadata,
-        index_metadata,
-    ) -> torch.Tensor:
-        prefill_md = main_metadata.prefill
-        index_prefill_md = index_metadata.prefill
-        assert prefill_md is not None, "sparse prefill metadata missing"
-        assert index_prefill_md is not None, "sparse index prefill metadata missing"
-        topk_idx = minimax_m3_index_topk(
-            index_q,
-            self.index_cache_layer.kv_cache,
-            index_prefill_md.block_table,
-            prefill_md.cu_seqlens_q,
-            prefill_md.seq_lens,
-            prefill_md.context_lens,
-            prefill_md.max_query_len,
-            prefill_md.max_seq_len,
-            self.topk,
-            self.init_blocks,
-            self.local_blocks,
-            self.num_kv_heads,
-            self.scale,
-        )
-        output = torch.empty_like(q)
-        minimax_m3_sparse_attn(
-            q,
-            kv_cache,
-            topk_idx,
-            prefill_md.block_table,
-            prefill_md.cu_seqlens_q,
-            prefill_md.seq_lens,
-            prefill_md.context_lens,
-            prefill_md.max_query_len,
-            self.num_kv_heads,
-            self.scale,
-            output,
-        )
-        return output
-
-    def _sparse_decode(
-        self,
-        q: torch.Tensor,
-        index_q: torch.Tensor,
-        kv_cache: torch.Tensor,
-        main_metadata,
-        index_metadata,
-    ) -> torch.Tensor:
-        decode_md = main_metadata.decode
-        index_decode_md = index_metadata.decode
-        assert decode_md is not None, "sparse decode metadata missing"
-        assert index_decode_md is not None, "sparse index decode metadata missing"
-        topk_idx = minimax_m3_index_topk_decode(
-            index_q,
-            self.index_cache_layer.kv_cache,
-            index_decode_md.block_table,
-            decode_md.seq_lens,
-            main_metadata.max_seq_len,
-            self.topk,
-            self.init_blocks,
-            self.local_blocks,
-            self.num_kv_heads,
-            self.scale,
-        )
-        output = torch.empty_like(q)
-        minimax_m3_sparse_attn_decode(
-            q,
-            kv_cache,
-            topk_idx,
-            decode_md.block_table,
-            decode_md.seq_lens,
-            self.num_kv_heads,
-            self.scale,
-            output,
-        )
-        return output
 
     def forward_impl(
         self,
@@ -1280,7 +1240,7 @@ class SparseMHAPagedAttentionImplForVllm(AttentionForVllmMHA):
 
         main_metadata, index_metadata = self._metadata_pair(attn_metadata)
 
-        self._validate_raw_kv_cache(kv_cache)
+        k_cache, v_cache, k_scale, v_scale = self._page16_shuffle_kv_cache(kv_cache)
         q = self._rope_index_cache(
             query,
             key,
@@ -1289,37 +1249,57 @@ class SparseMHAPagedAttentionImplForVllm(AttentionForVllmMHA):
             position,
             main_metadata,
             index_metadata,
-            kv_cache,
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
         )
         index_q = self._index_q
         assert index_q is not None
 
-        num_decode_tokens = main_metadata.num_decode_tokens
+        actual_tokens = min(
+            getattr(main_metadata, "num_actual_tokens", q.shape[0]), q.shape[0]
+        )
         num_prefill_tokens = main_metadata.num_prefill_tokens
         output_view = output.view(-1, self.num_heads, self.head_dim)
+        self.index_cache = self.index_cache_layer.kv_cache
+        fwd_ctx = SimpleNamespace(attn_metadata=main_metadata)
 
-        if num_prefill_tokens > 0:
-            prefill_slice = slice(num_decode_tokens, q.shape[0])
-            output_view[prefill_slice].copy_(
-                self._sparse_prefill(
-                    q[prefill_slice],
-                    index_q[prefill_slice],
-                    kv_cache,
-                    main_metadata,
-                    index_metadata,
-                )
+        q_actual = q[:actual_tokens]
+        key_actual = key[:actual_tokens] if key is not None else key
+        value_actual = value[:actual_tokens] if value is not None else value
+        self._index_q = index_q[:actual_tokens]
+        output_actual = output_view[:actual_tokens]
+        if actual_tokens < output_view.shape[0]:
+            output_view[actual_tokens:].zero_()
+
+        if actual_tokens == 0:
+            pass
+        elif num_prefill_tokens > 0:
+            AtomSparseMHAPagedAttentionImpl._sparse_prefill(
+                self,
+                q_actual,
+                key_actual,
+                value_actual,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                fwd_ctx,
+                output=output_actual,
             )
-
-        if main_metadata.num_decodes > 0:
-            decode_slice = slice(0, num_decode_tokens)
-            output_view[decode_slice].copy_(
-                self._sparse_decode(
-                    q[decode_slice],
-                    index_q[decode_slice],
-                    kv_cache,
-                    main_metadata,
-                    index_metadata,
-                )
+        elif main_metadata.num_decodes > 0:
+            AtomSparseMHAPagedAttentionImpl._sparse_decode(
+                self,
+                q_actual,
+                key_actual,
+                value_actual,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                fwd_ctx,
+                output=output_actual,
             )
 
         self._index_q = None
