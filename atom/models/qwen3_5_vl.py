@@ -16,16 +16,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # gfx1151 (RDNA3.5): torch SDPA falls back to the unfused math backend for the ViT
-# (flash/mem-efficient are disabled), so use aiter's Triton prefill attention
-# (~5-7x faster, O(N) memory, validated at head_dim 72). On gfx9/CDNA SDPA already
-# has a fast flash backend, so keep SDPA there.
+# (flash/mem-efficient are disabled). Use a custom Triton flash attention that
+# tiles head_dim into 5x16=80 (vs padding to 128) -> ~24 TFLOPS, ~20x over SDPA.
+# On gfx9/CDNA SDPA already has a fast flash backend, so keep SDPA there.
 try:
-    from aiter.ops.triton.attention.prefill_attention import context_attention_fwd
+    from atom.model_ops.vit_attention import vit_flash_attn
     from atom.utils.arch import aiter_hip_kernels_supported
 
     _USE_TRITON_VIT_ATTN = not aiter_hip_kernels_supported()
 except Exception:  # pragma: no cover - fallback if aiter/arch unavailable
-    context_attention_fwd = None
+    vit_flash_attn = None
     _USE_TRITON_VIT_ATTN = False
 
 
@@ -109,29 +109,23 @@ class Qwen3VisionAttention(nn.Module):
 
         if (
             _USE_TRITON_VIT_ATTN
-            and context_attention_fwd is not None
+            and vit_flash_attn is not None
             and cu_seqlens is not None
+            and self.head_dim <= 80
         ):
-            # Per-image flash attention over (tokens, heads, head_dim) contiguous q/k/v.
+            # Custom head-dim-tiled flash attention (per-image varlen). Tiles
+            # head_dim into 5x16=80 instead of padding to 128, so the QK/AV
+            # contraction is 80-deep (1.6x fewer WMMA k-steps). No external pad.
             b_start_loc, b_seq_len, max_seqlen = cu_seqlens
-            # WMMA-align head_dim: the Triton kernel is ~2x slower when head_dim
-            # is not a multiple of 16 (e.g. 72 -> unaligned masked loads). Pad q/k/v
-            # with zeros to the next multiple of 16 (72 -> 80); the padded dims
-            # contribute nothing to QK^T / AV, so the result is unchanged.
-            d = self.head_dim
-            d_pad = ((d + 15) // 16) * 16
-            if d_pad != d:
-                q = F.pad(q, (0, d_pad - d))
-                k = F.pad(k, (0, d_pad - d))
-                v = F.pad(v, (0, d_pad - d))
-            q = q.contiguous()
-            k = k.contiguous()
-            v = v.contiguous()
-            out = torch.empty_like(q)
-            context_attention_fwd(
-                q, k, v, out, b_start_loc, b_seq_len, max_seqlen, is_causal=False
+            out = vit_flash_attn(
+                q.contiguous(),
+                k.contiguous(),
+                v.contiguous(),
+                b_start_loc,
+                b_seq_len,
+                max_seqlen,
             )
-            out = out[:, :, :d].reshape(seq_len, self.embed_dim)
+            out = out.reshape(seq_len, self.embed_dim)
         else:
             # Reshape for SDPA: [batch, heads, seq_len, head_dim]
             qh = q.unsqueeze(0).transpose(1, 2)  # [1, num_heads, seq_len, head_dim]
