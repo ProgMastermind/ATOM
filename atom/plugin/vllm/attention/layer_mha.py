@@ -1246,14 +1246,28 @@ class SparseMHAPagedAttentionImplForVllm(
             raise RuntimeError("MiniMax-M3 sparse attention requires positions.")
 
         main_metadata, index_metadata = self._metadata_pair(attn_metadata)
+        actual_tokens = min(
+            getattr(main_metadata, "num_actual_tokens", num_tokens), num_tokens
+        )
+        output_view = output.view(-1, self.num_heads, self.head_dim)
+        if actual_tokens < output_view.shape[0]:
+            output_view[actual_tokens:].zero_()
+        if actual_tokens == 0:
+            return output.view(-1, self.num_heads * self.head_dim)
+
+        query_actual = query[:actual_tokens]
+        key_actual = key[:actual_tokens] if key is not None else key
+        value_actual = value[:actual_tokens] if value is not None else value
+        qkv_actual = qkv[:actual_tokens] if qkv is not None else qkv
+        position_actual = position[:actual_tokens]
 
         k_cache, v_cache, k_scale, v_scale = self._page16_shuffle_kv_cache(kv_cache)
         q = self._rope_index_cache(
-            query,
-            key,
-            value,
-            qkv,
-            position,
+            query_actual,
+            key_actual,
+            value_actual,
+            qkv_actual,
+            position_actual,
             main_metadata,
             index_metadata,
             k_cache,
@@ -1264,49 +1278,364 @@ class SparseMHAPagedAttentionImplForVllm(
         index_q = self._index_q
         assert index_q is not None
 
-        actual_tokens = min(
-            getattr(main_metadata, "num_actual_tokens", q.shape[0]), q.shape[0]
-        )
         num_prefill_tokens = main_metadata.num_prefill_tokens
-        output_view = output.view(-1, self.num_heads, self.head_dim)
+        num_decode_tokens = min(
+            getattr(main_metadata, "num_decode_tokens", 0), actual_tokens
+        )
+        num_extend_tokens = min(
+            getattr(main_metadata, "num_extend_tokens", 0),
+            max(0, actual_tokens - num_decode_tokens),
+        )
         self.index_cache = self.index_cache_layer.kv_cache
-        fwd_ctx = SimpleNamespace(attn_metadata=main_metadata)
 
-        q_actual = q[:actual_tokens]
-        key_actual = key[:actual_tokens] if key is not None else key
-        value_actual = value[:actual_tokens] if value is not None else value
-        self._index_q = index_q[:actual_tokens]
+        q_actual = q
         output_actual = output_view[:actual_tokens]
-        if actual_tokens < output_view.shape[0]:
-            output_view[actual_tokens:].zero_()
 
-        if actual_tokens == 0:
-            pass
-        elif num_prefill_tokens > 0:
+        num_decodes = getattr(main_metadata, "num_decodes", 0)
+        num_extends = getattr(main_metadata, "num_extends", 0)
+
+        def _phase_rows(rows, req_slice, expected_rows):
+            # Metadata built specifically for a phase is already compacted. Full
+            # batch metadata still contains decode rows before prefill/extend rows.
+            if rows is None:
+                return None
+            if rows.shape[0] == expected_rows:
+                return rows
+            return rows[req_slice]
+
+        # vLLM may schedule decode, extend, and prefill requests in one forward.
+        # MiniMax-M3 sparse kernels interpret every metadata row relative to the
+        # query tensor they receive, so each phase gets a local token slice plus
+        # matching request rows. Passing the full mixed metadata lets unrelated
+        # requests leak into top-k block selection and KV reads, especially with
+        # fp8 KV where small wrong reads become visible in GSM8K accuracy.
+        if num_extends > 0 and num_extend_tokens > 0:
+            assert main_metadata.extend_metadata is not None
+            extend_slice = slice(
+                num_decode_tokens, num_decode_tokens + num_extend_tokens
+            )
+            extend_reqs_slice = slice(num_decodes, num_decodes + num_extends)
+
+            cu_seqlens_q = main_metadata.extend_metadata.query_start_loc
+            query_lens = cu_seqlens_q[1 : num_extends + 1] - cu_seqlens_q[:num_extends]
+            qo_indptr = torch.arange(
+                num_extend_tokens + 1, dtype=torch.int32, device=q_actual.device
+            )
+            main_block_table = main_metadata.block_table[extend_reqs_slice]
+            main_seq_lens = main_metadata.seq_lens[extend_reqs_slice]
+            main_max_seq_len = main_metadata.extend_metadata.max_seq_len
+            max_query_len = main_metadata.extend_metadata.max_query_len
+            main_extend_metadata = SimpleNamespace(
+                qo_indptr=qo_indptr,
+                cu_seqlens_q=cu_seqlens_q,
+                seq_lens=main_seq_lens,
+                context_lens=main_seq_lens - query_lens,
+                block_table=main_block_table,
+                max_query_len=max_query_len,
+                max_seq_len=main_max_seq_len,
+            )
+            main_extend_sparse_metadata = SimpleNamespace(
+                seq_lens=main_seq_lens,
+                max_seq_len=main_max_seq_len,
+                slot_mapping=main_metadata.slot_mapping[extend_slice],
+                num_prefills=num_extends,
+                prefill=main_extend_metadata,
+                decode=None,
+            )
+
+            index_extend_source = index_metadata
+            index_extend_metadata_obj = getattr(
+                index_extend_source, "extend_metadata", None
+            )
+            index_max_seq_len = (
+                index_extend_metadata_obj.max_seq_len
+                if index_extend_metadata_obj is not None
+                else main_max_seq_len
+            )
+            index_block_table = getattr(
+                index_extend_source, "block_table", main_metadata.block_table
+            )[extend_reqs_slice]
+            index_seq_lens = getattr(
+                index_extend_source, "seq_lens", main_metadata.seq_lens
+            )[extend_reqs_slice]
+            index_extend_metadata = SimpleNamespace(
+                qo_indptr=qo_indptr,
+                cu_seqlens_q=cu_seqlens_q,
+                seq_lens=index_seq_lens,
+                context_lens=index_seq_lens - query_lens,
+                block_table=index_block_table,
+                max_query_len=max_query_len,
+                max_seq_len=index_max_seq_len,
+            )
+            index_extend_sparse_metadata = SimpleNamespace(
+                seq_lens=index_seq_lens,
+                max_seq_len=index_max_seq_len,
+                slot_mapping=getattr(
+                    index_extend_source, "slot_mapping", main_metadata.slot_mapping
+                )[extend_slice],
+                num_prefills=num_extends,
+                prefill=index_extend_metadata,
+                decode=None,
+            )
+            extend_ctx = SimpleNamespace(
+                attn_metadata=main_extend_sparse_metadata,
+                index_attn_metadata=index_extend_sparse_metadata,
+            )
+            self._index_q = index_q[extend_slice]
             AtomSparseMHAPagedAttentionImpl._sparse_prefill(
                 self,
-                q_actual,
-                key_actual,
-                value_actual,
+                q_actual[extend_slice],
+                key_actual[extend_slice] if key_actual is not None else key_actual,
+                value_actual[extend_slice] if value_actual is not None else value_actual,
                 k_cache,
                 v_cache,
                 k_scale,
                 v_scale,
-                fwd_ctx,
-                output=output_actual,
+                extend_ctx,
+                output=output_actual[extend_slice],
             )
-        elif main_metadata.num_decodes > 0:
+
+        prefill_start = num_decode_tokens + num_extend_tokens
+        prefill_tokens = min(num_prefill_tokens, max(0, actual_tokens - prefill_start))
+        if prefill_tokens > 0:
+            num_prefills = getattr(main_metadata, "num_prefills", 0)
+            prefill_slice = slice(prefill_start, prefill_start + prefill_tokens)
+            prefill_reqs_start = num_decodes + num_extends
+            prefill_reqs_slice = slice(
+                prefill_reqs_start, prefill_reqs_start + num_prefills
+            )
+
+            main_sparse_metadata = getattr(
+                main_metadata, "sparse_attention_metadata", None
+            )
+            if main_sparse_metadata is None and hasattr(main_metadata, "prefill"):
+                main_sparse_metadata = main_metadata
+            main_sparse_prefill = (
+                getattr(main_sparse_metadata, "prefill", None)
+                if main_sparse_metadata is not None
+                else None
+            )
+            main_prefill_source = (
+                getattr(main_metadata, "prefill_metadata", None) or main_sparse_prefill
+            )
+            assert main_prefill_source is not None
+            main_prefill_block_table = _phase_rows(
+                getattr(main_sparse_prefill, "block_table", None),
+                prefill_reqs_slice,
+                num_prefills,
+            )
+            if main_prefill_block_table is None:
+                main_prefill_block_table = main_metadata.block_table[prefill_reqs_slice]
+            main_prefill_seq_lens = _phase_rows(
+                getattr(main_sparse_prefill, "seq_lens", None),
+                prefill_reqs_slice,
+                num_prefills,
+            )
+            if main_prefill_seq_lens is None:
+                main_prefill_seq_lens = main_metadata.seq_lens[prefill_reqs_slice]
+            main_prefill_context_lens = _phase_rows(
+                getattr(main_sparse_prefill, "context_lens", None),
+                prefill_reqs_slice,
+                num_prefills,
+            )
+            prefill_cu_seqlens_q = getattr(
+                main_prefill_source, "query_start_loc", None
+            )
+            if prefill_cu_seqlens_q is None:
+                prefill_cu_seqlens_q = main_prefill_source.cu_seqlens_q
+            prefill_query_lens = (
+                prefill_cu_seqlens_q[1 : num_prefills + 1]
+                - prefill_cu_seqlens_q[:num_prefills]
+            )
+            prefill_qo_indptr = torch.arange(
+                prefill_tokens + 1, dtype=torch.int32, device=q_actual.device
+            )
+            main_prefill_phase = SimpleNamespace(
+                qo_indptr=prefill_qo_indptr,
+                cu_seqlens_q=prefill_cu_seqlens_q,
+                seq_lens=main_prefill_seq_lens,
+                context_lens=(
+                    main_prefill_context_lens
+                    if main_prefill_context_lens is not None
+                    else main_prefill_seq_lens - prefill_query_lens
+                ),
+                block_table=main_prefill_block_table,
+                max_query_len=main_prefill_source.max_query_len,
+                max_seq_len=main_prefill_source.max_seq_len,
+            )
+            main_prefill_sparse_metadata = SimpleNamespace(
+                seq_lens=main_prefill_seq_lens,
+                max_seq_len=main_prefill_source.max_seq_len,
+                slot_mapping=main_metadata.slot_mapping[prefill_slice],
+                num_prefills=num_prefills,
+                prefill=main_prefill_phase,
+                decode=None,
+            )
+
+            index_sparse_metadata = getattr(
+                index_metadata, "sparse_attention_metadata", None
+            )
+            if index_sparse_metadata is None and hasattr(index_metadata, "prefill"):
+                index_sparse_metadata = index_metadata
+            index_sparse_prefill = (
+                getattr(index_sparse_metadata, "prefill", None)
+                if index_sparse_metadata is not None
+                else None
+            )
+            index_prefill_block_table = _phase_rows(
+                getattr(index_sparse_prefill, "block_table", None),
+                prefill_reqs_slice,
+                num_prefills,
+            )
+            if index_prefill_block_table is None:
+                index_prefill_block_table = getattr(
+                    index_metadata, "block_table", main_metadata.block_table
+                )[prefill_reqs_slice]
+            index_prefill_seq_lens = _phase_rows(
+                getattr(index_sparse_prefill, "seq_lens", None),
+                prefill_reqs_slice,
+                num_prefills,
+            )
+            if index_prefill_seq_lens is None:
+                index_prefill_seq_lens = getattr(
+                    index_metadata, "seq_lens", main_metadata.seq_lens
+                )[prefill_reqs_slice]
+            index_prefill_context_lens = _phase_rows(
+                getattr(index_sparse_prefill, "context_lens", None),
+                prefill_reqs_slice,
+                num_prefills,
+            )
+            index_prefill_phase = SimpleNamespace(
+                qo_indptr=prefill_qo_indptr,
+                cu_seqlens_q=prefill_cu_seqlens_q,
+                seq_lens=index_prefill_seq_lens,
+                context_lens=(
+                    index_prefill_context_lens
+                    if index_prefill_context_lens is not None
+                    else index_prefill_seq_lens - prefill_query_lens
+                ),
+                block_table=index_prefill_block_table,
+                max_query_len=main_prefill_source.max_query_len,
+                max_seq_len=main_prefill_source.max_seq_len,
+            )
+            index_prefill_sparse_metadata = SimpleNamespace(
+                seq_lens=index_prefill_seq_lens,
+                max_seq_len=main_prefill_source.max_seq_len,
+                slot_mapping=getattr(
+                    index_metadata, "slot_mapping", main_metadata.slot_mapping
+                )[prefill_slice],
+                num_prefills=num_prefills,
+                prefill=index_prefill_phase,
+                decode=None,
+            )
+            prefill_ctx = SimpleNamespace(
+                attn_metadata=main_prefill_sparse_metadata,
+                index_attn_metadata=index_prefill_sparse_metadata,
+            )
+            self._index_q = index_q[prefill_slice]
+            AtomSparseMHAPagedAttentionImpl._sparse_prefill(
+                self,
+                q_actual[prefill_slice],
+                key_actual[prefill_slice] if key_actual is not None else key_actual,
+                value_actual[prefill_slice]
+                if value_actual is not None
+                else value_actual,
+                k_cache,
+                v_cache,
+                k_scale,
+                v_scale,
+                prefill_ctx,
+                output=output_actual[prefill_slice],
+            )
+
+        if main_metadata.num_decodes > 0 and num_decode_tokens > 0:
+            decode_slice = slice(0, num_decode_tokens)
+            main_decode_source = getattr(main_metadata, "decode", None)
+            main_decode_block_table = (
+                main_decode_source.block_table
+                if main_decode_source is not None
+                else main_metadata.block_table[:num_decodes]
+            )
+            main_decode_seq_lens = (
+                main_decode_source.seq_lens
+                if main_decode_source is not None
+                else main_metadata.seq_lens[:num_decodes]
+            )
+            main_decode_max_query_len = (
+                getattr(main_decode_source, "max_query_len", 1)
+                if main_decode_source is not None
+                else getattr(
+                    getattr(main_metadata, "decode_metadata", None),
+                    "max_query_len",
+                    1,
+                )
+            )
+            main_decode_phase = SimpleNamespace(
+                seq_lens=main_decode_seq_lens,
+                block_table=main_decode_block_table,
+                max_query_len=main_decode_max_query_len,
+            )
+            main_decode_sparse_metadata = SimpleNamespace(
+                seq_lens=main_decode_seq_lens,
+                max_seq_len=getattr(main_metadata, "max_seq_len", 0),
+                slot_mapping=main_metadata.slot_mapping[decode_slice],
+                num_prefills=0,
+                prefill=None,
+                decode=main_decode_phase,
+            )
+
+            index_decode_source = getattr(index_metadata, "decode", None)
+            index_decode_block_table = (
+                index_decode_source.block_table
+                if index_decode_source is not None
+                else getattr(index_metadata, "block_table", main_metadata.block_table)[
+                    :num_decodes
+                ]
+            )
+            index_decode_seq_lens = (
+                index_decode_source.seq_lens
+                if index_decode_source is not None
+                else getattr(index_metadata, "seq_lens", main_metadata.seq_lens)[
+                    :num_decodes
+                ]
+            )
+            index_decode_phase = SimpleNamespace(
+                seq_lens=index_decode_seq_lens,
+                block_table=index_decode_block_table,
+                max_query_len=main_decode_max_query_len,
+            )
+            index_decode_sparse_metadata = SimpleNamespace(
+                seq_lens=index_decode_seq_lens,
+                max_seq_len=getattr(
+                    index_metadata,
+                    "max_seq_len",
+                    main_decode_sparse_metadata.max_seq_len,
+                ),
+                slot_mapping=getattr(
+                    index_metadata, "slot_mapping", main_metadata.slot_mapping
+                )[decode_slice],
+                num_prefills=0,
+                prefill=None,
+                decode=index_decode_phase,
+            )
+            decode_ctx = SimpleNamespace(
+                attn_metadata=main_decode_sparse_metadata,
+                index_attn_metadata=index_decode_sparse_metadata,
+            )
+            self._index_q = index_q[decode_slice]
             AtomSparseMHAPagedAttentionImpl._sparse_decode(
                 self,
-                q_actual,
-                key_actual,
-                value_actual,
+                q_actual[decode_slice],
+                key_actual[decode_slice] if key_actual is not None else key_actual,
+                value_actual[decode_slice]
+                if value_actual is not None
+                else value_actual,
                 k_cache,
                 v_cache,
                 k_scale,
                 v_scale,
-                fwd_ctx,
-                output=output_actual,
+                decode_ctx,
+                output=output_actual[decode_slice],
             )
 
         self._index_q = None

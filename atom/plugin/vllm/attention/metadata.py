@@ -496,13 +496,20 @@ class SparseMHAPagedAttentionMetadataBuilder(AttentionMetadataBuilder):
             # MiniMax-M3 sparse attention uses the prefill kernel for any mixed
             # decode+prefill batch, because it builds per-token causal sparse
             # block tables. Only pure decode batches use the decode kernel.
-            prefill_start = 0
-            prefill_seq_lens = seq_lens[prefill_start:]
-            prefill_query_start = (
-                common_attn_metadata.query_start_loc[prefill_start:]
-            ).to(torch.int32)
+            # The vLLM scheduler orders request rows as decode, extend, prefill.
+            # The prefill metadata below must therefore start after decode rows
+            # and must shift query_start_loc back to this phase's local token
+            # slice; otherwise sparse prefill reads decode requests as prefixes.
+            prefill_start = num_decodes
+            prefill_stop = prefill_start + num_prefills_total
+            prefill_token_start = num_decode_tokens
+            prefill_seq_lens = seq_lens[prefill_start:prefill_stop]
+            prefill_query_start = common_attn_metadata.query_start_loc[
+                prefill_start : prefill_stop + 1
+            ].to(torch.int32)
+            prefill_query_start = prefill_query_start - prefill_token_start
             context_lens = common_attn_metadata.compute_num_computed_tokens()[
-                prefill_start:
+                prefill_start:prefill_stop
             ]
             seq_lens_cpu = getattr(
                 common_attn_metadata, "seq_lens_cpu_upper_bound", None
@@ -511,25 +518,29 @@ class SparseMHAPagedAttentionMetadataBuilder(AttentionMetadataBuilder):
                 seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
             if seq_lens_cpu is None:
                 seq_lens_cpu = seq_lens.cpu()
-            prefill_max_seq_len = int(seq_lens_cpu[prefill_start:].max().item())
+            prefill_max_seq_len = int(
+                seq_lens_cpu[prefill_start:prefill_stop].max().item()
+            )
             query_lens_cpu = (
                 common_attn_metadata.query_start_loc_cpu[1:]
                 - common_attn_metadata.query_start_loc_cpu[:-1]
             )
-            prefill_max_query_len = int(query_lens_cpu[prefill_start:].max().item())
+            prefill_max_query_len = int(
+                query_lens_cpu[prefill_start:prefill_stop].max().item()
+            )
             if self.block_size != SPARSE_BLOCK_SIZE:
                 raise ValueError(
                     f"MiniMax-M3 sparse block size must be {SPARSE_BLOCK_SIZE}."
                 )
             qo_indptr = torch.arange(
-                num_tokens + 1, dtype=torch.int32, device=seq_lens.device
+                num_prefill_tokens + 1, dtype=torch.int32, device=seq_lens.device
             )
             prefill_metadata = SparseMHAPrefillMetadata(
                 qo_indptr=qo_indptr,
                 cu_seqlens_q=prefill_query_start,
                 seq_lens=prefill_seq_lens,
                 context_lens=context_lens,
-                block_table=block_table[prefill_start:],
+                block_table=block_table[prefill_start:prefill_stop],
                 max_query_len=prefill_max_query_len,
                 max_seq_len=prefill_max_seq_len,
             )
