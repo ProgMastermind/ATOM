@@ -59,7 +59,7 @@ runs:
           --shm-size=16G --privileged --cap-add=SYS_PTRACE \
           -e HF_TOKEN="${HF_TOKEN:-}" \
           --security-opt seccomp=unconfined \
-          --ulimit memlock=-1 --ulimit stack=67108864 --pull always \
+          --ulimit memlock=-1 --ulimit stack=67108864 --ulimit nofile=65536:524288 --pull always \
           -e ATOM_DISABLE_MMAP=true \
           ${{ inputs.container-env }} \
           --env-file "$ENV_FILE" \
