@@ -1,20 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2026, Advanced Micro Devices, Inc. All rights reserved.
-"""Block-level functional test for ATOM's GPT-OSS attention, driving the REAL
-``OAIAttention`` module end to end (qkv_proj -> RoPE + paged KV write ->
-attention with per-head sinks + alternating sliding window + GQA -> o_proj),
-checked against a pure-torch reference.
+"""Block-level test driving the REAL OAIAttention module end to end (qkv_proj ->
+RoPE + paged KV write -> attention with sinks + alternating sliding window + GQA
+-> o_proj) vs a torch reference. Exercises ATOM's actual module + arch dispatch
+(PagedAttentionImpl), selected via --backend {asm,triton}.
 
-Unlike the aiter-side op_test, this exercises ATOM's actual module + its arch
-dispatch (PagedAttentionImpl): on gfx942/gfx950 the AiterBackend path
-(flash_attn_varlen + pa_decode_gluon); set ``use_flash_layout`` for the
-portable triton ``unified_attention`` path (gfx1250).
-
-Standalone (no ModelRunner): we init TP=1, set a minimal current atom config,
-instantiate OAIAttention, allocate the KV cache, build the ForwardContext
-(attn metadata + kv_cache_data + Context) by hand, and call forward.
-
-Run:  python3 tests/block/test_attention_block_gptoss.py
+Standalone (no ModelRunner): init TP=1, set a minimal current atom config,
+instantiate OAIAttention, allocate the KV cache, build the ForwardContext by hand,
+call forward. Run: python3 tests/block/test_attention_block_gptoss.py
 """
 
 import argparse
@@ -24,15 +17,10 @@ from types import SimpleNamespace
 
 import torch
 
-# NOTE: the gfx1250 GPT-OSS serving recipe (serve_gpt_a8w4.sh) sets
-# ATOM_USE_UNIFIED_ATTN=1 / AITER_ROPE_TRITON_BACKEND=1 / ENABLE_CK=0 so attention
-# runs on ATOM's TritonMHABackend -> aiter triton unified_attention. Those flags
-# assume the full ModelRunner (GEMM/RoPE/selector global setup) and do NOT compose
-# with this hand-built single-layer harness (they regress passing cases here). The
-# serving attention PATH is validated instead by the aiter-side op_test
-# (op_tests/block/test_attention_block.py --backend triton) on gfx1250, and by the
-# real server itself. This harness exercises the real OAIAttention module via the
-# explicit --backend {asm,triton} switch below.
+# The gfx1250 serving recipe sets ATOM_USE_UNIFIED_ATTN/AITER_ROPE_TRITON_BACKEND/
+# ENABLE_CK; those assume the full ModelRunner and don't compose with this single-
+# layer harness. The triton (unified_attention) serving path is instead validated
+# by the aiter op_test op_tests/block/test_attention_block.py --backend triton.
 
 
 # --------------------------------------------------------------------------- #
@@ -138,11 +126,9 @@ def alloc_kv_cache(cfg, hf, batch, seq_len, layer_num, flash_layout=False):
 
 
 def _fused_rope(attn, q, k, v, positions):
-    """RoPE q,k via the SAME fused kernel the module uses (not forward_native).
-    On gfx1250 the fused RoPE and forward_native differ by ~1e-2 (bit-identical
-    on gfx950); using the kernel's RoPE in the reference isolates the attention
-    op under test from that RoPE numerics gap. Returns roped (q, k); writes go to
-    a throwaway cache."""
+    """RoPE q,k via the SAME fused kernel the module uses (fused vs forward_native
+    differ ~1e-2 on gfx1250), so the reference isolates the attention op, not RoPE.
+    Returns roped (q, k); cache writes go to a throwaway buffer."""
     from aiter.ops.triton.fusions.fused_kv_cache import fused_qk_rope_reshape_and_cache
 
     nq = attn.num_local_attention_heads
@@ -257,10 +243,8 @@ def run_prefill(attn, hf, cfg, batch, seq_len, layer_num, args, flash=False):
         in_seq % bsz
     )
     context_lens = torch.full((batch,), seq_len, dtype=torch.int32, device="cuda")
-    # asm prefill (flash_attn_varlen) reads K/V directly (block_tables unused).
-    # triton prefill (prefill_attention_triton, pure prefill) treats raw K/V as a
-    # block_size=1 cache + a fake per-token block table mapping seq i token j ->
-    # global row cu[i]+j.
+    # triton pure-prefill treats raw K/V as a block_size=1 cache + a fake per-token
+    # table (cu[i]+j); asm reads K/V directly (block_tables unused).
     if flash:
         block_tables = torch.arange(total, dtype=torch.int32, device="cuda").view(
             batch, seq_len
@@ -453,10 +437,8 @@ def make_attn(hf, layer_num, flash, kv_cache_dtype="bf16"):
     init_weights(attn)
     attn.rotary_emb.cos_cache = attn.rotary_emb.cos_cache.cuda()
     attn.rotary_emb.sin_cache = attn.rotary_emb.sin_cache.cuda()
-    # The backend CLASS is chosen by ATOM's real selector (ATOM_USE_UNIFIED_ATTN
-    # -> TritonMHABackend). Both backends share PagedAttentionImpl; use_flash_layout
-    # is normally set by the builder's build_kv_cache_tensor, which we bypass, so
-    # set it here to match the selected backend.
+    # use_flash_layout is normally set by the backend's build_kv_cache_tensor,
+    # which we bypass; set it here to pick asm (False) vs triton (True).
     attn.attn.impl.use_flash_layout = flash
     return attn
 
