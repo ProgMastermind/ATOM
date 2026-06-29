@@ -791,10 +791,14 @@ def _interleave_gate_up_rows_(layer: torch.nn.Module) -> None:
 
     The reorder is on whole rows (the ``2I`` axis); the MXFP4-packed pairs live
     on the LAST axis (``H//2`` bytes/row), so reordering never splits a packed
-    byte. We therefore reorder a ``uint8`` view of the FP4 weight — bit-exact,
-    no dequant/requant, no scale recompute (torch has no ``index_select`` for the
-    ``float4_e2m1fn_x2`` dtype itself). The e8m0 scale (already uint8) and the
-    bf16 bias are reordered the same way so they stay matched to the weight rows.
+    byte. For FP4 we reorder a ``uint8`` view (bit-exact, no dequant/requant, no
+    scale recompute — torch has no ``index_select`` for ``float4_e2m1fn_x2``).
+
+    Memory: the permutation is applied **in place per expert**, reusing the
+    existing storage. A plain ``index_select(...).contiguous()`` over the whole
+    tensor would double peak memory (a full second copy of the ~GB-sized w13),
+    which OOMs across many layers at load time. Here the only transient is one
+    expert's rows (a few MB), so peak overhead is negligible.
 
     Idempotency guard: sets ``layer._w13_gate_up_interleaved`` so a double call
     (e.g. process_weights_after_loading invoked twice) is a no-op.
@@ -802,34 +806,40 @@ def _interleave_gate_up_rows_(layer: torch.nn.Module) -> None:
     if getattr(layer, "_w13_gate_up_interleaved", False):
         return
 
-    def _gugu_idx(two_i: int, device) -> torch.Tensor:
-        # rows [gate(0..I-1) | up(0..I-1)] -> [g0,u0,g1,u1,...]
+    def _interleave_inplace(t: torch.Tensor) -> None:
+        """In-place row reorder [g..|u..] -> [g0,u0,g1,u1,...], per expert.
+
+        Only FP4 (float4_e2m1fn_x2) needs the uint8 view, because torch has no
+        index_select/reshape for it AND its bytes are row-contiguous so the row
+        reorder is exact. Other dtypes (uint8 e8m0 scale, bf16/float bias) are
+        reordered directly — viewing them as uint8 would reinterpret bytes and
+        corrupt the values.
+
+        Per expert e: view its 2I rows as (2, I, *rest), transpose to
+        (I, 2, *rest) (the gugu order); reshape forces one small (single-expert)
+        temp, then copy_ it back into the same storage. No full-tensor duplicate.
+        """
+        _fp4 = getattr(torch, "float4_e2m1fn_x2", None)
+        if _fp4 is not None and t.dtype == _fp4:
+            buf = t.view(torch.uint8)
+        else:
+            buf = t
+
+        E, two_i = buf.shape[0], buf.shape[1]
         assert two_i % 2 == 0, f"w13 row dim {two_i} not even"
         i = two_i // 2
-        idx = torch.empty(two_i, dtype=torch.long, device=device)
-        idx[0::2] = torch.arange(i, device=device)  # gate -> even
-        idx[1::2] = torch.arange(i, device=device) + i  # up   -> odd
-        return idx
+        rest = buf.shape[2:]
+        for e in range(E):
+            rows = buf[e]  # view into storage, shape (2I, *rest)
+            gugu = (
+                rows.view(2, i, *rest).transpose(0, 1).reshape(two_i, *rest)
+            )  # one (single-expert) temp
+            rows.copy_(gugu)  # write back into the same storage
 
-    def _reorder_rows(t: torch.Tensor) -> torch.Tensor:
-        """index_select on dim=1, via a uint8 view if the dtype is unsupported.
-
-        FP4 (float4_e2m1fn_x2) has no index_select; view it as uint8 (bytes are
-        row-contiguous, so a row reorder is exact), select, then view back.
-        """
-        idx = _gugu_idx(t.shape[1], t.device)
-        orig_dtype = t.dtype
-        try:
-            return t.index_select(1, idx).contiguous()
-        except (RuntimeError, NotImplementedError):
-            return (
-                t.view(torch.uint8).index_select(1, idx).contiguous().view(orig_dtype)
-            )
-
-    layer.w13_weight.data = _reorder_rows(layer.w13_weight.data)
-    layer.w13_weight_scale.data = _reorder_rows(layer.w13_weight_scale.data)
+    _interleave_inplace(layer.w13_weight.data)
+    _interleave_inplace(layer.w13_weight_scale.data)
     if getattr(layer, "w13_bias", None) is not None:
-        layer.w13_bias.data = _reorder_rows(layer.w13_bias.data)
+        _interleave_inplace(layer.w13_bias.data)
     layer._w13_gate_up_interleaved = True
 
 
