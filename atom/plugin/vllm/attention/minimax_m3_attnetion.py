@@ -367,7 +367,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             index_decode_md = (
                 index_metadata.decode if index_metadata is not None else decode_md
             )
-            max_query_len = getattr(decode_md, "max_query_len", 1)
+            max_query_len = max(1, int(getattr(decode_md, "max_query_len", 1) or 1))
             key = self._topk_cache_key(
                 "decode", index_q[:num_decode_tokens], index_decode_md
             )

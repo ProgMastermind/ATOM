@@ -434,7 +434,9 @@ class MinimaxM3SparseMetadata:
 
 
 class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
-    _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
+    # MiniMax-M3 sparse attention owns dynamic index/topk/cache state that must
+    # be refreshed outside full cudagraph capture.
+    _cudagraph_support = AttentionCGSupport.NEVER
     reorder_batch_threshold = 1
 
     def __init__(
@@ -525,8 +527,8 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata.query_start_loc_cpu[1:]
                 - common_attn_metadata.query_start_loc_cpu[:-1]
             )
-            prefill_max_query_len = int(
-                query_lens_cpu[prefill_start:prefill_stop].max().item()
+            prefill_max_query_len = max(
+                1, int(query_lens_cpu[prefill_start:prefill_stop].max().item())
             )
             if self.block_size != SPARSE_BLOCK_SIZE:
                 raise ValueError(
@@ -551,7 +553,9 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
                 common_attn_metadata.query_start_loc_cpu[1:]
                 - common_attn_metadata.query_start_loc_cpu[:-1]
             )
-            decode_max_query_len = int(query_lens_cpu[:num_decodes].max().item())
+            decode_max_query_len = max(
+                1, int(query_lens_cpu[:num_decodes].max().item())
+            )
             decode_metadata = MinimaxM3SparseDecodeMetadata(
                 seq_lens=seq_lens[:num_decodes],
                 block_table=block_table[:num_decodes],
@@ -1334,15 +1338,12 @@ class AiterMlaMetadataBuilderForVllm(MLACommonMetadataBuilder):
         seq_lens = common_attn_metadata.seq_lens
         dcp_local_seq_lens = common_attn_metadata.dcp_local_seq_lens
 
-        (
-            num_decodes,
-            num_prefills,
-            num_decode_tokens,
-            num_prefill_tokens,
-        ) = split_decodes_and_prefills(
-            common_attn_metadata,
-            decode_threshold=self.reorder_batch_threshold,
-            require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata,
+                decode_threshold=self.reorder_batch_threshold,
+                require_uniform=(self.query_len_support != QueryLenSupport.VARLEN),
+            )
         )
 
         assert num_decodes + num_prefills == num_reqs
@@ -2106,13 +2107,10 @@ class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
         num_tokens = common_attn_metadata.num_actual_tokens
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        (
-            num_decodes,
-            num_prefills,
-            num_decode_tokens,
-            num_prefill_tokens,
-        ) = split_decodes_and_prefills(
-            common_attn_metadata, decode_threshold=self.reorder_batch_threshold
+        num_decodes, num_prefills, num_decode_tokens, num_prefill_tokens = (
+            split_decodes_and_prefills(
+                common_attn_metadata, decode_threshold=self.reorder_batch_threshold
+            )
         )
 
         assert num_decodes + num_prefills == num_reqs
