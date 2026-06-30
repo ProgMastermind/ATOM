@@ -18,9 +18,7 @@ class AiterMhaBackendForVllm:
 
     @staticmethod
     def get_supported_kernel_block_sizes():
-        from vllm.v1.attention.backend import MultipleOf
-
-        return [MultipleOf(16)]
+        return [16]
 
     @classmethod
     def supports_block_size(cls, block_size: int | None) -> bool:

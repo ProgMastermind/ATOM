@@ -22,9 +22,43 @@ from atom.plugin.vllm.attention.backend import (
     SparseMHAIndexerBackend,
 )
 from atom.plugin.vllm.attention.layer_common import _register_vllm_static_forward_context
+from atom.utils import mark_spliting_op
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.attention import Attention as VllmAttention
+
+try:
+    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
+except ImportError:
+    def eager_break_during_capture(fn):
+        return fn
+
+def minimax_m3_sparse_attention_fake(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    output_hidden_size: int,
+) -> torch.Tensor:
+    del positions, layer_name
+    return qkv.new_empty((qkv.shape[0], output_hidden_size))
+
+
+@mark_spliting_op(
+    is_custom=True,
+    gen_fake=minimax_m3_sparse_attention_fake,
+    mutates_args=[],
+)
+def minimax_m3_sparse_attention(
+    qkv: torch.Tensor,
+    positions: torch.Tensor,
+    layer_name: str,
+    output_hidden_size: int,
+) -> torch.Tensor:
+    from vllm.forward_context import get_forward_context
+
+    layer = get_forward_context().no_compile_layers[layer_name]
+    output = qkv.new_empty((qkv.shape[0], output_hidden_size))
+    return layer._forward_with_output(qkv, positions, output)
 
 
 class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
@@ -327,6 +361,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             kv_cache = kv_cache.view(target_dtype)
 
         num_decode_tokens = getattr(main_metadata, "num_decode_tokens", 0)
+        num_prefill_tokens = getattr(main_metadata, "num_prefill_tokens", 0)
         if num_decode_tokens > 0 and main_metadata.decode is not None:
             decode_md = main_metadata.decode
             index_decode_md = (
@@ -374,7 +409,6 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
                 out[:num_decode_tokens],
             )
 
-        num_prefill_tokens = getattr(main_metadata, "num_prefill_tokens", 0)
         if num_prefill_tokens > 0 and main_metadata.prefill is not None:
             start = num_decode_tokens
             stop = start + num_prefill_tokens
@@ -413,22 +447,17 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             )
         return output
 
-    def forward(
+    @eager_break_during_capture
+    def _forward_with_output(
         self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
+        qkv: torch.Tensor,
         positions: Optional[torch.Tensor] = None,
-        q_scale: Optional[torch.Tensor] = None,
-        qkv: Optional[torch.Tensor] = None,
-        **kwargs,
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        del query, key, value, q_scale, kwargs
-        if qkv is None:
-            raise ValueError("MiniMax-M3 sparse vLLM attention requires packed qkv.")
         main_metadata, index_metadata = self._metadata_for_layer()
         num_tokens = qkv.shape[0]
-        output = qkv.new_empty((num_tokens, self.q_size))
+        if output is None:
+            output = qkv.new_empty((num_tokens, self.q_size))
         if main_metadata is None or positions is None:
             return output.fill_(0)
         actual_tokens = min(
@@ -450,6 +479,28 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             index_metadata if index_metadata is not None else main_metadata,
         )
         return output
+
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        positions: Optional[torch.Tensor] = None,
+        q_scale: Optional[torch.Tensor] = None,
+        qkv: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> torch.Tensor:
+        del query, key, value, q_scale, kwargs
+        if qkv is None:
+            raise ValueError("MiniMax-M3 sparse vLLM attention requires packed qkv.")
+        if positions is None:
+            raise ValueError("positions is required for MiniMax-M3 sparse attention.")
+        return torch.ops.aiter.minimax_m3_sparse_attention(
+            qkv,
+            positions,
+            self.layer_name,
+            self.q_size,
+        )
 
 
 class MiniMaxM3DenseAttentionForVllm(nn.Module):
@@ -540,39 +591,9 @@ class MiniMaxM3DenseAttentionForVllm(nn.Module):
         positions: Optional[torch.Tensor],
         qkv: Optional[torch.Tensor],
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        if (
-            qkv is not None
-            and positions is not None
-            and self.rotary_emb is not None
-            and self.q_norm is not None
-            and self.k_norm is not None
-        ):
-            try:
-                from atom.models.minimax_m3 import _minimax_m3_cos_sin_cache
-
-                aiter.fused_qknorm_idxrqknorm(
-                    qkv,
-                    self.q_norm.weight,
-                    self.k_norm.weight,
-                    _minimax_m3_cos_sin_cache(self.rotary_emb, qkv),
-                    positions,
-                    self.num_heads,
-                    self.num_kv_heads,
-                    self.rotary_emb.rotary_dim,
-                    self.q_norm.variance_epsilon,
-                    num_index_heads=0,
-                )
-                return tuple(
-                    tensor.contiguous()
-                    for tensor in qkv.split(
-                        [self.q_size, self.kv_size, self.kv_size], dim=-1
-                    )
-                )
-            except (AttributeError, RuntimeError):
-                # Fall back to the explicit MiniMax-M3 QK-norm/RoPE path below
-                # when the fused vLLM op or a required attribute is unavailable.
-                pass
-
+        # The dense fused qknorm/rope preproc mutates qkv in-place and is not
+        # graph-replay safe for MiniMax-M3; keep this path explicit.
+        del qkv
         query = query.contiguous().view(-1, self.num_heads, self.head_dim)
         key = key.contiguous().view(-1, self.num_kv_heads, self.head_dim)
 

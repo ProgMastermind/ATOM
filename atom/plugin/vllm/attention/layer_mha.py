@@ -12,9 +12,7 @@ from atom.model_ops.base_attention import (
     run_pa_decode_gluon,
     run_pa_fwd_asm,
 )
-from atom.plugin.vllm.attention.backend import (
-    AiterMhaBackendForVllm,
-)
+from atom.plugin.vllm.attention.backend import AiterMhaBackendForVllm
 from atom.plugin.vllm.attention.layer_common import (
     _register_vllm_static_forward_context,
 )
