@@ -2120,7 +2120,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         # consumes directly. Independent of the non-AR fuse_input_norm_quant path.
         qkv_proj = getattr(self.self_attn, "fused_qkv_a_proj", None)
         input_norm_fused_quant = (
-            qkv_proj is not None
+            not self.self_attn.is_v32
+            and qkv_proj is not None
             and qkv_proj.params_dtype == dtypes.fp8
             and qkv_proj.quant_type.value
             in (QuantType.per_1x128.value, QuantType.per_Token.value)
