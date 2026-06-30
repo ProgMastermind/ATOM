@@ -794,13 +794,10 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         )
         gfx = get_gfx()
         self.is_gfx1250 = gfx == "gfx1250"
-        # gfx1250 grouped a8w4 MoE kernel only supports the non-interleaved
-        # (gate|up separated) scale layout; reject is_guinterleave up front.
-        if self.is_gfx1250 and self.is_guinterleave:
-            raise NotImplementedError(
-                "gfx1250 MoE only supports is_guinterleave=False; "
-                "unset ATOM_MOE_GU_ITLV."
-            )
+        # gfx1250 grouped MoE kernel supports both SEPARATED (gguu) and
+        # INTERLEAVE (gugu) stage1 layouts. is_guinterleave is honored end to
+        # end: shuffle_weight / shuffle_scale_n32k4 interleave the gate/up rows
+        # when True, and apply() forwards GateMode.INTERLEAVE to the kernel.
         if envs.is_set("ATOM_USE_TRITON_MOE"):
             self.use_triton = envs.ATOM_USE_TRITON_MOE
         else:
