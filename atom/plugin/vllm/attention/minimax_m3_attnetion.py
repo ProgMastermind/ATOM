@@ -21,17 +21,14 @@ from atom.plugin.vllm.attention.backend import (
     MiniMaxM3SparseAttentionBackend,
     SparseMHAIndexerBackend,
 )
-from atom.plugin.vllm.attention.layer_common import _register_vllm_static_forward_context
+from atom.plugin.vllm.attention.layer_common import (
+    _register_vllm_static_forward_context,
+)
 from atom.utils import mark_spliting_op
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.attention import Attention as VllmAttention
 
-try:
-    from vllm.compilation.breakable_cudagraph import eager_break_during_capture
-except ImportError:
-    def eager_break_during_capture(fn):
-        return fn
 
 def minimax_m3_sparse_attention_fake(
     qkv: torch.Tensor,
@@ -121,6 +118,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
     backend modules here: that model directory is not part of the long-term ATOM
     backend surface.
     """
+
     is_indexed_sparse_attention = True
 
     def __init__(
@@ -210,7 +208,9 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         if index_q_norm is None or index_k_norm is None:
             raise ValueError("MiniMax-M3 sparse attention requires index norms.")
         if index_head_dim <= 0 or index_q_size <= 0 or topk <= 0:
-            raise ValueError("MiniMax-M3 sparse attention requires index dimensions/topk.")
+            raise ValueError(
+                "MiniMax-M3 sparse attention requires index dimensions/topk."
+            )
 
         self.index_cache_layer = MiniMaxM3SparseIndexerCache(
             layer_name=f"{self.layer_name}.index_cache",
@@ -447,7 +447,6 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             )
         return output
 
-    @eager_break_during_capture
     def _forward_with_output(
         self,
         qkv: torch.Tensor,
@@ -575,41 +574,29 @@ class MiniMaxM3DenseAttentionForVllm(nn.Module):
         if process is not None:
             process(act_dtype)
 
-    def _split_qkv(self, query, key, value, qkv):
-        if qkv is None:
-            return query, key, value
+    def _qk_norm_rope(
+        self,
+        qkv: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        from atom.models.minimax_m3 import _minimax_m3_cos_sin_cache
+
+        qkv = qkv.contiguous()
+        aiter.fused_qknorm_idxrqknorm(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            _minimax_m3_cos_sin_cache(self.rotary_emb, qkv),
+            positions,
+            self.num_heads,
+            self.num_kv_heads,
+            self.rotary_emb.rotary_dim,
+            self.q_norm.variance_epsilon,
+            num_index_heads=0,
+        )
         return tuple(
             tensor.contiguous()
             for tensor in qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
-        )
-
-    def _qk_norm_rope(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        positions: Optional[torch.Tensor],
-        qkv: Optional[torch.Tensor],
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-        # The dense fused qknorm/rope preproc mutates qkv in-place and is not
-        # graph-replay safe for MiniMax-M3; keep this path explicit.
-        del qkv
-        query = query.contiguous().view(-1, self.num_heads, self.head_dim)
-        key = key.contiguous().view(-1, self.num_kv_heads, self.head_dim)
-
-        if self.q_norm is not None:
-            query = self.q_norm(query)
-        if self.k_norm is not None:
-            key = self.k_norm(key)
-        if self.rotary_emb is not None:
-            if positions is None:
-                raise ValueError("positions is required for MiniMax-M3 RoPE.")
-            query, key = self.rotary_emb(positions, query, key)
-
-        return (
-            query.reshape(-1, self.q_size),
-            key.reshape(-1, self.kv_size),
-            value.reshape(-1, self.kv_size),
         )
 
     def forward(
@@ -622,7 +609,6 @@ class MiniMaxM3DenseAttentionForVllm(nn.Module):
         qkv: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> torch.Tensor:
-        del q_scale, kwargs
-        query, key, value = self._split_qkv(query, key, value, qkv)
-        query, key, value = self._qk_norm_rope(query, key, value, positions, qkv)
+        del query, key, value, q_scale, kwargs
+        query, key, value = self._qk_norm_rope(qkv, positions)
         return self.attn(query, key, value)

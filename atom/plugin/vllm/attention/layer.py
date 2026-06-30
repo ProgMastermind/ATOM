@@ -9,7 +9,6 @@ from atom.plugin.vllm.attention.layer_mla import (
 )
 from atom.plugin.vllm.attention import ops as _atom_vllm_attention_ops  # noqa: F401
 
-
 _MINIMAX_M3_MODEL_TYPES = {"minimax_m3", "minimax_m3_text", "minimax_m3_vl"}
 
 
