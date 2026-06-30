@@ -81,4 +81,5 @@ class AttentionForVllm:
             )
 
             return MiniMaxM3DenseAttentionForVllm(*args, **kwargs)
-        return AttentionForVllmMHA.create(*args, **kwargs)
+        kwargs.pop("impl_cls", None)
+        return AttentionForVllmMHA(*args, **kwargs)

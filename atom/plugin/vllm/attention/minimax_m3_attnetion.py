@@ -17,12 +17,66 @@ from aiter import dtypes
 from torch import nn
 
 from atom.config import get_current_atom_config
-from atom.plugin.vllm.attention.backend import SparseMHAPagedAttentionBackend
+from atom.plugin.vllm.attention.backend import (
+    MiniMaxM3SparseAttentionBackend,
+    SparseMHAIndexerBackend,
+)
 from atom.plugin.vllm.attention.layer_common import _register_vllm_static_forward_context
-from atom.plugin.vllm.attention.layer_mha import SparseMHAIndexerCache
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.attention import Attention as VllmAttention
+
+
+class MiniMaxM3SparseIndexerCache(nn.Module, AttentionLayerBase):
+    """Key-only index cache owned by MiniMax-M3 sparse attention."""
+
+    def __init__(
+        self,
+        *,
+        layer_name: str,
+        head_dim: int,
+        kv_cache_dtype: str,
+    ) -> None:
+        from vllm.v1.attention.backend import AttentionType
+        from vllm.utils.torch_utils import kv_cache_dtype_str_to_dtype
+
+        super().__init__()
+        atom_config = get_current_atom_config()
+        vllm_config = atom_config.plugin_config.vllm_config
+        self.layer_name = layer_name
+        self.prefix = layer_name
+        self.attn_type = AttentionType.DECODER
+        self.attn_backend = SparseMHAIndexerBackend
+        self.kv_cache_dtype = kv_cache_dtype
+        self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
+            kv_cache_dtype, vllm_config.model_config
+        )
+        self.num_kv_heads = 1
+        self.head_size = head_dim
+        self.head_size_v = head_dim
+        self.sliding_window = -1
+        self.kv_cache = torch.tensor([])
+        _register_vllm_static_forward_context(self)
+
+    @property
+    def impl(self):
+        return self
+
+    def get_attn_backend(self):
+        return self.attn_backend
+
+    def get_kv_cache_spec(self, vllm_config):
+        from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+        return MLAAttentionSpec(
+            block_size=vllm_config.cache_config.block_size,
+            num_kv_heads=1,
+            head_size=self.head_size,
+            dtype=self.kv_cache_torch_dtype,
+        )
+
+
+AttentionLayerBase.register(MiniMaxM3SparseIndexerCache)
 
 
 class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
@@ -80,7 +134,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             cache_config.cache_dtype if cache_config is not None else kv_cache_dtype
         )
         self.layer_name = prefix if prefix is not None else f"M3_SPARSE_{layer_num}"
-        self.attn_backend = SparseMHAPagedAttentionBackend
+        self.attn_backend = MiniMaxM3SparseAttentionBackend
         self.kv_cache_dtype = cache_dtype
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             cache_dtype, atom_config.plugin_config.vllm_config.model_config
@@ -124,7 +178,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         if index_head_dim <= 0 or index_q_size <= 0 or topk <= 0:
             raise ValueError("MiniMax-M3 sparse attention requires index dimensions/topk.")
 
-        self.index_cache_layer = SparseMHAIndexerCache(
+        self.index_cache_layer = MiniMaxM3SparseIndexerCache(
             layer_name=f"{self.layer_name}.index_cache",
             head_dim=index_head_dim,
             kv_cache_dtype="auto",
@@ -494,30 +548,26 @@ class MiniMaxM3DenseAttentionForVllm(nn.Module):
             and self.k_norm is not None
         ):
             try:
-                from vllm import _custom_ops as ops
+                from atom.models.minimax_m3 import _minimax_m3_cos_sin_cache
 
-                fused_op = getattr(ops, "fused_minimax_m3_qknorm_rope_kv_insert", None)
-                if fused_op is not None:
-                    from atom.models.minimax_m3 import _minimax_m3_cos_sin_cache
-
-                    fused_op(
-                        qkv,
-                        self.q_norm.weight,
-                        self.k_norm.weight,
-                        _minimax_m3_cos_sin_cache(self.rotary_emb, qkv),
-                        positions,
-                        self.num_heads,
-                        self.num_kv_heads,
-                        self.rotary_emb.rotary_dim,
-                        self.q_norm.variance_epsilon,
-                        kv_cache_dtype="auto",
+                aiter.fused_qknorm_idxrqknorm(
+                    qkv,
+                    self.q_norm.weight,
+                    self.k_norm.weight,
+                    _minimax_m3_cos_sin_cache(self.rotary_emb, qkv),
+                    positions,
+                    self.num_heads,
+                    self.num_kv_heads,
+                    self.rotary_emb.rotary_dim,
+                    self.q_norm.variance_epsilon,
+                    num_index_heads=0,
+                )
+                return tuple(
+                    tensor.contiguous()
+                    for tensor in qkv.split(
+                        [self.q_size, self.kv_size, self.kv_size], dim=-1
                     )
-                    return tuple(
-                        tensor.contiguous()
-                        for tensor in qkv.split(
-                            [self.q_size, self.kv_size, self.kv_size], dim=-1
-                        )
-                    )
+                )
             except (AttributeError, RuntimeError):
                 # Fall back to the explicit MiniMax-M3 QK-norm/RoPE path below
                 # when the fused vLLM op or a required attribute is unavailable.

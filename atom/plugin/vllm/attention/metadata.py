@@ -400,7 +400,7 @@ class AiterMlaSparseMetadataForVllm:
 
 
 @dataclass
-class SparseMHAPrefillMetadata:
+class MinimaxM3SparsePrefillMetadata:
     qo_indptr: torch.Tensor
     cu_seqlens_q: torch.Tensor
     seq_lens: torch.Tensor
@@ -411,14 +411,14 @@ class SparseMHAPrefillMetadata:
 
 
 @dataclass
-class SparseMHADecodeMetadata:
+class MinimaxM3SparseDecodeMetadata:
     seq_lens: torch.Tensor
     block_table: torch.Tensor
     max_query_len: int = 1
 
 
 @dataclass
-class SparseMHAMetadata:
+class MinimaxM3SparseMetadata:
     seq_lens: torch.Tensor
     max_seq_len: int
     slot_mapping: torch.Tensor
@@ -429,11 +429,11 @@ class SparseMHAMetadata:
     num_prefill_tokens: int
     block_table: torch.Tensor
     max_query_len: int
-    prefill: SparseMHAPrefillMetadata | None = None
-    decode: SparseMHADecodeMetadata | None = None
+    prefill: MinimaxM3SparsePrefillMetadata | None = None
+    decode: MinimaxM3SparseDecodeMetadata | None = None
 
 
-class SparseMHAPagedAttentionMetadataBuilder(AttentionMetadataBuilder):
+class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
     _cudagraph_support = AttentionCGSupport.UNIFORM_BATCH
     reorder_batch_threshold = 1
 
@@ -447,7 +447,7 @@ class SparseMHAPagedAttentionMetadataBuilder(AttentionMetadataBuilder):
     ):
         del model_runner
         super().__init__(kv_cache_spec, layer_names, config, device)
-        logger.info("init SparseMHAPagedAttentionMetadataBuilder")
+        logger.info("init MinimaxM3SparseAttentionMetadataBuilder")
         from vllm.config import VllmConfig
 
         assert isinstance(config, VllmConfig)
@@ -491,7 +491,7 @@ class SparseMHAPagedAttentionMetadataBuilder(AttentionMetadataBuilder):
         seq_lens = common_attn_metadata.seq_lens
         block_table = common_attn_metadata.block_table_tensor
 
-        prefill_metadata: SparseMHAPrefillMetadata | None = None
+        prefill_metadata: MinimaxM3SparsePrefillMetadata | None = None
         if num_prefills_total > 0:
             # MiniMax-M3 sparse attention uses the prefill kernel for any mixed
             # decode+prefill batch, because it builds per-token causal sparse
@@ -535,7 +535,7 @@ class SparseMHAPagedAttentionMetadataBuilder(AttentionMetadataBuilder):
             qo_indptr = torch.arange(
                 num_prefill_tokens + 1, dtype=torch.int32, device=seq_lens.device
             )
-            prefill_metadata = SparseMHAPrefillMetadata(
+            prefill_metadata = MinimaxM3SparsePrefillMetadata(
                 qo_indptr=qo_indptr,
                 cu_seqlens_q=prefill_query_start,
                 seq_lens=prefill_seq_lens,
@@ -545,20 +545,20 @@ class SparseMHAPagedAttentionMetadataBuilder(AttentionMetadataBuilder):
                 max_seq_len=prefill_max_seq_len,
             )
 
-        decode_metadata: SparseMHADecodeMetadata | None = None
+        decode_metadata: MinimaxM3SparseDecodeMetadata | None = None
         if num_decodes > 0:
             query_lens_cpu = (
                 common_attn_metadata.query_start_loc_cpu[1:]
                 - common_attn_metadata.query_start_loc_cpu[:-1]
             )
             decode_max_query_len = int(query_lens_cpu[:num_decodes].max().item())
-            decode_metadata = SparseMHADecodeMetadata(
+            decode_metadata = MinimaxM3SparseDecodeMetadata(
                 seq_lens=seq_lens[:num_decodes],
                 block_table=block_table[:num_decodes],
                 max_query_len=decode_max_query_len,
             )
 
-        return SparseMHAMetadata(
+        return MinimaxM3SparseMetadata(
             seq_lens=seq_lens,
             max_seq_len=common_attn_metadata.max_seq_len,
             slot_mapping=common_attn_metadata.slot_mapping,

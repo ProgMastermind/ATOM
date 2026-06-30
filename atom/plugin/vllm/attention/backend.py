@@ -303,7 +303,7 @@ class AiterSparseMlaIndexerBackendForVllm(AiterMlaBackendForVllm):
         return (cls.__module__, cls.__qualname__)
 
 
-class SparseMHAPagedAttentionBackend:
+class MiniMaxM3SparseAttentionBackend:
     """vLLM-facing sparse MHA backend surface for MiniMax-M3."""
 
     accept_output_buffer: bool = True
@@ -348,10 +348,10 @@ class SparseMHAPagedAttentionBackend:
     @staticmethod
     def get_builder_cls() -> Type:
         from atom.plugin.vllm.attention.metadata import (
-            SparseMHAPagedAttentionMetadataBuilder,
+            MinimaxM3SparseAttentionMetadataBuilder,
         )
 
-        return SparseMHAPagedAttentionMetadataBuilder
+        return MinimaxM3SparseAttentionMetadataBuilder
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
@@ -399,11 +399,11 @@ class SparseMHAPagedAttentionBackend:
 
     @staticmethod
     def get_impl_cls():
-        from atom.plugin.vllm.attention.layer_mha import (
-            SparseMHAPagedAttentionImplForVllm,
+        from atom.plugin.vllm.attention.minimax_m3_attnetion import (
+            MiniMaxM3SparseAttentionForVllm,
         )
 
-        return SparseMHAPagedAttentionImplForVllm
+        return MiniMaxM3SparseAttentionForVllm
 
     @classmethod
     def full_cls_name(cls) -> tuple[str, str]:
@@ -428,10 +428,10 @@ class SparseMHAIndexerBackend(AiterMlaBackendForVllm):
     @staticmethod
     def get_builder_cls() -> Type:
         from atom.plugin.vllm.attention.metadata import (
-            SparseMHAPagedAttentionMetadataBuilder,
+            MinimaxM3SparseAttentionMetadataBuilder,
         )
 
-        return SparseMHAPagedAttentionMetadataBuilder
+        return MinimaxM3SparseAttentionMetadataBuilder
 
     @classmethod
     def get_supported_head_sizes(cls) -> list[int]:
