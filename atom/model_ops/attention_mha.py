@@ -1261,12 +1261,36 @@ class SparseMHAPagedAttentionImpl(PagedAttentionImpl):
             return None
         return entry["value"]
 
+    def _persist_topk_value(self, value: tuple) -> tuple:
+        # Skip layers reuse this (topk_idx, sparse_bt, sparse_ctx) after the
+        # CUDAGraph-captured layers in between, but the kernel's torch.empty
+        # outputs are not stable across that boundary. Copy into per-impl
+        # persistent buffers (one per shape, held on self) so the reuse reads a
+        # fixed address.
+        bufs = getattr(self, "_persist_topk_buffers", None)
+        if bufs is None:
+            bufs = {}
+            self._persist_topk_buffers = bufs
+        out = []
+        for i, t in enumerate(value):
+            if t is None:
+                out.append(None)
+                continue
+            bkey = (i, tuple(t.shape), t.dtype)
+            buf = bufs.get(bkey)
+            if buf is None:
+                buf = torch.empty_like(t)
+                bufs[bkey] = buf
+            buf.copy_(t)
+            out.append(buf)
+        return tuple(out)
+
     def _store_cached_topk(self, sparse_metadata, key: tuple, value: tuple):
         state = self._topk_cache_state(sparse_metadata)
         if state is not None:
             state["topk"] = {
                 "key": key,
-                "value": value,
+                "value": self._persist_topk_value(value),
                 "layer_num": self.layer_num,
                 "sparse_layer_ordinal": self.sparse_layer_ordinal,
             }
