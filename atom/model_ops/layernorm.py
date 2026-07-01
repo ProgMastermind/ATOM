@@ -15,7 +15,6 @@ from aiter import (
 from aiter.dist.communication_op import (
     tensor_model_parallel_fused_allreduce_rmsnorm,
     tensor_model_parallel_fused_allreduce_rmsnorm_quant,
-    tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group,
 )
 from aiter.dist.parallel_state import get_tensor_model_parallel_world_size
 from aiter.jit.utils.torch_guard import torch_compile_guard
@@ -348,26 +347,17 @@ class RMSNorm(nn.Module):
                 _QV_PER_1X128,
                 _QV_PER_TOKEN,
             ), "Unsupported quant type for fused allreduce rmsnorm quant"
-            if self.quant_type.value == _QV_PER_1X128:
-                x, residual, x_scale = (
-                    tensor_model_parallel_fused_allreduce_rmsnorm_quant_per_group(
-                        x.contiguous(),
-                        residual,
-                        self.weight,
-                        self.eps,
-                        group_size=128,
-                        transpose_scale=self._aiter_transpose_scale,
-                    )
-                )
-            else:  # _QV_PER_TOKEN
-                x, residual, x_scale = (
-                    tensor_model_parallel_fused_allreduce_rmsnorm_quant(
-                        x.contiguous(),
-                        residual,
-                        self.weight,
-                        self.eps,
-                    )
-                )
+            # Unified kernel: `quant_type` selects the epilogue (per-token vs
+            # per-group); group_size / transpose_scale apply to per-group only.
+            x, residual, x_scale = tensor_model_parallel_fused_allreduce_rmsnorm_quant(
+                x.contiguous(),
+                residual,
+                self.weight,
+                self.eps,
+                quant_type=self.quant_type,
+                group_size=128,
+                transpose_scale=self._aiter_transpose_scale,
+            )
             return (x, x_scale), residual
         if self.fused_allreduce and self.tp_size > 1:
             assert (
