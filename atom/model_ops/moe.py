@@ -1872,9 +1872,11 @@ class Int8MoEMethod(FusedMoEMethodBase):
         assert (
             activation == ActivationType.Silu
         ), "Int8MoEMethod only supports SiLU-gated experts"
-        from atom.model_ops.fused_moe_triton import triton_kernel_int8_moe_forward
+        from aiter.ops.triton.moe.moe_op_gemm_int8_smoothquant import (
+            fused_moe_int8_smoothquant,
+        )
 
-        return triton_kernel_int8_moe_forward(
+        return fused_moe_int8_smoothquant(
             hidden_states=x,
             w13=layer.w13_weight,
             w2=layer.w2_weight,
