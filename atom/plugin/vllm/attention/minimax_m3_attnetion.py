@@ -378,7 +378,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         positions: torch.Tensor,
         main_metadata,
         index_metadata,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, object, object]:
         from atom.models.minimax_m3 import _minimax_m3_cos_sin_cache
 
         if self.kv_cache.numel() == 0 or self.index_cache_layer.kv_cache.numel() == 0:
@@ -386,6 +386,10 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             return (
                 qkv.new_zeros((num_tokens, self.q_size)),
                 qkv.new_zeros((num_tokens, self.index_q_size)),
+                self.kv_cache,
+                self.kv_cache,
+                None,
+                None,
             )
 
         qkv = qkv.contiguous()
@@ -424,7 +428,7 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
             v_scale=v_scale if self.kv_cache_dtype == "fp8" else None,
             asm_layout=True,
         )
-        return q_out, index_q
+        return q_out, index_q, k_cache, v_cache, k_scale, v_scale
 
     def _topk_cache_key(self, phase: str, index_q: torch.Tensor, metadata) -> tuple:
         return (
@@ -609,14 +613,15 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         query: torch.Tensor,
         index_q: torch.Tensor,
         output: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        k_scale,
+        v_scale,
         main_metadata,
         index_metadata,
     ) -> torch.Tensor:
         q = query.view(-1, self.num_heads, self.head_dim)
         out = output.view(-1, self.num_heads, self.head_dim)
-        k_cache, v_cache, k_scale, v_scale = (
-            self._page16_shuffle_cache_for_sparse_kernel()
-        )
         self._run_decode_sparse_attention(
             q,
             index_q,
@@ -662,16 +667,22 @@ class MiniMaxM3SparseAttentionForVllm(nn.Module, AttentionLayerBase):
         self._validate_bound_sparse_state(main_metadata, index_metadata)
         if self.kv_cache.numel() == 0 or self.index_cache_layer.kv_cache.numel() == 0:
             return output.fill_(0)
-        q_actual, index_q = self._insert_qkv_and_index(
-            qkv[:actual_tokens],
-            positions[:actual_tokens],
-            main_metadata,
-            index_metadata,
+        q_actual, index_q, k_cache, v_cache, k_scale, v_scale = (
+            self._insert_qkv_and_index(
+                qkv[:actual_tokens],
+                positions[:actual_tokens],
+                main_metadata,
+                index_metadata,
+            )
         )
         output[:actual_tokens] = self._run_sparse_attention(
             q_actual,
             index_q,
             output[:actual_tokens],
+            k_cache,
+            v_cache,
+            k_scale,
+            v_scale,
             main_metadata,
             index_metadata,
         )
