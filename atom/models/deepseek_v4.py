@@ -2055,7 +2055,7 @@ class DeepseekV4Attention(nn.Module):
                     self.unified_kv,
                     kv_indices_prefix,
                     kv_indptr_prefix,
-                    kv_ful,
+                    kv_full,
                     attn_md.kv_indices_extend,
                     attn_md.kv_indptr_extend,
                     self.attn_sink,
