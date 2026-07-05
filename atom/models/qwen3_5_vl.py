@@ -20,7 +20,7 @@ import torch.nn.functional as F
 # tiles head_dim into 5x16=80 (vs padding to 128) -> ~24 TFLOPS, ~20x over SDPA.
 # On gfx9/CDNA SDPA already has a fast flash backend, so keep SDPA there.
 try:
-    from atom.model_ops.vit_attention import vit_flash_attn
+    from aiter.ops.triton.attention.vit_flash_attn import vit_flash_attn
     from atom.utils.arch import aiter_hip_kernels_supported
 
     _USE_TRITON_VIT_ATTN = not aiter_hip_kernels_supported()
