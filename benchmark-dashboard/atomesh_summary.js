@@ -1,0 +1,2 @@
+window.ATOMESH_RUN_URL = "https://github.com/ROCm/ATOM/actions/runs/28723952270";
+window.ATOMESH_SUMMARY_MARKDOWN = "### ATOMesh Model Performance Benchmark Summary\n\n| Model | Topology | ISL/OSL | Concurrency | Interactivity | Total tok/s | Input tok/s | Output tok/s | Total tok/s/GPU | Input tok/s/GPU | Output tok/s/GPU | TTFT ms | TPOT ms | E2E ms | GSM8K |\n| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |\n";
