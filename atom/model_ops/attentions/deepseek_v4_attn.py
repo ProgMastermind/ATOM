@@ -2530,17 +2530,18 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         buffers in `forward_vars`. Replay-time prepare_decode writes into the
         SAME buffers — captured graph reads stable addresses.
 
-        NOTE on dynamic-shape kernels (`update_compressor_states` / `swa_write`):
-        these currently use variable kernel grids (`grid=(num_compress,)`),
-        which CUDAGraph capture rejects. A follow-up PR converts them to fixed
-        grid + sentinel masking. Until then, capture itself can succeed (the
-        helpers run on CPU + small H2D), but model.forward inside torch.cuda.graph
-        will likely fail at the first such kernel launch — the user can detect
-        this via capture log output. (`fused_compress_attn` is already
-        CG-safe: launches at the decode-tight slice
-        (`_decode_compress_cap[ratio]`, baked at capture) and
-        sentinel-skips inactive rows internally for both BF16 Main and FP8
-        Indexer paths.)
+        NOTE on the state-write kernels (`update_compressor_states` /
+        `swa_write`): both are now FIXED-grid + sentinel-masked, so they are
+        CUDAGraph-capturable (level-3 default). `swa_write` launches
+        grid=(bs, write_per_batch) with bs baked at capture and write_per_batch a
+        `constexpr`; rows past each seq's actual token count sentinel-skip.
+        `update_compressor_states` launches grid=(write_plan.shape[0],) — the
+        plan-buffer capacity fixed at builder init, NOT the per-fwd num_write —
+        and inactive rows carry `position=-1` and bail (see state_writes.py). So
+        model.forward inside torch.cuda.graph does NOT hit a variable-grid launch
+        here. (`fused_compress_attn` is likewise CG-safe: launches at the
+        decode-tight slice `_decode_compress_cap[ratio]` baked at capture and
+        sentinel-skips inactive rows for both BF16 Main and FP8 Indexer paths.)
         """
         var = self.model_runner.forward_vars
         # Honor MTP at capture time: V4-Pro `mtp_k=1` → 2 tokens/req. The
