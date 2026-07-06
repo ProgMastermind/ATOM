@@ -129,7 +129,6 @@ def _index_block_score_kernel(
         order=(1, 0),
     )
     q = tl.load(q_ptrs, boundary_check=(0,), padding_option="zero")
-    q_f32 = q.to(tl.float32)
     q_start = prefix_len + pid_q * BLOCK_SIZE_Q
 
     off_q = tl.arange(0, BLOCK_SIZE_Q) + pid_q * BLOCK_SIZE_Q + prefix_len
@@ -154,8 +153,7 @@ def _index_block_score_kernel(
             + off_d[:, None] * stride_ik_d,
         )
         if k.dtype.is_fp8():
-            k = k.to(tl.float32)
-            qk = tl.dot(q_f32, k, out_dtype=tl.float32) * sm_scale_log2e
+            qk = tl.dot(q.to(k.dtype), k, out_dtype=tl.float32) * sm_scale_log2e
         else:
             qk = tl.dot(q, k, out_dtype=tl.float32) * sm_scale_log2e
         # apply causal mask as needed
