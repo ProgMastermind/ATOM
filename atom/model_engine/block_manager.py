@@ -101,6 +101,19 @@ class BlockManager:
         # full-length, so admission gates on the per-request windowed peak
         # rather than the whole prompt. Mirrors vLLM max_admission_blocks.
         self.max_num_batched_tokens: int = getattr(config, "max_num_batched_tokens", 0)
+        # SWA prefix-cache hit gate: a hit only needs the trailing window before
+        # the boundary to be SWA-present (SWA is local); the compressed prefix
+        # gate stays full-length. `swa_tail_blocks` = contiguous blocks that must
+        # cover that window, using win_with_spec = window + mtp_k (spec-decode
+        # tail tokens reach back further; see scheduler win_with_spec).
+        _spec = getattr(config, "speculative_config", None)
+        _mtp_k = int(getattr(_spec, "num_speculative_tokens", 0) or 0) if _spec else 0
+        _win_with_spec = self.swa_window + _mtp_k
+        self.swa_tail_blocks: int = (
+            max(1, (_win_with_spec - 1 + block_size - 1) // block_size)
+            if self.swa_window > 0
+            else 0
+        )
         self.swa_blocks: list[Block] = [Block(i) for i in range(num_swa_blocks)]
         self.swa_hash_to_block_id: dict[int, int] = dict()
         self.swa_free_block_ids: deque[int] = deque(range(num_swa_blocks))
@@ -145,6 +158,39 @@ class BlockManager:
         span = max(0, self.swa_window - 1) + max(self.max_num_batched_tokens, bs)
         cap = (span + bs - 1) // bs + 1
         return min(cap, seq.num_blocks)
+
+    def _swa_bounded_hit(self, seq: Sequence, P: int, block_hashes: list[int]) -> int:
+        """SWA prefix-cache gate (vLLM SlidingWindowManager, simple-hybrid one
+        pass). Given the compressed prefix length `P` and each block's content
+        hash, return the largest boundary `L <= P` whose trailing window
+        `[L - swa_tail_blocks, L)` is fully SWA-present — scanning right-to-left
+        and stopping at the first (rightmost) complete window. Blocks before that
+        window are out of the sliding window (never read by the resumed forward),
+        so their SWA absence does NOT shorten the hit; `allocate()` marks them -1.
+
+        Bounding the scan by `P` (only blocks the compressed match also covered)
+        guarantees the returned `L` satisfies BOTH compressed[0,L) present and
+        SWA[L-window,L) present — the boundary can never land on a block whose
+        in-window SWA is missing (#1417).
+
+        Falls through to the length of a contiguous run ending at block 0 (0 if
+        block 0 is absent): this covers short prompts (P < swa_tail_blocks, whole
+        prefix within one window) and vLLM's partial-hit case; the boundary's
+        window then spans [0, L) which is present, so it stays safe.
+        """
+        if not self.swa_enabled:
+            return P
+        need = self.swa_tail_blocks
+        num_contig = 0
+        for i in range(P - 1, -1, -1):
+            swa_id = self.swa_hash_to_block_id.get(block_hashes[i], -1)
+            if swa_id != -1 and self.swa_blocks[swa_id].token_ids == seq.block(i):
+                num_contig += 1
+                if num_contig >= need:
+                    return i + num_contig  # rightmost complete window → boundary
+            else:
+                num_contig = 0
+        return num_contig  # short prompt / partial front run (window spans [0,L))
 
     def _free_swa_out_of_window(self, seq: Sequence, seq_len: int | None = None):
         """M2 brick-2: release SWA blocks that have fallen fully behind the
@@ -323,27 +369,33 @@ class BlockManager:
                 if len(self.swa_free_block_ids_set) < swa_need:
                     return -1
             return 0
+        # Step 1: compressed prefix (CSA/HCA/indexer share the block hash and
+        # read the WHOLE history, so this stays a full front-to-back chained
+        # match). Record each block's hash for the SWA scan below.
         h = -1
-        num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks
+        compressed_hit = 0
+        block_hashes: list[int] = []
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
             block_id = self.hash_to_block_id.get(h, -1)
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 break
-            # M2: intersect with the SWA pool — a compressed hit is only usable
-            # if this block's SWA is ALSO still cached (the SWA pool evicts /
-            # window-frees independently). Stops the hit at the first block
-            # whose SWA is gone, so allocate() never reuses compressed-without-SWA.
-            if self.swa_enabled:
-                swa_id = self.swa_hash_to_block_id.get(h, -1)
-                if swa_id == -1 or self.swa_blocks[swa_id].token_ids != token_ids:
-                    break
-            num_cached_blocks += 1
-            # Hits on already-used blocks share refs; only free-pool hits
-            # consume a free slot (claimed inline in allocate()).
-            if block_id in self.used_block_ids:
+            block_hashes.append(h)
+            compressed_hit += 1
+        # Step 2: SWA only needs the trailing window before the boundary to be
+        # present (SWA is local). Scan right-to-left within the compressed prefix
+        # for the largest boundary whose window is SWA-cached (vLLM
+        # SlidingWindowManager; simple-hybrid one pass). Reduces compressed_hit
+        # → num_cached_blocks so we never reuse a block whose in-window SWA is
+        # gone (#1417), while out-of-window front blocks (SWA-freed) don't block
+        # the hit.
+        num_cached_blocks = self._swa_bounded_hit(seq, compressed_hit, block_hashes)
+        # Free-pool demand: blocks we actually reuse minus those already used
+        # (shared ref); blocks we drop from the hit become fresh → counted.
+        num_new_blocks = seq.num_blocks
+        for i in range(num_cached_blocks):
+            if self.hash_to_block_id[block_hashes[i]] in self.used_block_ids:
                 num_new_blocks -= 1
         if len(self.free_block_ids_set) < num_new_blocks:
             return -1
@@ -367,6 +419,13 @@ class BlockManager:
         a hash until fully filled.
         """
         assert not seq.block_table
+        # SWA tail-gate: only the trailing window before the hit boundary is
+        # SWA-reused; earlier blocks are out of window (never read by the resumed
+        # forward) → mark -1 (matches _swa_bounded_hit; keeps swa_block_table
+        # aligned with block_table). swa_hit_start == boundary - swa_tail_blocks
+        # on a full-window hit, and 0 on a short/partial hit (whole prefix in
+        # one window → all present, all claimed).
+        swa_hit_start = max(0, num_cached_blocks - self.swa_tail_blocks)
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)
@@ -385,7 +444,10 @@ class BlockManager:
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
             if self.swa_enabled:
-                self._allocate_swa_for_cached(h, token_ids, seq)
+                if i < swa_hit_start:
+                    seq.swa_block_table.append(-1)  # out of window: never read
+                else:
+                    self._allocate_swa_for_cached(h, token_ids, seq)
         for _ in range(num_cached_blocks, seq.num_blocks):
             block_id = self._pop_free_block()
             self._allocate_block(block_id)

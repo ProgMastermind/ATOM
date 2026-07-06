@@ -465,42 +465,13 @@ class Scheduler:
             CacheStats() if config.enable_prefix_caching else None
         )
         self.enable_chunked_prefill = config.enable_chunked_prefill
-        # V4 SWA correctness on a prefix-cache hit. V4's sliding-window state is
-        # a per-request ring (NOT shared across blocks), so on a hit the new
-        # request's ring is empty and a tail token whose SWA window reaches back
-        # into the cached region would read garbage. Fix: pull the forward start
-        # back by enough whole blocks that the last `window` cached tokens are
-        # re-forwarded, repopulating the ring. The compressed-KV hit (n_committed
-        # = context_len // ratio) is UNAFFECTED because context_lens =
-        # num_cached + num_scheduled is invariant under this shift. Only V4 needs
-        # this; 0 disables (e.g. once SWA gets per-block shared storage, "fix C").
-        # See docs / plan: V4 prefix cache fix B'.
-        # NOTE: V4 detection must use `architectures`, not `model_type` — the
-        # config registry maps "deepseek_v4" -> "deepseek_v3" so model_type
-        # reads as v3 (same reason config.py:1118 uses architectures).
-        self._v4_swa_warmup_blocks = 0
-        _hf = getattr(config, "hf_config", None)
-        _arches = getattr(_hf, "architectures", None) or []
-        _is_v4 = any("DeepseekV4" in str(a) for a in _arches)
-        if config.enable_prefix_caching and _is_v4:
-            import math as _math
-
-            window = int(getattr(_hf, "sliding_window", 128) or 128)
-            # The SWA ring's physical stride is `win_with_spec = window + mtp_k`
-            # (MTP draft tokens get their own ring slots). A tail token's window
-            # can reach back `win_with_spec - 1` ring slots, so the re-forwarded
-            # region must cover that many tokens — not just `window`. Verified:
-            # with mtp_k=1, rolling back only `window`(128) leaves the deepest
-            # reach-back (r=4) reading one stale slot -> DIVERGE.
-            mtp_k = (
-                config.speculative_config.num_speculative_tokens
-                if config.speculative_config is not None
-                else 0
-            )
-            win_with_spec = window + int(mtp_k or 0)
-            self._v4_swa_warmup_blocks = _math.ceil(
-                win_with_spec / self.block_manager.block_size
-            )
+        # V4 SWA correctness on a prefix-cache hit is now handled entirely in
+        # BlockManager: `_swa_bounded_hit` bounds the hit so the boundary's
+        # trailing window is SWA-present, and `allocate` marks out-of-window
+        # blocks -1. The old `_v4_swa_warmup_blocks` (re-forward the tail to
+        # repopulate the per-request ring) was a pre-paged-ring workaround and is
+        # removed — the paged content-addressed SWA pool reuses the tail window
+        # directly. See PLAN_swa_prefix_cache_tail_gate.md.
         # Number of running seqs currently mid-prefill (per-seq state lives in
         # `Sequence.is_partial_prefill`). Maintained as a counter so Phase 1
         # of `schedule()` can skip the running-queue scan entirely on
@@ -925,21 +896,13 @@ class Scheduler:
                 continue
 
             # Probe cache hits FIRST so budget check sees the real
-            # (post-prefix-cache) remaining token count.
+            # (post-prefix-cache) remaining token count. V4 SWA correctness is
+            # enforced inside can_allocate (_swa_bounded_hit bounds the hit to
+            # where the trailing-window SWA is present); no post-hoc warmup trim.
             num_cached_blocks = self.block_manager.can_allocate(seq)
             if num_cached_blocks < 0:
                 self.waiting.appendleft(seq)
                 break
-
-            # V4 SWA fix (B'): drop the last `_v4_swa_warmup_blocks` hit blocks so
-            # those tokens are re-forwarded, repopulating the per-request SWA
-            # ring (see __init__). Compressed-KV n_committed is unaffected
-            # (context_lens = cached + scheduled stays = prompt length). Only
-            # fires on a real hit (>0); a full miss is untouched.
-            if self._v4_swa_warmup_blocks and num_cached_blocks > 0:
-                num_cached_blocks = max(
-                    0, num_cached_blocks - self._v4_swa_warmup_blocks
-                )
 
             # Use num_tokens (not num_prompt_tokens) so preempted seqs re-forward
             # their decoded tokens — preempt() frees their KV blocks but keeps
