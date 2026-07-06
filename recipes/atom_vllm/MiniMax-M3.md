@@ -26,7 +26,7 @@ checkpoint path or the corresponding model id for `MODEL`.
 MODEL=/path/to/MiniMax-M3-MXFP8
 TP=4
 PORT=8001
-
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 vllm serve "${MODEL}" \
     --dtype auto \
     --load-format auto \
@@ -52,7 +52,7 @@ config:
 
 ```bash
 MODEL=/path/to/MiniMax-M3-MXFP4
-
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 vllm serve "${MODEL}" \
     --dtype auto \
     --load-format auto \
