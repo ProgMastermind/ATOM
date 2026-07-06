@@ -482,11 +482,6 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             raise ValueError("ATOM does not support cascade attention yet")
         assert common_attn_metadata is not None
 
-        # Plain decode can have many concurrent requests; each request contributes
-        # exactly one query token, so max_query_len stays 1.
-        if common_attn_metadata.max_query_len == 1:
-            return self._build_uniform_decode_metadata(common_attn_metadata)
-
         from vllm.v1.attention.backends.utils import (
             split_decodes_prefills_and_extends,
         )
@@ -502,6 +497,13 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             common_attn_metadata=common_attn_metadata,
             decode_threshold=getattr(self, "reorder_batch_threshold", 1) or 1,
         )
+
+        # Plain decode has max_query_len == 1, while MTP/spec decode verifies
+        # num_spec+1 tokens per request. Both should use the decode path, but only
+        # when the split says there are no prefill/extend requests in the batch.
+        if num_decodes > 0 and num_extends == 0 and num_prefills == 0:
+            return self._build_uniform_decode_metadata(common_attn_metadata)
+
         num_tokens = common_attn_metadata.num_actual_tokens
         num_prefills_total = num_extends + num_prefills
         num_prefill_tokens = num_tokens - num_decode_tokens
@@ -569,13 +571,14 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
 
         num_reqs = common_attn_metadata.num_reqs
         num_tokens = common_attn_metadata.num_actual_tokens
+        max_query_len = common_attn_metadata.max_query_len
         seq_lens = common_attn_metadata.seq_lens
         block_table = common_attn_metadata.block_table_tensor
 
         decode_metadata = MinimaxM3SparseDecodeMetadata(
             seq_lens=seq_lens[:num_reqs],
             block_table=block_table[:num_reqs],
-            max_query_len=1,
+            max_query_len=max_query_len,
         )
         return MinimaxM3SparseMetadata(
             seq_lens=seq_lens,
@@ -587,7 +590,7 @@ class MinimaxM3SparseAttentionMetadataBuilder(AttentionMetadataBuilder):
             num_prefills=0,
             num_prefill_tokens=0,
             block_table=block_table,
-            max_query_len=1,
+            max_query_len=max_query_len,
             prefill=None,
             decode=decode_metadata,
         )
