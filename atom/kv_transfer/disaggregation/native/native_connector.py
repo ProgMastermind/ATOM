@@ -3,28 +3,21 @@
 
 """Native single-node KV connector (HIP VMM, no third-party transport).
 
-A fully in-tree prefill/decode KV connector for the single-node (scale-up /
-XGMI) case. It depends only on the HIP Virtual Memory Management API
+In-tree prefill/decode KV connector for the single-node (scale-up / XGMI) case.
+Depends only on the HIP Virtual Memory Management API
 (:mod:`atom.kv_transfer.disaggregation.native.vmm`) — no MoRI, no Mooncake.
 
 Selected with ``--kv-transfer-config '{"kv_connector":"native", ...}'``.
 
-Data path (push, producer -> consumer):
-  * The consumer allocates a VMM "staging" buffer, exports its POSIX fd, and
-    sends it (plus the request's destination block ids) to the producer over a
-    UNIX side channel.
-  * The producer imports the consumer's staging (granting its own device
-    access), gathers the request's KV blocks straight into it over the fabric
-    (``hipMemcpy`` peer, i.e. XGMI), and replies WRITE_DONE.
-  * The consumer scatters from its staging into its KV pool locally.
-  No RDMA, no IPC-handle churn: one fd import per (consumer, producer) pair,
-  then direct device-to-device copies.
-
-Scope: this is the v1 connector body wiring the VMM primitive (validated by
-``tests/test_native_vmm_transfer.py``) into the KVConnector interface. Requests
-in a step are transferred sequentially; a concurrent staging pool and the
-DeepSeek-V4 slot/index regions are follow-ups. End-to-end 4P4D serving
-validation is tracked in ROCm/ATOM#1483.
+Data path (push, producer -> consumer), all staged through the consumer's VMM
+buffer so no model-side allocation change is required:
+  * The consumer allocates a VMM staging buffer per pending request, exports its
+    POSIX fd, and sends it (with the request's dst block ids / slot) to the
+    producer over a UNIX side channel.
+  * The producer imports the staging (granting its own device access), gathers
+    the request's KV blocks + SWA slots + compressor state into it over XGMI
+    (``hipMemcpy`` peer), and replies WRITE_DONE.
+  * The consumer scatters from its staging into its KV pool / state.
 """
 
 from __future__ import annotations
@@ -33,10 +26,14 @@ import logging
 import os
 import socket
 import threading
+import time
 from typing import Any
 
 import msgpack
+import torch
+import zmq
 
+from aiter.dist.parallel_state import get_dp_group, get_tp_group
 from atom.config import Config
 from atom.kv_transfer.disaggregation.base import (
     KVConnectorBase,
@@ -44,6 +41,7 @@ from atom.kv_transfer.disaggregation.base import (
 )
 from atom.kv_transfer.disaggregation.native import vmm
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata, ReqMeta
+from atom.utils.network import get_ip
 
 logger = logging.getLogger("atom")
 
@@ -52,19 +50,19 @@ TransferId = int
 
 _MSG_WRITE_REQUEST = b"\x01"
 _MSG_WRITE_DONE = b"\x02"
+_PREFILL_WAIT_S = 30.0
 
 
 def _port_offset(dp_rank: int, tp_rank: int, tp_size: int = 1) -> int:
     return dp_rank * tp_size + tp_rank
 
 
-def _sock_path(role: str, port: int) -> str:
-    return f"/tmp/atom_native_{role}_{port}.sock"
+def _sock_path(port: int) -> str:
+    return f"/tmp/atom_native_p_{port}.sock"
 
 
 # ---------------------------------------------------------------------------
-# Scheduler (transport-agnostic): maps transfer_id <-> request_id and emits
-# ConnectorMetadata. No third-party dependency.
+# Scheduler (transport-agnostic).
 # ---------------------------------------------------------------------------
 class NativeConnectorScheduler(KVConnectorSchedulerBase):
     def __init__(self, config: Config) -> None:
@@ -88,7 +86,7 @@ class NativeConnectorScheduler(KVConnectorSchedulerBase):
         if tid is not None:
             self.transfer_id_to_request_id[tid] = seq.id
             self.request_id_to_transfer_id[seq.id] = tid
-        slot_idx = getattr(seq, "slot_index", -1)
+        slot_idx = getattr(seq, "per_req_cache_group", getattr(seq, "slot_index", -1))
         params["local_slot_index"] = slot_idx
         meta = ReqMeta(
             local_block_ids=list(getattr(seq, "block_ids", []) or []),
@@ -109,6 +107,9 @@ class NativeConnectorScheduler(KVConnectorSchedulerBase):
             self._reqs_to_recv[seq.id] = meta
         elif params.get("do_remote_decode"):
             assert self.is_producer
+            # The transfer handle the consumer will request is the producer's
+            # own request id (see request_finished), not params["transfer_id"].
+            meta.transfer_id = seq.id
             self._reqs_to_save[seq.id] = meta
 
     def build_connector_meta(self) -> ConnectorMetadata:
@@ -133,65 +134,119 @@ class NativeConnectorScheduler(KVConnectorSchedulerBase):
 
 
 # ---------------------------------------------------------------------------
-# Worker (transport): VMM staging + direct peer copy.
+# Worker (VMM transport).
 # ---------------------------------------------------------------------------
 class NativeConnector(KVConnectorBase):
     def __init__(self, config: Config) -> None:
         self.config = config
         kv_cfg = config.kv_transfer_config or {}
         self.is_producer = kv_cfg.get("kv_role", "kv_producer") == "kv_producer"
-        self.device = getattr(config, "device_id", 0)
+        self.device = torch.cuda.current_device()
         if not vmm.supported(self.device):
             raise RuntimeError(
-                "kv_connector='native' requires HIP Virtual Memory Management "
-                "(single-node scale-up); use 'moriio' for cross-node RDMA."
+                "kv_connector='native' requires HIP VMM (single-node scale-up); "
+                "use 'moriio' for cross-node RDMA."
             )
-        self.tp_rank = getattr(config, "tp_rank", 0)
-        self.tp_size = getattr(config, "tp_size", 1)
+        self.tp_rank = get_tp_group().rank_in_group
+        self.tp_size = get_tp_group().world_size
+        self.dp_rank = get_dp_group().rank_in_group
+        self.dp_size = get_dp_group().world_size
+        self.local_ip = get_ip()
+        self.http_port = kv_cfg.get("http_port", 8000)
+        self.request_address = f"{self.local_ip}:{self.http_port}"
+        self.proxy_ip = kv_cfg.get("proxy_ip")
+        self.proxy_ping_port = kv_cfg.get("proxy_ping_port", 36367)
         self.base_handshake_port = kv_cfg.get("handshake_port", 6501)
         self._port = self.base_handshake_port + _port_offset(
-            0, self.tp_rank, self.tp_size
+            self.dp_rank, self.tp_rank, self.tp_size
         )
 
-        self._regions: list[tuple[int, int]] = []  # (base_addr, unit_bytes)
-        self._staging: vmm.VmmBuffer | None = None
-        self._staging_bytes = 0
-        self._imported: dict[int, vmm.VmmBuffer] = {}  # consumer fd -> imported staging
+        # KV region layout (filled by register_kv_caches).
+        self._block_regions: list[tuple[int, int]] = []  # (base, bytes/block)
+        self._slot_regions: list[tuple[int, int]] = []  # (base, bytes/slot)
+        self._state_base = 0
+        self._state_slot_bytes = 0
+        self._state_pool_free: list[int] = []
+        self._gather_slot = None
+        self._scatter_slot = None
 
         self._lock = threading.Lock()
         self.done_sending: set[ReqId] = set()
         self.done_recving: set[ReqId] = set()
-        # producer: transfer_id -> src block ids (from reqs_to_save)
-        self._src_blocks: dict[TransferId, list[int]] = {}
+        # producer: transfer_id -> (src_block_ids, src_slot)
+        self._prefills: dict[TransferId, tuple[list[int], int]] = {}
+        self._prefills_cv = threading.Condition(self._lock)
+        self._imported: dict[int, vmm.VmmBuffer] = {}
+
+        self._zmq = zmq.Context()
+        if self.tp_rank == 0 and self.dp_rank == 0 and self.proxy_ip:
+            threading.Thread(target=self._ping, daemon=True).start()
+
+    # -- proxy service discovery -------------------------------------------
+
+    def _ping(self) -> None:
+        path = f"tcp://{self.proxy_ip}:{self.proxy_ping_port}"
+        role = "P" if self.is_producer else "D"
+        with self._zmq.socket(zmq.DEALER) as sock:
+            sock.connect(path)
+            i = 1
+            while True:
+                try:
+                    sock.send(
+                        msgpack.dumps(
+                            {
+                                "type": "register",
+                                "role": role,
+                                "index": str(i),
+                                "request_address": f"http://{self.request_address}/v1/completions",
+                                "rpc_port": self._port,
+                                "handshake_port": self.base_handshake_port,
+                                "dp_size": self.dp_size,
+                                "tp_size": self.tp_size,
+                                "transfer_mode": "write",
+                            }
+                        )
+                    )
+                    i += 1
+                except Exception:
+                    pass
+                time.sleep(5.0)
 
     # -- KVConnectorBase ----------------------------------------------------
 
     def register_kv_caches(self, kv_caches, transfer_tensors=None) -> None:
-        if transfer_tensors is None:
+        tt = transfer_tensors
+        if tt is None:
             raise RuntimeError("native connector requires KV transfer tensors")
-        for r in list(transfer_tensors.block_regions) + list(
-            transfer_tensors.slot_regions
-        ):
-            self._regions.append((r.base_addr, r.unit_bytes))
-        # staging holds the largest single request: one block per region is a
-        # safe unit; grown lazily if a request needs more.
-        self._staging_bytes = sum(ub for _, ub in self._regions) or (1 << 20)
-        self._staging = vmm.VmmBuffer.alloc(self._staging_bytes, self.device)
-        if self.is_producer:
-            threading.Thread(target=self._serve, daemon=True).start()
+        self._block_regions = [(r.base_addr, r.unit_bytes) for r in tt.block_regions]
+        self._slot_regions = [(r.base_addr, r.unit_bytes) for r in tt.slot_regions]
+        self._gather_slot = tt.gather_slot
+        self._scatter_slot = tt.scatter_slot
+        if tt.staging_region is not None:
+            self._state_base = tt.staging_region.base_addr
+            self._state_slot_bytes = tt.staging_region.unit_bytes
+            self._state_pool_free = list(range(tt.staging_pool_size))
         logger.info(
-            "[native] registered %d KV regions, staging=%.1fMB (role=%s dev=%d)",
-            len(self._regions),
-            self._staging_bytes / (1 << 20),
+            "[native] registered %d block + %d slot regions, state_slot=%dB "
+            "(role=%s dev=%d rank=%d)",
+            len(self._block_regions),
+            len(self._slot_regions),
+            self._state_slot_bytes,
             "producer" if self.is_producer else "consumer",
             self.device,
+            self.tp_rank,
         )
+        if self.is_producer:
+            threading.Thread(target=self._serve, daemon=True).start()
 
     def start_load_kv(self, metadata: ConnectorMetadata) -> None:
-        # producer: remember src block ids so the side channel can gather them.
-        for req_id, meta in metadata.reqs_to_save.items():
-            self._src_blocks[meta.transfer_id] = meta.local_block_ids
-        # consumer: pull each pending request from its producer.
+        for _, meta in metadata.reqs_to_save.items():
+            with self._prefills_cv:
+                self._prefills[meta.transfer_id] = (
+                    meta.local_block_ids,
+                    meta.local_slot_index,
+                )
+                self._prefills_cv.notify_all()
         for req_id, meta in metadata.reqs_to_recv.items():
             self._recv_request(req_id, meta)
 
@@ -205,46 +260,78 @@ class NativeConnector(KVConnectorBase):
     def get_finished_recv_blocks(self) -> list[int]:
         return []
 
-    # -- consumer side ------------------------------------------------------
+    # -- staging layout -----------------------------------------------------
+
+    def _req_bytes(self, nblocks: int) -> int:
+        b = sum(bpb for _, bpb in self._block_regions) * nblocks
+        b += sum(bps for _, bps in self._slot_regions)
+        b += self._state_slot_bytes
+        return b
+
+    def _acquire_state_slot(self) -> int:
+        with self._lock:
+            return self._state_pool_free.pop() if self._state_pool_free else -1
+
+    def _release_state_slot(self, idx: int) -> None:
+        if idx >= 0:
+            with self._lock:
+                self._state_pool_free.append(idx)
+
+    # -- consumer -----------------------------------------------------------
 
     def _recv_request(self, req_id: ReqId, meta: ReqMeta) -> None:
-        import torch
-
-        self._grow_staging(len(meta.local_block_ids))
+        nblocks = len(meta.local_block_ids)
+        staging = vmm.VmmBuffer.alloc(self._req_bytes(nblocks), self.device)
         payload = msgpack.dumps(
             {
                 "req_id": req_id,
                 "transfer_id": meta.transfer_id,
                 "dst_block_ids": meta.local_block_ids,
+                "dst_slot": meta.local_slot_index,
             }
         )
         target = _sock_path(
-            "p",
             meta.remote_handshake_port
-            + _port_offset(meta.remote_dp_rank, self.tp_rank, meta.tp_size),
+            + _port_offset(meta.remote_dp_rank, self.tp_rank, meta.tp_size)
         )
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.connect(target)
-        socket.send_fds(s, [_MSG_WRITE_REQUEST + payload], [self._staging.export_fd()])
+        socket.send_fds(s, [_MSG_WRITE_REQUEST + payload], [staging.export_fd()])
         resp = s.recv(4096)
         s.close()
         if resp[:1] != _MSG_WRITE_DONE:
             logger.error("[native] no WRITE_DONE for req %s", req_id)
             return
-        # scatter staging -> local KV
-        off = 0
-        for base, unit in self._regions:
-            for db in meta.local_block_ids:
-                vmm.copy(base + db * unit, self._staging.data_ptr + off, unit)
-                off += unit
-        torch.cuda.synchronize(self.device)
+        self._scatter(staging, meta.local_block_ids, meta.local_slot_index)
         with self._lock:
             self.done_recving.add(req_id)
 
-    # -- producer side ------------------------------------------------------
+    def _scatter(self, staging, dst_block_ids, dst_slot) -> None:
+        off = 0
+        for base, bpb in self._block_regions:
+            for db in dst_block_ids:
+                vmm.copy(base + db * bpb, staging.data_ptr + off, bpb)
+                off += bpb
+        for base, bps in self._slot_regions:
+            if dst_slot >= 0:
+                vmm.copy(base + dst_slot * bps, staging.data_ptr + off, bps)
+            off += bps
+        if self._state_slot_bytes and dst_slot >= 0 and self._scatter_slot is not None:
+            pool_idx = self._acquire_state_slot()
+            if pool_idx >= 0:
+                vmm.copy(
+                    self._state_base + pool_idx * self._state_slot_bytes,
+                    staging.data_ptr + off,
+                    self._state_slot_bytes,
+                )
+                self._scatter_slot(dst_slot, pool_idx)
+                self._release_state_slot(pool_idx)
+        torch.cuda.synchronize(self.device)
+
+    # -- producer -----------------------------------------------------------
 
     def _serve(self) -> None:
-        path = _sock_path("p", self._port)
+        path = _sock_path(self._port)
         if os.path.exists(path):
             os.unlink(path)
         srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -255,8 +342,6 @@ class NativeConnector(KVConnectorBase):
             threading.Thread(target=self._handle, args=(conn,), daemon=True).start()
 
     def _handle(self, conn: socket.socket) -> None:
-        import torch
-
         try:
             msg, fds, _, _ = socket.recv_fds(conn, 1 << 16, 1)
             if not msg or msg[:1] != _MSG_WRITE_REQUEST:
@@ -264,16 +349,12 @@ class NativeConnector(KVConnectorBase):
             req = msgpack.loads(msg[1:])
             dst = self._imported.get(fds[0])
             if dst is None:
-                dst = vmm.VmmBuffer.import_fd(fds[0], self._staging_bytes, self.device)
+                nblocks = len(req["dst_block_ids"])
+                dst = vmm.VmmBuffer.import_fd(
+                    fds[0], self._req_bytes(nblocks), self.device
+                )
                 self._imported[fds[0]] = dst
-            src_blocks = self._src_blocks.get(req["transfer_id"], req["dst_block_ids"])
-            # gather producer KV blocks straight into the consumer's staging
-            off = 0
-            for base, unit in self._regions:
-                for sb in src_blocks:
-                    vmm.copy(dst.data_ptr + off, base + sb * unit, unit)
-                    off += unit
-            torch.cuda.synchronize(self.device)
+            self._gather(dst, req["transfer_id"])
             conn.sendall(_MSG_WRITE_DONE + msgpack.dumps({"req_id": req["req_id"]}))
             with self._lock:
                 self.done_sending.add(req["req_id"])
@@ -282,8 +363,30 @@ class NativeConnector(KVConnectorBase):
         finally:
             conn.close()
 
-    def _grow_staging(self, nblocks: int) -> None:
-        need = sum(ub for _, ub in self._regions) * max(1, nblocks)
-        if need > self._staging_bytes:
-            self._staging_bytes = need
-            self._staging = vmm.VmmBuffer.alloc(need, self.device)
+    def _gather(self, staging, transfer_id: int) -> None:
+        with self._prefills_cv:
+            self._prefills_cv.wait_for(
+                lambda: transfer_id in self._prefills, timeout=_PREFILL_WAIT_S
+            )
+            src_block_ids, src_slot = self._prefills.get(transfer_id, ([], -1))
+        off = 0
+        for base, bpb in self._block_regions:
+            for sb in src_block_ids:
+                vmm.copy(staging.data_ptr + off, base + sb * bpb, bpb)
+                off += bpb
+        for base, bps in self._slot_regions:
+            if src_slot >= 0:
+                vmm.copy(staging.data_ptr + off, base + src_slot * bps, bps)
+            off += bps
+        if self._state_slot_bytes and src_slot >= 0 and self._gather_slot is not None:
+            pool_idx = self._acquire_state_slot()
+            if pool_idx >= 0:
+                self._gather_slot(src_slot, pool_idx)
+                torch.cuda.current_stream().synchronize()
+                vmm.copy(
+                    staging.data_ptr + off,
+                    self._state_base + pool_idx * self._state_slot_bytes,
+                    self._state_slot_bytes,
+                )
+                self._release_state_slot(pool_idx)
+        torch.cuda.synchronize(self.device)
