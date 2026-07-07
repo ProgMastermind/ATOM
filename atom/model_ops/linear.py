@@ -21,9 +21,11 @@ from aiter import (
 from aiter.dist.parallel_state import get_tp_group
 from aiter.jit.utils.torch_guard import torch_compile_guard
 from aiter.tuned_gemm import tgemm
-from aiter.utility import fp4_utils
-import aiter.ops.triton.utils._triton.arch_info as arch_info
-from aiter.ops.triton.utils.shuffle import shuffle_scale_gemm, shuffle_scale_gemm_e8m0
+from aiter.ops.triton.utils.shuffle import (
+    collapse_mxfp4_gemm_scale,
+    quant_mxfp4_act_preshuffle,
+    shuffle_scale_gemm_e8m0,
+)
 from atom.config import QuantizationConfig, get_current_atom_config
 from atom.quant_spec import LayerQuantConfig, should_skip_online_quant
 from atom.model_ops.utils import (
@@ -198,52 +200,26 @@ def gemm_a4w4_quant(
             dtype=otype,
             device=x.device,
         )
-        # Scale preshuffle factor per arch: 32 on gfx950, 16 on gfx1250 (WMMA
-        # tiles both M and N in 16-lane groups). Applies to BOTH the activation
-        # (M-axis) and weight (N-axis) e8m0 scales.
-        _arch = arch_info.get_arch()
-        _scale_pf = 16 if _arch == "gfx1250" else MXFP4_QUANT_BLOCK_SIZE
-
+        # Arch-specific MXFP4 preshuffle operand prep (scale preshuffle factor,
+        # gfx1250-vs-gfx950 activation quant + e8m0 tile, scale re-collapse) lives
+        # in aiter.ops.triton.utils.shuffle so load-time shuffle and forward GEMM
+        # stay in one place.
         if x_scale is None:
-            quant_func = get_hip_quant(QuantType.per_1x32)
-            if _arch == "gfx1250" and m >= MXFP4_QUANT_BLOCK_SIZE:
-                # get_hip_quant's built-in scale shuffle is gfx950-pinned
-                # (per_1x32_mx_quant_hip pads to (256, 8) -> the 32/8 tile,
-                # no arch branch). On gfx1250 quantize WITHOUT that shuffle and
-                # apply the arch-aware e8m0 tile (16/4) in-line, mirroring the
-                # weight-scale path so the activation scale matches the gfx1250
-                # GEMM instead of arriving in the gfx950 layout.
-                x, x_scale = quant_func(
-                    x, quant_dtype=params_dtype, shuffle=False
-                )
-                x_scale = shuffle_scale_gemm_e8m0(x_scale.view(torch.uint8), arch=_arch)
-            else:
-                x, x_scale = quant_func(
-                    x,
-                    quant_dtype=params_dtype,
-                    shuffle=(m >= MXFP4_QUANT_BLOCK_SIZE),
-                )
+            x, x_scale = quant_mxfp4_act_preshuffle(x, params_dtype, m)
         else:
-            x_scale = x_scale.view(torch.float8_e8m0fnu)
+            x_scale = collapse_mxfp4_gemm_scale(
+                x_scale.view(torch.float8_e8m0fnu), rows_valid=m
+            )
             x = x.view(torch.float4_e2m1fn_x2)
 
-        if m >= MXFP4_QUANT_BLOCK_SIZE:
-            x_scale = x_scale.view(torch.uint8).view(
-                x_scale.shape[0] // _scale_pf, -1
-            )
-        else:
-            x_scale = x_scale[:m, ...].view(torch.uint8)
-
-        # Re-collapse the un-collapsed (rows_pad, kgroups_pad) weight scale
-        # produced by shuffle_scale_gemm_e8m0 into the kernel layout, by the same
-        # arch preshuffle factor used for the activation scale above.
+        # collapse_mxfp4_gemm_scale re-collapses the un-collapsed (rows_pad,
+        # kgroups_pad) weight scale produced by shuffle_scale_gemm_e8m0 into the
+        # kernel layout, by the same arch preshuffle factor as the activation scale.
         y = gemm_afp4wfp4_preshuffle(
             x.view(torch.uint8),
             weight.view(torch.uint8).view(weight.shape[0] // 16, -1),
             x_scale,
-            weight_scale.view(torch.uint8).view(
-                weight_scale.shape[0] // _scale_pf, -1
-            ),
+            collapse_mxfp4_gemm_scale(weight_scale),
             y=y,
         )
     # Default AITER path: quantize/shuffle into the layout expected by gemm_a4w4
@@ -773,13 +749,11 @@ class LinearBase(nn.Module):
                 # weight; only the AITER bpreshuffle fallback needs the shuffle.
                 and not (use_triton_gemm() and gemm_a8w8_triton is not None)
             ) or (
-                # gemma4w4 weight shuffled here (-> shuffle_weights below)
                 self.quant_type == QuantType.per_1x32
                 and (not is_fp4_blockscale or not use_fp4_non_shuffle_triton_gemm())
             )
             # per_1x128 only needs shuffle when using the preshuffle GEMM path
             if not need_shuffle and self.quant_type == QuantType.per_1x128:
-                # gemma8w8 blockscale weight shuffled here (-> shuffle_weights below)
                 need_shuffle = envs.ATOM_FP8_BLOCKSCALE_WEIGHT_PRESHUFFLE
                 # Modules whose fused forward calls a *preshuffle* blockscale GEMM
                 # directly (e.g. DeepSeek fused qkv_a_proj) need the 16x16-shuffled
