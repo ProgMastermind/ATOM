@@ -37,9 +37,6 @@ if envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE:
         moe_gemm_a4w4,
         mxfp4_quant,
     )
-    # aiter #3900 unified the per-module swizzle_scales into utils/shuffle.py's
-    # arch-aware shuffle_scale_moe (a8w4/a8w8/a16w4/a4w4 family). Alias to keep
-    # the a8w4 / cdna4 call sites below unchanged.
     from aiter.ops.triton.utils.shuffle import (
         shuffle_scale_moe as swizzle_scales_a8w4,
         shuffle_scale_moe as swizzle_scales_cdna4,
