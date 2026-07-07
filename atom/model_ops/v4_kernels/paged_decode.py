@@ -63,26 +63,44 @@ LOG2E = 1.4426950408889634  # log2(e); folded into qk_scale so softmax can use e
 _MAX_KV_SPLITS = 64  # Hard cap on kv_splits (see _kv_splits_heuristic).
 
 
-@functools.lru_cache(maxsize=None)
+# Per-device persistent (iota, ones) base buffers, sized once to an upper bound
+# on N and sliced per call — see _v4_decode_const_indices.
+_V4_DECODE_IDX_BUFS: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+
+
 def _v4_decode_const_indices(
     n: int, device: torch.device
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Per-token paged-decode index tensors that depend only on N.
+    """Per-token paged-decode index tensors, sliced from persistent buffers.
 
-    ``qo_indptr = arange(N+1)`` and ``kv_last_page_lens = ones(N)`` are pure
-    functions of the token count N (fixed per CUDAGraph batch size), so build
-    them once per (N, device) and reuse the same buffers across every layer and
-    every decode step instead of re-allocating on each call. Values are
-    constant and the decode kernel treats them as read-only (indptr / per-token
-    last-page lengths), so sharing is safe. Under CUDAGraph the cached tensors
-    are persistent (held by the cache) with stable addresses across replays,
-    and each N is used only by its own captured graph — so this is capture-safe
-    while removing the per-call ``arange`` + ``ones`` (fill) launches that
-    otherwise fire on every layer × window × decode step.
+    ``qo_indptr = arange(N+1)`` (per-token: the kernel runs ``max_seqlen_q=1``,
+    so this is a per-token indptr, NOT the per-seq ``cu_seqlens_q`` — they differ
+    under MTP) and ``kv_last_page_lens = ones(N)`` (page_size=1) depend only on N.
+    Rather than re-allocating them on every layer × window × decode step (each a
+    ``arange`` + ``ones`` fill launch), allocate a single per-device iota/ones
+    buffer once, sized to ``max_num_batched_tokens`` (an upper bound on N), and
+    return contiguous prefix slices ``[:n+1]`` / ``[:n]``.
+
+    The base buffers are persistent with stable addresses and are sized to the
+    max before any CUDAGraph capture, so they are never reallocated — the slices
+    are capture-safe. Values are constant and the decode kernel treats them as
+    read-only, so sharing across calls/layers is safe. This replaces the earlier
+    per-N ``lru_cache`` (which grew unbounded when N was not CG-quantised).
     """
-    qo_indptr = torch.arange(n + 1, dtype=torch.int32, device=device)
-    kv_last_page_lens = torch.ones(n, dtype=torch.int32, device=device)
-    return qo_indptr, kv_last_page_lens
+    buf = _V4_DECODE_IDX_BUFS.get(device)
+    if buf is None:
+        from atom.config import get_current_atom_config
+
+        max_tokens = int(get_current_atom_config().max_num_batched_tokens)
+        iota = torch.arange(max_tokens + 1, dtype=torch.int32, device=device)
+        ones = torch.ones(max_tokens, dtype=torch.int32, device=device)
+        buf = (iota, ones)
+        _V4_DECODE_IDX_BUFS[device] = buf
+    iota, ones = buf
+    assert (
+        n + 1 <= iota.numel()
+    ), f"decode N={n} exceeds max_num_batched_tokens buffer ({iota.numel() - 1})"
+    return iota[: n + 1], ones[:n]
 
 
 # FP8 KV cache (1xGROUP_SIZE block-scale quantization).
