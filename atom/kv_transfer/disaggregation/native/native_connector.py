@@ -1,23 +1,13 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Native single-node KV connector (HIP VMM, no third-party transport).
+"""Native single-node KV connector (HIP VMM; no third-party transport).
 
-In-tree prefill/decode KV connector for the single-node (scale-up / XGMI) case.
-Depends only on the HIP Virtual Memory Management API
-(:mod:`atom.kv_transfer.disaggregation.native.vmm`) — no MoRI, no Mooncake.
-
-Selected with ``--kv-transfer-config '{"kv_connector":"native", ...}'``.
-
-Data path (push, producer -> consumer), all staged through the consumer's VMM
-buffer so no model-side allocation change is required:
-  * The consumer allocates a VMM staging buffer per pending request, exports its
-    POSIX fd, and sends it (with the request's dst block ids / slot) to the
-    producer over a UNIX side channel.
-  * The producer imports the staging (granting its own device access), gathers
-    the request's KV blocks + SWA slots + compressor state into it over XGMI
-    (``hipMemcpy`` peer), and replies WRITE_DONE.
-  * The consumer scatters from its staging into its KV pool / state.
+Single-node (XGMI) prefill/decode connector, selected with
+``kv_connector="native"``. Push path: the consumer sends a VMM staging fd over a
+UNIX socket; the producer imports it, gathers the request's KV blocks + SWA
+slots + compressor state into it (hipMemcpy peer over XGMI); the consumer
+scatters into its KV pool.
 """
 
 from __future__ import annotations

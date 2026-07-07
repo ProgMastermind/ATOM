@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""Cross-process test for HIP VMM based KV transfer.
-
-A producer process allocates an exportable VMM buffer on GPU 0, fills it, and
-passes the POSIX fd to a consumer process (GPU 1) over a UNIX socket. The
-consumer imports it and peer-copies blocks directly over the fabric, then
-verifies the data. Requires >= 2 GPUs with VMM support; skips otherwise.
+"""Cross-process HIP VMM KV-transfer test: a producer exports a VMM buffer on
+GPU 0, a consumer imports it on GPU 1 and peer-copies blocks, then verifies.
+Requires >= 2 GPUs with VMM support; skips otherwise.
 """
 
 from __future__ import annotations

@@ -1,18 +1,14 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
-"""HIP VMM based cross-process GPU buffer sharing (scale-up KV transfer).
+"""HIP VMM cross-process GPU buffer sharing (scale-up KV transfer).
 
-Foundation for a single-node (XGMI) prefill/decode KV connector. A producer
-allocates an exportable VMM buffer, shares its POSIX file descriptor over a
-UNIX socket (``socket.send_fds``); a consumer imports it, grants its own device
-peer access and copies directly over the fabric with a plain ``Tensor.copy_``
-(``hipMemcpyPeerAsync``). Unlike legacy hipIpc, VMM shareable handles work
-reliably across processes and do not require the source GPU to be visible to
-the consumer.
-
-The tiny C++ helper is JIT-compiled on first use (never at import time), so
-importing this module is cheap and safe on CPU-only hosts.
+A producer allocates an exportable VMM buffer and shares its POSIX fd (over a
+UNIX socket); a consumer imports it, grants its device peer access, and copies
+directly over the fabric. Unlike legacy hipIpc, VMM shareable handles are
+reliable cross-process and don't need the source GPU visible to the consumer.
+The C++ helper is JIT-compiled lazily (never at import), so importing is cheap
+on CPU-only hosts.
 """
 
 from __future__ import annotations

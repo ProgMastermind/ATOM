@@ -1,13 +1,10 @@
 // SPDX-License-Identifier: MIT
 // Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 //
-// Minimal HIP Virtual Memory Management (VMM) bridge for cross-process,
-// scale-up (single-node, XGMI) KV-cache sharing. A producer allocates an
-// exportable VMM buffer and shares its POSIX file descriptor; a consumer
-// imports it, grants its own device peer access, and copies directly over the
-// fabric. Unlike legacy hipIpc handles, VMM shareable handles + explicit
-// hipMemSetAccess give reliable cross-process peer access without requiring the
-// source GPU to be in the consumer's visible set.
+// Minimal HIP VMM bridge for cross-process single-node (XGMI) KV sharing:
+// allocate an exportable VMM buffer, export/import its POSIX fd, grant peer
+// access, and copy. Reliable cross-process where legacy hipIpc is not, and does
+// not require the source GPU to be in the consumer's visible set.
 #include <torch/extension.h>
 #include <hip/hip_runtime.h>
 
