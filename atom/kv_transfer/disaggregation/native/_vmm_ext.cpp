@@ -121,10 +121,22 @@ int64_t vmm_import(int fd, int64_t nbytes, int device) {
 }
 
 // Wrap the first `nbytes` of the mapped region as a (non-owning) uint8 tensor.
+int64_t vmm_ptr(int64_t id) {
+  return reinterpret_cast<int64_t>(region(id).ptr);
+}
+
 torch::Tensor vmm_tensor(int64_t id, int64_t nbytes, int device) {
   auto opts = torch::TensorOptions().dtype(torch::kUInt8).device(
       torch::kCUDA, device);
   return torch::from_blob(region(id).ptr, {nbytes}, opts);
+}
+
+// Device-to-device copy between two raw device pointers (peer-mapped ok). Used
+// by the connector to gather/scatter KV blocks to/from the VMM staging region.
+void vmm_copy(int64_t dst_ptr, int64_t src_ptr, int64_t nbytes) {
+  HIPCK(hipMemcpy(reinterpret_cast<void *>(dst_ptr),
+                  reinterpret_cast<void *>(src_ptr),
+                  static_cast<size_t>(nbytes), hipMemcpyDeviceToDevice));
 }
 
 void vmm_free(int64_t id) {
@@ -143,6 +155,8 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("vmm_alloc", &vmm_alloc);
   m.def("vmm_export_fd", &vmm_export_fd);
   m.def("vmm_import", &vmm_import);
+  m.def("vmm_ptr", &vmm_ptr);
   m.def("vmm_tensor", &vmm_tensor);
+  m.def("vmm_copy", &vmm_copy);
   m.def("vmm_free", &vmm_free);
 }

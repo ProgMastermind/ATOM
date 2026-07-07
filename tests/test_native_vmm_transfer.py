@@ -23,7 +23,7 @@ NCOPY = 64
 
 
 def _producer(path, device, ready):
-    from atom.kv_transfer.disaggregation.xgmi import VmmBuffer
+    from atom.kv_transfer.disaggregation.native import VmmBuffer
 
     torch.cuda.set_device(device)
     buf = VmmBuffer.alloc(NBYTES, device)
@@ -44,7 +44,7 @@ def _producer(path, device, ready):
 
 
 def _consumer(path, device, ready, result):
-    from atom.kv_transfer.disaggregation.xgmi import VmmBuffer
+    from atom.kv_transfer.disaggregation.native import VmmBuffer
 
     torch.cuda.set_device(device)
     ready.wait(60)
@@ -76,7 +76,7 @@ def _consumer(path, device, ready, result):
     reason="requires >= 2 GPUs",
 )
 def test_vmm_cross_process_transfer(tmp_path):
-    from atom.kv_transfer.disaggregation.xgmi import supported
+    from atom.kv_transfer.disaggregation.native import supported
 
     if not supported(0) or not supported(1):
         pytest.skip("HIP VMM not supported on these devices")

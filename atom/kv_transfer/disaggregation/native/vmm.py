@@ -45,6 +45,11 @@ def supported(device: int = 0) -> bool:
     return bool(_ext().vmm_supported(device))
 
 
+def copy(dst_ptr: int, src_ptr: int, nbytes: int) -> None:
+    """Device-to-device copy between raw device pointers (peer-mapped ok)."""
+    _ext().vmm_copy(dst_ptr, src_ptr, nbytes)
+
+
 class VmmBuffer:
     """An exportable VMM buffer mapped on one device.
 
@@ -72,6 +77,11 @@ class VmmBuffer:
     def export_fd(self) -> int:
         """POSIX fd to send to a peer (e.g. via ``socket.send_fds``)."""
         return _ext().vmm_export_fd(self._id)
+
+    @property
+    def data_ptr(self) -> int:
+        """Raw mapped device pointer (for :func:`copy`)."""
+        return _ext().vmm_ptr(self._id)
 
     def tensor(self, dtype: torch.dtype, shape) -> torch.Tensor:
         """View of the buffer as ``dtype`` reshaped to ``shape``.

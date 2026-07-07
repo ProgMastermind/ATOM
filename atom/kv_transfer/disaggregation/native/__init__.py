@@ -3,6 +3,6 @@
 
 """Single-node (XGMI) scale-up KV-transfer primitives."""
 
-from atom.kv_transfer.disaggregation.xgmi.vmm import VmmBuffer, supported
+from atom.kv_transfer.disaggregation.native.vmm import VmmBuffer, supported
 
 __all__ = ["VmmBuffer", "supported"]

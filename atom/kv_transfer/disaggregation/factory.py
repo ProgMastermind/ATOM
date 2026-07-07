@@ -134,3 +134,11 @@ KVConnectorFactory.register(
     scheduler_module="atom.kv_transfer.disaggregation.mooncake.mooncake_connector",
     scheduler_class="MooncakeConnectorScheduler",
 )
+
+KVConnectorFactory.register(
+    "native",
+    worker_module="atom.kv_transfer.disaggregation.native.native_connector",
+    worker_class="NativeConnector",
+    scheduler_module="atom.kv_transfer.disaggregation.native.native_connector",
+    scheduler_class="NativeConnectorScheduler",
+)
