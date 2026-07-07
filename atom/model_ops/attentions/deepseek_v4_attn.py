@@ -1357,6 +1357,14 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             ]
             var[f"{p}block_tables"].np[ub_real_reqs:padded_bs] = 0
 
+            # paged-SWA: slice this ubatch's SWA block table from the global
+            # var["swa_block_tables"] (filled by prepare_block_tables above,
+            # window-freed -1 already clamped to 0), same as block_tables.
+            var[f"{p}swa_block_tables"].np[:ub_real_reqs] = var["swa_block_tables"].np[
+                req_start : req_start + ub_real_reqs
+            ]
+            var[f"{p}swa_block_tables"].np[ub_real_reqs:padded_bs] = 0
+
             # positions: copy the ubatch's token slice (values match the global
             # positions slice the UBatchWrapper Context will expose).
             ub_positions_np = positions_np[tok_start : tok_start + ub_real_tokens]
@@ -1378,6 +1386,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             cu_seqlens_q_gpu = var[f"{p}cu_seqlens_q"].copy_to_gpu(padded_bs + 1)
             context_lens_gpu = var[f"{p}context_lens"].copy_to_gpu(padded_bs)
             block_tables_gpu = var[f"{p}block_tables"].copy_to_gpu(padded_bs)
+            swa_block_tables_gpu = var[f"{p}swa_block_tables"].copy_to_gpu(padded_bs)
             state_slot_gpu = var[f"{p}v4_meta_state_slot_groups"].copy_to_gpu(padded_bs)
 
             # ---- compress plans (per ubatch buffer set) ----
@@ -1407,6 +1416,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             attn_metadata.state_slot_mapping = state_slot_gpu
             attn_metadata.state_slot_mapping_cpu = state_slot_np_ub
             attn_metadata.compress_plans = compress_plans
+            attn_metadata.swa_block_tables = swa_block_tables_gpu
 
             # token_num_per_seq over PADDED bs (pad reqs contribute max_seqlen_q
             # each so batch_id_per_token covers padded_total_tokens).
@@ -2123,7 +2133,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         swa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_swa"].gpu
         csa_indices_gpu = var[f"{buf_prefix_ubatch}v4_kv_indices_csa"].gpu
         write_v4_paged_decode_indices(
-            block_tables=var["swa_block_tables"].gpu[:scheduled_bs],
+            # paged-SWA: SWA block table must come from the SAME buffer set as
+            # batch_id_per_token. In a TBO ubatch, batch_id_per_token holds
+            # LOCAL req indices [0, ub_real_reqs), so the SWA table must be the
+            # ubatch-sliced var[f"{p}swa_block_tables"] whose row i == local req
+            # i — not the global var["swa_block_tables"] (row i == global req i).
+            # Using the global table here makes ubatch1 (req_start>0) read other
+            # requests' SWA blocks → cross-request KV contamination, wrong output
+            # without a crash. block_tables_np_full above (HCA) already uses the
+            # prefixed buffer; this line must match. For the non-ubatch path the
+            # prefix is "" so this resolves to var["swa_block_tables"] as before.
+            block_tables=var[f"{buf_prefix_ubatch}swa_block_tables"].gpu[:scheduled_bs],
             batch_id_per_token=batch_id_per_token_gpu,
             positions=var[f"{buf_prefix_ubatch}positions"].gpu,
             swa_indptr=swa_indptr_gpu,
@@ -2826,6 +2846,11 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"{p}positions"] = CpuGpuBuffer(T_dec, **i64)
             bufs[f"{p}context_lens"] = CpuGpuBuffer(bs, **i32)
             bufs[f"{p}block_tables"] = CpuGpuBuffer(bs, max_blocks, **i32)
+            # paged-SWA: per-ubatch SWA block table (separate pool), sliced from
+            # the global var["swa_block_tables"] like block_tables. Required so
+            # TBO decode's model-forward swa_write / decode index kernel address
+            # the SWA pool; without it swa_block_tables is None → swa_write(None).
+            bufs[f"{p}swa_block_tables"] = CpuGpuBuffer(bs, max_blocks, **i32)
             bufs[f"{p}cu_seqlens_q"] = CpuGpuBuffer(bs + 1, **i32)
 
             # V4 decode metadata buffers.
@@ -2841,7 +2866,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             bufs[f"{p}v4_kv_indptr_csa"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_kv_indptr_hca"] = CpuGpuBuffer(T_dec + 1, **i32)
             bufs[f"{p}v4_n_committed_csa_per_seq"] = CpuGpuBuffer(bs, **i32)
-            bufs[f"{p}v4_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i64)
+            bufs[f"{p}v4_batch_id_per_token"] = CpuGpuBuffer(mnbt, **i32)
             bufs[f"{p}v4_indexer_cu_committed"] = CpuGpuBuffer(bs + 1, **i32)
 
             for ratio, is_overlap in self._unique_compress_ratios_overlap:
