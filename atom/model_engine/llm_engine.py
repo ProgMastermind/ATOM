@@ -88,7 +88,7 @@ class LLMEngine:
         self.io_processor = InputOutputProcessor(
             config, self.tokenizer, config.kv_cache_block_size
         )
-        if config.enable_disagg:
+        if config.enable_rapidserve:
             self.core_mgr = DisaggCoreManager(config)
         else:
             self.core_mgr = CoreManager(config)

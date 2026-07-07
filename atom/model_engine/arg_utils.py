@@ -58,7 +58,7 @@ class EngineArgs:
     kv_transfer_config: str = "{}"
     draft_model: Optional[str] = None
     mark_trace: bool = False
-    enable_disagg: bool = False
+    enable_rapidserve: bool = False
     disagg_prefill_max_num_seqs: Optional[int] = None
     disagg_constrained: bool = False
     online_quant_config: Optional[dict] = None
@@ -265,7 +265,7 @@ class EngineArgs:
             help="Enable graph_marker nodes for tracing/profile instrumentation.",
         )
         parser.add_argument(
-            "--enable-disagg",
+            "--enable-rapidserve",
             action="store_true",
             help="Enable intra-GPU prefill/decode disaggregation. "
             "Defaults to unconstrained mode (plain separate streams, "
@@ -282,7 +282,7 @@ class EngineArgs:
         parser.add_argument(
             "--disagg-constrained",
             action="store_true",
-            help="With --enable-disagg, enable CU-masked streams and "
+            help="With --enable-rapidserve, enable CU-masked streams and "
             "shm-based prefill/decode coordination. Default (off) "
             "uses plain separate streams with no CU masking.",
         )

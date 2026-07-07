@@ -311,21 +311,10 @@ class tokenIDProcessor:
     def get_token_locations(
         self, batch: ScheduledBatch
     ) -> tuple[np.ndarray, np.ndarray, np.ndarray, bool]:
-        cur_req_ids = batch.req_ids
-        num_cur = len(cur_req_ids)
-
-        if self.prev_batch is None:
-            # No previous batch (e.g. first decode step in disagg mode after warmup clean).
-            # All sequences are new — no deferred outputs to copy.
-            return (
-                np.empty(0, dtype=np.intp),
-                np.empty(0, dtype=np.intp),
-                np.arange(num_cur, dtype=np.intp),
-                False,
-            )
-
         prev_req_ids = self.prev_batch.req_ids
+        cur_req_ids = batch.req_ids
         num_prev = len(prev_req_ids)
+        num_cur = len(cur_req_ids)
 
         prev_id_to_idx = dict(zip(prev_req_ids, range(num_prev)))
 
@@ -404,15 +393,6 @@ class tokenIDProcessor:
             return self.input_ids.copy_to_gpu(total_tokens_decode)
 
         """for decode: input ids are from prev_sampled_token_ids"""
-        if self.prev_batch is None:
-            # No previous batch (e.g. first decode step in disagg mode).
-            # No deferred outputs exist — read tokens directly from scheduled_tokens.
-            token_ids = scheduled_tokens[
-                total_tokens_prefill : total_tokens_prefill + total_tokens_decode
-            ]
-            self.input_ids.np[:total_tokens_decode] = token_ids
-            return self.input_ids.copy_to_gpu(total_tokens_decode)
-
         deferred_curr_indices, deferred_prev_indices, new_curr_indices, is_all_same = (
             self.get_token_locations(batch)
         )
@@ -615,7 +595,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.label = f"Model Runner{rank}/{self.world_size}"
-        if getattr(config, "enable_disagg", False):
+        if getattr(config, "enable_rapidserve", False):
             import hashlib
 
             self._disagg_session_id = hashlib.md5(
@@ -699,7 +679,7 @@ class ModelRunner:
                 model_class, "quant_exclude_name_mapping", {}
             ),
         )
-        # self.model = model_class(config)
+
         if config.disagg_is_decode:
             # Decode imports prefill's weights via CUDA IPC and owns no weight
             # memory. Build on the meta device so construction allocates zero GPU
@@ -1381,7 +1361,7 @@ class ModelRunner:
         # In disagg mode, subtract safety_margin again so NCCL/system allocs
         # (e.g. the 512MB NCCL barrier buffer) don't OOM when two processes
         # share the GPU.
-        if getattr(config, "enable_disagg", False):
+        if getattr(config, "enable_rapidserve", False):
             available_for_kv_budget -= 4 * safety_margin
         # This prevents OOM when other processes share the GPU.
         available_for_kv = min(available_for_kv_budget, free)

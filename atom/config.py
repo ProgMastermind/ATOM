@@ -1086,7 +1086,7 @@ class Config:
     hf_overrides: Optional[dict[str, Any]] = None
 
     # Intra-GPU prefill/decode disaggregation
-    enable_disagg: bool = False
+    enable_rapidserve: bool = False
     # ZMQ IPC address: decode PUSH → prefill PULL (BlockAssignment messages)
     disagg_d2p_addr: str = ""
     # ZMQ IPC address: prefill PUSH → decode PULL (PrefillDone messages)
@@ -1105,7 +1105,7 @@ class Config:
     # Override max_num_seqs for the prefill process in disagg mode.
     # When None, prefill inherits the base max_num_seqs.
     disagg_prefill_max_num_seqs: Optional[int] = None
-    # When True (and enable_disagg=True), use CU-masked streams + shm
+    # When True (and enable_rapidserve=True), use CU-masked streams + shm
     # coordination between prefill and decode. When False (default),
     # use plain separate streams with no CU masking.
     disagg_constrained: bool = False
