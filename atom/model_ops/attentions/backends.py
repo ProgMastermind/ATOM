@@ -167,6 +167,28 @@ class AttentionMetadataBuilder(ABC, Generic[T]):
         """
         return 0
 
+    # ------------------------------------------------------------------ #
+    # Paged sliding-window (SWA) pool — a separate, window-freed KV pool  #
+    # some attention types carve out of the main KV budget.              #
+    # ------------------------------------------------------------------ #
+    # ModelRunner queries these at startup to decide, model-agnostically,
+    # whether to reserve a `num_swa_blocks`-sized SWA pool and deduct its
+    # bytes from the main (compressed) KV pool. A builder that returns >0
+    # from `swa_pool_block_bytes()` opts into the pool; the default 0 means
+    # no separate SWA pool (standard attentions keep all KV in one pool).
+    # This keeps the arch-specific decision inside the builder, not in the
+    # runner.
+
+    def swa_pool_block_bytes(self) -> int:
+        """Bytes of ONE physical SWA-pool block across all attention layers,
+        or 0 (default) if this attention type has no separate paged-SWA pool."""
+        return 0
+
+    def swa_pool_num_blocks(self, max_num_seqs: int, max_model_len: int) -> int:
+        """Number of blocks to reserve for the paged-SWA pool, or 0 (default).
+        Only consulted when `swa_pool_block_bytes()` > 0."""
+        return 0
+
     def allocate_kv_cache_tensors(
         self, num_kv_heads: int, num_draft_layers: int
     ) -> dict[str, Any]:

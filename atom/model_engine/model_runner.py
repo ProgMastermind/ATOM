@@ -1384,26 +1384,20 @@ class ModelRunner:
         )
         self.max_per_req_cache_slots = max_per_req_cache_slots
 
-        # paged-SWA: DeepSeek-V4 gets a SEPARATE windowed/prefix-
-        # cached SWA pool. The SWA bytes that `compute_block_bytes` charges per
-        # compressed block move into a `num_swa_blocks`-sized pool (window-freed,
-        # so far smaller than the compressed pool), and the freed budget grows
-        # `num_kvcache_blocks`. V4 detected via architectures (config registry
-        # maps model_type deepseek_v4 → v3).
-        _arches = getattr(hf_config, "architectures", None) or []
-        # paged-SWA: separate windowed/prefix-cached SWA pool — the RIGHT fix
-        # for #1417. The SWA bytes that `compute_block_bytes` charges per
-        # compressed block move into a `num_swa_blocks`-sized pool (window-freed,
-        # ~1248 blocks), and the freed budget grows num_kvcache_blocks (~108k).
-        # VALIDATED: eager repro 0/3 + gsm8k 0.952 @1319/nc64 + perf parity;
-        # non-eager CUDAGraph capture succeeds (swa_block_tables wired into
-        # build_for_cudagraph_capture). Under PD/disaggregation the SWA pool is
-        # transferred per-request by seq.swa_block_table (only the live window,
-        # i.e. the last ~128-token block); see get_kv_transfer_tensors.
-        _is_v4 = any("DeepseekV4" in str(a) for a in _arches)
-        if _is_v4:
-            b = self.attn_metadata_builder
-            swa_block_bytes = b.swa_pool_block_bytes()
+        # paged-SWA: some attention backends carve a SEPARATE windowed/prefix-
+        # cached SWA pool out of the KV budget. The SWA bytes that
+        # `compute_block_bytes` charges per compressed block move into a
+        # `num_swa_blocks`-sized pool (window-freed, so far smaller than the
+        # compressed pool), and the freed budget grows `num_kvcache_blocks`.
+        # Whether this applies is a builder capability — `swa_pool_block_bytes()`
+        # returns >0 only for backends with a separate SWA pool — so the runner
+        # stays model-agnostic (no architecture check here). Under
+        # PD/disaggregation the SWA pool is transferred per-request by
+        # seq.swa_block_table (only the live window, i.e. the last ~128-token
+        # block); see get_kv_transfer_tensors.
+        b = self.attn_metadata_builder
+        swa_block_bytes = b.swa_pool_block_bytes()
+        if swa_block_bytes > 0:
             num_swa_blocks = b.swa_pool_num_blocks(
                 config.max_num_seqs, config.max_model_len
             )
