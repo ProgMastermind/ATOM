@@ -24,8 +24,6 @@ export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
 TP=8
 
-rm -rf /root/.cache/atom/*
-
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
   --server-port 7777 \
@@ -39,12 +37,10 @@ python -m atom.entrypoints.openai_server \
 ```bash
 #!/bin/bash
 
-model_path=/shared/data/amd_int/models/GLM-5.2-FP8
+model_path=zai-org/GLM-5-FP8
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
 TP=4
-
-rm -rf /root/.cache/atom/*
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
@@ -65,8 +61,6 @@ export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
 TP=4
 
-rm -rf /root/.cache/atom/*
-
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
   --server-port 8000 \
@@ -85,8 +79,6 @@ model_path=amd/GLM-5.2-MXFP4
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
 export AITER_USE_FLYDSL_MOE_SORTING=1
 TP=4
-
-rm -rf /root/.cache/atom/*
 
 python -m atom.entrypoints.openai_server \
   --model "$model_path" \
