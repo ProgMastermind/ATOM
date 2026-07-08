@@ -47,7 +47,7 @@ python -m atom.entrypoints.openai_server \
   --server-port 8000 \
   --kv_cache_dtype fp8 \
   --no-enable_prefix_caching \
-  --online_quant_config '{"layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}}' \
+  --online_quant_config '{"global_quant_config": "ptpc_fp8", "layer_quant_config":{"model.layers.*.mlp.experts":"mxfp8"}, "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate"]}' \
   -tp $TP 2>&1 | tee server.log &
 ```
 
