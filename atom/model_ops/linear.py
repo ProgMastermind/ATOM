@@ -201,7 +201,7 @@ def gemm_a4w4_quant(
             device=x.device,
         )
         if x_scale is None:
-            # quant with no shuffle, then shuffle
+            # quant with no shuffle + manual shuffle + collapse
             x, x_scale = quant_mxfp4_act_preshuffle(
                 x, params_dtype, m, MXFP4_QUANT_BLOCK_SIZE
             )
@@ -774,7 +774,7 @@ class LinearBase(nn.Module):
                     else:
                         shuffle_weights(self.weight)
                 # self.weight_scale.data = fp4_utils.e8m0_shuffle(self.weight_scale.data)
-        # shuffle the weight once
+        # shuffle the weight scale once
         if self.quant_type == QuantType.per_1x32 and (
             self.params_dtype != dtypes.fp4x2 or not use_fp4_non_shuffle_triton_gemm()
         ):
