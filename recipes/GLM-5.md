@@ -91,8 +91,17 @@ python -m atom.entrypoints.openai_server \
   -tp $TP 2>&1 | tee server_mtp.log &
 ```
 
+### Offline Inference with DP Attention + Expert Parallel
+
+```bash
+#!/bin/bash
+
+python -m atom.examples.simple_inference --model zai-org/GLM-5-FP8 -tp 8 --enable-dp-attention --enable-expert-parallel
+```
+
 Tips on server configuration:
 - We suggest using fp8 kv cache for better memory efficiency in the serving mode.
+- DP attention + EP MoE mode does not support fp8 kv cache when gqa=8, so `--kv_cache_dtype fp8` should not be used with `--enable-dp-attention --enable-expert-parallel`.
 - GLM-5 reuses the DeepSeek v3 implementation in ATOM (MLA attention, MoE routing), so all DeepSeek v3 optimizations apply automatically.
 - No `--trust-remote-code` is needed since ATOM has built-in support for `GlmMoeDsaForCausalLM`.
 
