@@ -312,7 +312,7 @@ class RMSNorm(nn.Module):
             "kind": "rmsnorm_activation",
         }
 
-    @mark_trace(prefix="rmsnorm", torch_compile=True)
+    @mark_trace
     def forward(
         self,
         x: torch.Tensor,

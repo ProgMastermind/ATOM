@@ -507,21 +507,123 @@ class EventIndex:
 # =============================================================================
 
 
-def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -> None:
-    """
-    Parse prefill phase from a run trace (no warmup mixed in this trace).
-    """
-    # CPU side prefill annotations.
-    # Matches "prefill[bs=1 tok=115 ctx=115]" format.
-    prefills = [
+def find_prefill_events(events: List[Dict]) -> List[Dict]:
+    """Return CPU-side prefill annotations sorted by start time."""
+    return sorted(
+        [
+            e
+            for e in events
+            if e.get("name", "").startswith("prefill[")
+            and e.get("ph") == "X"
+            and e.get("cat") == "user_annotation"
+        ],
+        key=lambda x: x["ts"],
+    )
+
+
+def same_thread_duration_events(events: List[Dict], anchor: Dict) -> List[Dict]:
+    """Events on the same CPU lane as ``anchor``."""
+    return [
         e
         for e in events
-        if e.get("name", "").startswith("prefill[")
-        and e.get("ph") == "X"
-        and e.get("cat") == "user_annotation"
+        if e.get("ph") == "X"
+        and e.get("tid") == anchor.get("tid")
+        and e.get("pid") == anchor.get("pid")
     ]
-    prefills = sorted(prefills, key=lambda x: x["ts"])
 
+
+def collect_prefill_launch_modules(
+    prefill_event: Dict, prefill_idx: EventIndex
+) -> List[Dict[str, Any]]:
+    """Collect level-2 prefill modules whose subtree launches GPU work."""
+    level1_children = prefill_idx.get_direct_children(prefill_event)
+    launch_items: List[Dict[str, Any]] = []
+    for l1 in level1_children:
+        l1_name = l1.get("name", "<unknown>")
+        for l2 in prefill_idx.get_direct_children(l1):
+            if prefill_idx.has_kernel_launch(l2):
+                launch_items.append({"level1_name": l1_name, "level2_event": l2})
+    return launch_items
+
+
+def _runtime_launches_by_ts(events: List[Dict]) -> Tuple[List[Dict], List[float]]:
+    launches = [
+        e
+        for e in events
+        if e.get("cat") == "cuda_runtime" and is_kernel_launch(e.get("name", ""))
+    ]
+    launches.sort(key=lambda x: x.get("ts", 0))
+    return launches, [e.get("ts", 0) for e in launches]
+
+
+def _kernel_index_by_correlation(
+    events: List[Dict], corr_needed: set
+) -> Dict[Any, List[Dict]]:
+    kernel_by_corr: Dict[Any, List[Dict]] = {}
+    if not corr_needed:
+        return kernel_by_corr
+    for e in events:
+        if e.get("ph") != "X" or e.get("cat") != "kernel":
+            continue
+        corr = (e.get("args") or {}).get("correlation")
+        if corr is None or corr not in corr_needed:
+            continue
+        kernel_by_corr.setdefault(corr, []).append(e)
+    for corr in kernel_by_corr:
+        kernel_by_corr[corr].sort(key=lambda x: x.get("ts", 0))
+    return kernel_by_corr
+
+
+def map_prefill_modules_to_kernels(
+    all_events: List[Dict],
+    prefill_thread_events: List[Dict],
+    launch_items: List[Dict[str, Any]],
+) -> List[List[Dict[str, Any]]]:
+    """Map each prefill module to GPU kernels via same-trace correlation ids."""
+    runtime_launches, runtime_launch_ts = _runtime_launches_by_ts(prefill_thread_events)
+    item_corrs: List[List[Any]] = []
+    corr_needed = set()
+
+    for item in launch_items:
+        event = item["level2_event"]
+        start = event.get("ts", 0)
+        end = start + event.get("dur", 0)
+        left = bisect.bisect_left(runtime_launch_ts, start)
+        right = bisect.bisect_right(runtime_launch_ts, end)
+        corrs = []
+        for launch in runtime_launches[left:right]:
+            corr = (launch.get("args") or {}).get("correlation")
+            if corr is not None:
+                corr_needed.add(corr)
+                corrs.append(corr)
+        item_corrs.append(corrs)
+
+    kernel_by_corr = _kernel_index_by_correlation(all_events, corr_needed)
+    item_kernels: List[List[Dict[str, Any]]] = []
+    for corrs in item_corrs:
+        kernels: List[Dict[str, Any]] = []
+        for corr in corrs:
+            for k in kernel_by_corr.get(corr, []):
+                kernels.append({"name": k.get("name", "N/A"), "dur": k.get("dur", 0)})
+        item_kernels.append(kernels)
+    return item_kernels
+
+
+def resolve_prefill_module_name(event: Dict[str, Any], prefill_idx: EventIndex) -> str:
+    """Use the first launch-bearing child for MoE container modules."""
+    mod_name = event.get("name", "<unknown>")
+    if "moe" not in mod_name.lower():
+        return mod_name
+    children = prefill_idx.get_direct_children(event)
+    children_with_launch = [c for c in children if prefill_idx.has_kernel_launch(c)]
+    if children_with_launch:
+        return children_with_launch[0].get("name", mod_name)
+    return mod_name
+
+
+def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -> None:
+    """Parse prefill from a run trace using same-trace launch correlations."""
+    prefills = find_prefill_events(events)
     if not prefills:
         print("No prefill (user_annotation) events found.")
         write_breakdown_xlsx(output_xlsx, [], sheet_name="prefill")
@@ -536,126 +638,42 @@ def parse_prefill(events: List[Dict], output_xlsx: str, target_layer: int = 3) -
         f"(ts={actual_prefill.get('ts', 0):.0f}, dur={actual_prefill.get('dur', 0):.0f})"
     )
 
-    # Build prefill hierarchy on the same thread as the selected CPU prefill.
-    # Using thread affinity is more robust than category-only filtering.
-    prefill_tid = actual_prefill.get("tid")
-    prefill_pid = actual_prefill.get("pid")
-    prefill_hierarchy_events = [
-        e
-        for e in events
-        if e.get("ph") == "X"
-        and e.get("tid") == prefill_tid
-        and e.get("pid") == prefill_pid
-    ]
-    # Build index once for fast subtree queries in prefill parsing.
-    prefill_idx = EventIndex(prefill_hierarchy_events)
-    level1_children = prefill_idx.get_direct_children(actual_prefill)
+    prefill_thread_events = same_thread_duration_events(events, actual_prefill)
+    prefill_idx = EventIndex(prefill_thread_events)
+    launch_items = collect_prefill_launch_modules(actual_prefill, prefill_idx)
     print(
-        f"Prefill level 1 (same thread pid={prefill_pid}, tid={prefill_tid}): "
-        f"{len(level1_children)} nodes"
+        "Prefill level 1 "
+        f"(same thread pid={actual_prefill.get('pid')}, "
+        f"tid={actual_prefill.get('tid')}): "
+        f"{len(prefill_idx.get_direct_children(actual_prefill))} nodes"
     )
+    print(f"Level2 children with kernel launch: {len(launch_items)}")
 
-    # Keep only level2 children that have kernel launch in their subtree.
-    launch_level2_items = []
-    for l1 in level1_children:
-        l1_name = l1.get("name", "<unknown>")
-        level2_children = prefill_idx.get_direct_children(l1)
-        level2_with_launch = [
-            l2 for l2 in level2_children if prefill_idx.has_kernel_launch(l2)
-        ]
-        for l2 in level2_with_launch:
-            launch_level2_items.append(
-                {
-                    "level1_name": l1_name,
-                    "level2_event": l2,
-                }
-            )
-
-    print(f"Level2 children with kernel launch: {len(launch_level2_items)}")
-
-    # Layer extraction by rmsnorm positions:
-    # each layer has 2 rmsnorm modules, layer N starts at rmsnorm index 2*N (0-based).
     all_norm_indices = [
         i
-        for i, item in enumerate(launch_level2_items)
+        for i, item in enumerate(launch_items)
         if is_strict_norm_name(item["level2_event"].get("name", ""))
     ]
-
-    # Build launch->kernel mapping by correlation id.
-    # Build launch candidates from current prefill thread/range once.
-    runtime_launches = [
-        e
-        for e in prefill_hierarchy_events
-        if e.get("cat") == "cuda_runtime" and is_kernel_launch(e.get("name", ""))
-    ]
-    runtime_launches.sort(key=lambda x: x.get("ts", 0))
-    runtime_launch_ts = [e.get("ts", 0) for e in runtime_launches]
-
-    item_corrs: List[List[Any]] = []
-    corr_needed = set()
-    for item in launch_level2_items:
-        l2 = item["level2_event"]
-        l2_start = l2.get("ts", 0)
-        l2_end = l2_start + l2.get("dur", 0)
-
-        left = bisect.bisect_left(runtime_launch_ts, l2_start)
-        right = bisect.bisect_right(runtime_launch_ts, l2_end)
-        launches_in_l2 = runtime_launches[left:right]
-        curr_corrs = []
-        for launch in launches_in_l2:
-            corr = (launch.get("args") or {}).get("correlation")
-            if corr is not None:
-                corr_needed.add(corr)
-                curr_corrs.append(corr)
-        item_corrs.append(curr_corrs)
-
-    # Build kernel index only for correlations we actually need.
-    kernel_by_corr: Dict[Any, List[Dict]] = {}
-    if corr_needed:
-        for e in events:
-            if e.get("ph") != "X" or e.get("cat") != "kernel":
-                continue
-            corr = (e.get("args") or {}).get("correlation")
-            if corr is None or corr not in corr_needed:
-                continue
-            kernel_by_corr.setdefault(corr, []).append(e)
-        for corr in kernel_by_corr:
-            kernel_by_corr[corr].sort(key=lambda x: x.get("ts", 0))
-
-    item_kernels: List[List[Dict[str, Any]]] = []
-    for corrs in item_corrs:
-        kernels = []
-        for corr in corrs:
-            for k in kernel_by_corr.get(corr, []):
-                kernels.append({"name": k.get("name", "N/A"), "dur": k.get("dur", 0)})
-        item_kernels.append(kernels)
-
-    def _resolve_moe_child_name_prefill(event: Dict[str, Any]) -> str:
-        mod_name = event.get("name", "<unknown>")
-        if "moe" not in mod_name.lower():
-            return mod_name
-        children = prefill_idx.get_direct_children(event)
-        children_with_launch = [c for c in children if prefill_idx.has_kernel_launch(c)]
-        if children_with_launch:
-            return children_with_launch[0].get("name", mod_name)
-        return mod_name
+    item_kernels = map_prefill_modules_to_kernels(
+        events, prefill_thread_events, launch_items
+    )
 
     def build_rows_from_item_range(start: int, end: int) -> List[List[Any]]:
-        rows = []
+        rows: List[List[Any]] = []
         for i in range(start, end):
-            item = launch_level2_items[i]
-            mod_name = _resolve_moe_child_name_prefill(item["level2_event"])
+            mod_name = resolve_prefill_module_name(
+                launch_items[i]["level2_event"], prefill_idx
+            )
             if should_filter_prefill(mod_name):
                 continue
             kernels = [k for k in item_kernels[i] if k["name"] not in ("", "N/A")]
-            if not kernels:
-                continue
-            rows.extend(process_module(mod_name, len(kernels), 0, kernels))
+            if kernels:
+                rows.extend(process_module(mod_name, len(kernels), 0, kernels))
         return rows
 
     _extract_layer_and_write(
         all_norm_indices,
-        len(launch_level2_items),
+        len(launch_items),
         target_layer,
         "Prefill",
         "prefill",
