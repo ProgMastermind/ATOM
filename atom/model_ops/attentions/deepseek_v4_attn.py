@@ -432,13 +432,19 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
             + len(self.hca_layers) * hca_main
         )
 
+    def swa_block_bytes_per_layer(self) -> int:
+        """paged-SWA: bytes of ONE SWA physical block for ONE layer
+        (full-resolution, ratio-1 = block_size tokens x head_dim x classical
+        elem). Single source for the per-layer SWA block size, reused by both
+        `swa_pool_block_bytes` and the KV-transfer region stride."""
+        return self.block_size * self.head_dim * self._classical_dtype.itemsize
+
     def swa_pool_block_bytes(self) -> int:
         """paged-SWA: bytes of ONE SWA physical block across all layers
         (full-resolution, ratio-1). This is exactly the SWA term that
         `compute_block_bytes` adds; the budget moves it to a separate
         `num_swa_blocks`-sized pool instead of charging it per compressed block."""
-        elem_bf16 = self._classical_dtype.itemsize
-        return self.num_layers * self.block_size * self.head_dim * elem_bf16
+        return self.num_layers * self.swa_block_bytes_per_layer()
 
     def swa_pool_num_blocks(self, max_num_seqs: int, max_model_len: int) -> int:
         """Size the windowed SWA pool (vLLM-aligned; chunked-prefill freeing).
@@ -499,16 +505,16 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
                         read by `cp_gather_indexer_k_quant_cache`).
           - HCA Main:   k2=1 entry × head_dim BF16
         """
-        elem_bf16 = self._classical_dtype.itemsize
-        csa_main_per_block = self.k1_csa * self.head_dim * elem_bf16
+        elem_classical = self._classical_dtype.itemsize
+        csa_main_per_block = self.k1_csa * self.head_dim * elem_classical
         csa_idx_per_block = self.k1_csa * self._aligned_index_dim  # fp8 = 1B
-        hca_main_per_block = self.k2_hca * self.head_dim * elem_bf16
+        hca_main_per_block = self.k2_hca * self.head_dim * elem_classical
         # paged-SWA: the sliding-window KV is content-addressed, one full-
         # resolution (ratio-1) entry per original token in EVERY layer, so each
         # block carries `block_size * head_dim` BF16 of SWA per layer. This term
         # is charged here but the budget (model_runner.get_num_blocks) strips it
         # back out into the separate window-freed num_swa_blocks pool.
-        swa_per_block = self.block_size * self.head_dim * elem_bf16
+        swa_per_block = self.block_size * self.head_dim * elem_classical
         return (
             len(self.csa_layers) * (csa_main_per_block + csa_idx_per_block)
             + len(self.hca_layers) * hca_main_per_block
@@ -804,7 +810,7 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # region is emitted below as swa_block_regions (keyed by
         # seq.swa_block_table, only the live window is transferred).
         swa_pages = self.model_runner.num_swa_blocks * self.block_size
-        elem_bf16 = 2
+        elem_classical = self._classical_dtype.itemsize
         elem_fp32 = 4
 
         block_regions: list[KVTransferRegion] = []
@@ -814,17 +820,17 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # Block regions: compress tail per layer
         for layer_id in range(self.num_layers):
             uv = runner.v4_unified_kv[layer_id]
-            compress_base = uv.data_ptr() + swa_pages * self.head_dim * elem_bf16
+            compress_base = uv.data_ptr() + swa_pages * self.head_dim * elem_classical
             compress_total = (
-                uv.numel() * elem_bf16 - swa_pages * self.head_dim * elem_bf16
+                uv.numel() * elem_classical - swa_pages * self.head_dim * elem_classical
             )
             if compress_total <= 0:
                 continue
             ratio = self.compress_ratios[layer_id]
             if ratio == 4:
-                bpb = self.k1_csa * self.head_dim * elem_bf16
+                bpb = self.k1_csa * self.head_dim * elem_classical
             elif ratio == 128:
-                bpb = self.k2_hca * self.head_dim * elem_bf16
+                bpb = self.k2_hca * self.head_dim * elem_classical
             else:
                 continue
             block_regions.append(KVTransferRegion(compress_base, compress_total, bpb))
@@ -843,13 +849,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # swa_block_table — window-freeing leaves only the live tail (the last
         # ~128-token block) as non-(-1) entries, so only that gets transferred.
         # block b's SWA lives at uv[0] + b*block_size*head_dim*elem.
-        swa_block_bytes = self.block_size * self.head_dim * elem_bf16
+        swa_block_bytes = self.swa_block_bytes_per_layer()
         for layer_id in range(self.num_layers):
             uv = runner.v4_unified_kv[layer_id]
             swa_block_regions.append(
                 KVTransferRegion(
                     uv.data_ptr(),
-                    swa_pages * self.head_dim * elem_bf16,
+                    swa_pages * self.head_dim * elem_classical,
                     swa_block_bytes,
                 )
             )
