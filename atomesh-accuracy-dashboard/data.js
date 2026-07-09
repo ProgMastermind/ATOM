@@ -1,5 +1,5 @@
 window.BENCHMARK_DATA = {
-  "lastUpdate": 1783478192193,
+  "lastUpdate": 1783617780634,
   "repoUrl": "https://github.com/ROCm/ATOM",
   "entries": {
     "Benchmark": [
@@ -738,6 +738,57 @@ window.BENCHMARK_DATA = {
             "value": 0.7604,
             "unit": "score",
             "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/28912426945 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202607071606 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7604 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          }
+        ]
+      },
+      {
+        "commit": {
+          "author": {
+            "name": "Lingpeng Jin",
+            "username": "valarLip",
+            "email": "103567126+valarLip@users.noreply.github.com"
+          },
+          "committer": {
+            "name": "GitHub",
+            "username": "web-flow",
+            "email": "noreply@github.com"
+          },
+          "id": "dd64a5f1ae818fd81bec48d8b087d175c68f446f",
+          "message": "fix(dsv4): align TBO v4_batch_id_per_token buffer to int32 (#1526)\n\nThe ubatch (TBO) allocation of v4_batch_id_per_token was int64 while the\nnon-ubatch allocation was already int32. The staged numpy array is int32\n(np.full(..., dtype=np.int32)) and _stage() asserts arr.dtype == buffer.dtype,\nso serving with --enable-tbo hit the dtype-mismatch assertion the moment it\nstaged batch_id_per_token. Make the ubatch buffer int32 to match the array,\nthe non-ubatch buffer, and the downstream int32 consumers.\n\nint32 is correct here: batch_id is used as a PyTorch advanced index\n(cu_committed_gpu[batch_id_per_token_gpu]), which accepts int32, and the\ndownstream kernels (deepgemm_fp8_paged_mqa_logits, top_k_per_row_decode,\nflydsl SWA scatter) all want / tolerate int32.\n\nAlso fix two stale docs that contradicted the code:\n- _stage docstring said \"Auto-casts dtype\" but the body asserts dtype equality.\n- A comment claimed \"int64 batch_id is mandated by PyTorch fancy indexing\".",
+          "timestamp": "2026-07-09T13:59:56Z",
+          "url": "https://github.com/ROCm/ATOM/commit/dd64a5f1ae818fd81bec48d8b087d175c68f446f"
+        },
+        "date": 1783617762999,
+        "tool": "customBiggerIsBetter",
+        "benches": [
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP accuracy (GSM8K)",
+            "value": 0.9454,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29035235790 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202607091539 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9462 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP MTP acceptance (%)",
+            "value": 64.7,
+            "unit": "%",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29035235790 | Threshold: 0.94 | Baseline: 0.96 | BaselineModel: deepseek-ai/DeepSeek-V4-Pro | BaselineNote: Same base model as DeepSeek-V4-Pro FP8 (MTP-3). | Docker: rocm/atom-dev:nightly_202607091539 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.9462 | fewshot: 3 | Model: /models/deepseek-ai/DeepSeek-V4-Pro"
+          },
+          {
+            "name": "ATOMesh::DeepSeek-V4-Pro MTP avg toks/fwd (tok/fwd)",
+            "value": 2.94,
+            "unit": "tok/fwd"
+          },
+          {
+            "name": "ATOMesh::Meta-Llama-3-8B-Instruct accuracy (GSM8K)",
+            "value": 0.7278,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29035235790 | Threshold: 0.73 | Baseline: 0.75 | BaselineModel: meta-llama/Meta-Llama-3-8B-Instruct | BaselineNote: HF reports 0.796 but 8-shot CoT; CI uses 3-shot, not comparable | Docker: rocm/atom-dev:nightly_202607091539 | GPU: AMD Instinct MI355X | VRAM: 252GB | ROCm: 7.2.4 | strict-match: 0.7278 | fewshot: 3 | Model: /models/meta-llama/Meta-Llama-3-8B-Instruct"
+          },
+          {
+            "name": "ATOMesh::gpt-oss-120b accuracy (GSM8K)",
+            "value": 0.8855,
+            "unit": "score",
+            "extra": "Run: https://github.com/ROCm/ATOM/actions/runs/29035235790 | Threshold: 0.87 | Baseline: 0.9 | BaselineModel: openai/gpt-oss-120b | BaselineNote: No public GSM8K baseline available | Docker: rocm/atom-dev:nightly_202607091539 | GPU: AMD Radeon Graphics | VRAM: 288GB | ROCm: 7.2.4 | strict-match: 0.3586 | fewshot: 3 | Model: /models/openai/gpt-oss-120b"
           }
         ]
       }
