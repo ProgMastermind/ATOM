@@ -86,7 +86,7 @@ python -m atom.entrypoints.openai_server \
   --server-port 8004 \
   --kv_cache_dtype fp8 \
   --no-enable_prefix_caching \
-  --online_quant_config '{"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "*expert*"]}' \
+  --online_quant_config '{"global_quant_config":"ptpc_fp8","exclude_layer":["lm_head","model.embed_tokens","*.mlp.gate", "model.layers.[0-9].mlp.*expert*","model.layers.[1-6][0-9].mlp.*expert*","model.layers.7[0-7].mlp.*expert*"]}' \
   --num-speculative-tokens 3 \
   --method mtp \
   -tp $TP 2>&1 | tee server_mtp.log &
