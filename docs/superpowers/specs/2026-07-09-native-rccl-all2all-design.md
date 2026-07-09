@@ -141,13 +141,36 @@ the per-(token,expert) contributions back to `[num_tokens, hidden]`, weighting b
 Constraint: constant tensor shapes across capture/replay and **no host sync** on
 routing tensors (`topk_ids` never leaves device).
 
-Fixed per-rank capacity: `C = graph_bs * num_experts_per_token` (the max
-(token,expert) pairs one rank can send to any single destination under the
-uniform-decode batch). `C` is derived from `context.graph_bs`, so it is constant
-for a given captured graph.
+**Per-rank batch sizes differ across DP ranks.** Under DP+EP each DP rank runs
+attention on its own local decode batch, but the MoE all2all crosses all EP
+ranks, so the send/recv capacity cannot be sized from the *local* batch. ATOM
+already exchanges per-rank token counts **before the step** via
+`DPMetadata.num_tokens_across_dp` (an `all_reduce` on the DP cpu group) and
+`.item()`s `max_tokens_across_dp` at metadata-build time — outside any graph.
+In `dp_uniform_decode` mode this is exactly why `ModelRunner._preprocess` sets
+`num_input_tokens = max_tokens` and `ForwardMode.decide` makes `moe_pad_bs` /
+`context.graph_bs` **cross-DP unified**: every rank pads to the same captured
+size. The RCCL backend builds on this — it does not add a new collective.
 
-`prepare()` when not `is_prefill`:
+Fixed per-rank capacity: `C = graph_bs * num_experts_per_token`, where
+`context.graph_bs` is the **cross-DP-unified** padded batch (the captured size ≥
+`max_tokens_across_dp`, picked in `ForwardMode.decide`). Because every DP/EP rank
+sees the identical `graph_bs`, `C` is the same constant on all ranks and across
+capture/replay — so the equal-split `all_to_all_single` never shape-mismatches.
+`C` is a Python int resolved on host before capture (from the pre-step count
+exchange), never an in-graph `.item()`.
 
+Non-uniform decode (`dp_uniform_decode=False`) is forced eager today
+(`use_cudagraph=False`) and MoE uses the variable-length path; the RCCL backend
+handles it with the prefill-style variable-split `all_to_all_single` (§4), since
+host sync is permitted when not capturing. Only `dp_uniform_decode=True` uses the
+fixed-capacity graph path below.
+
+`prepare()` when `not is_prefill` and `dp_uniform_decode`:
+
+0. Read `C` from `context.graph_bs` (cross-DP-unified, resolved on host before
+   capture from the pre-step `num_tokens_across_dp` exchange — §5 intro). No
+   collective and no `.item()` happen here inside the graph.
 1. `topk_ids` stays on device.
 2. **Device pack.** A device operation (Triton or `torch.scatter_`-based) builds
    a fixed `[world_size, C, hidden]` send buffer: for each local (token, expert)
@@ -210,6 +233,11 @@ capture/replay; the decode path here follows the same constant-shape discipline.
 - **CUDA-graph smoke test:** capture the decode `prepare`+`finalize` under a
   graph and replay with different (but ≤ graph_bs) token counts; assert no host
   sync (no `.item()`/`.cpu()` on routing tensors) and correct output.
+- **Differing per-DP-rank batch test:** simulate DP ranks with unequal local
+  decode batches; assert the fixed capacity `C` derived from the cross-DP-unified
+  `graph_bs` is identical on every rank and the equal-split `all_to_all_single`
+  does not shape-mismatch. Complements the smoke test by exercising the exact
+  bug this revision fixes.
 - **world_size==1 test:** bypass path returns the reference weighted combine.
 
 ## 9. Files touched
