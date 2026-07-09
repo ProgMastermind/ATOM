@@ -471,11 +471,13 @@ class DeepseekV4AttentionMetadataBuilder(CommonAttentionBuilder):
         # hits "No free SWA blocks" at high concurrency. MTP off → max_spec_steps
         # == 0 → win_with_spec == window, so this is a no-op for non-spec runs.
         per_decode = (self.win_with_spec + bs - 1) // bs + 1
-        num_tokens = min(
-            max(0, self.window_size - 1) + self.max_num_batched_tokens, max_model_len
-        )
-        one_prefill = (num_tokens + bs - 1) // bs + 1
-        return one_prefill + max_num_seqs * per_decode + 64
+        # Window-only prefill (ensure_for_tokens materializes only the trailing
+        # window, not the whole chunk): a prefilling seq now holds the same
+        # ~per_decode SWA blocks as a decoding seq, already covered by the
+        # per-seq term. The old fat `one_prefill` term (a full
+        # max_num_batched_tokens chunk's SWA, ~128 blocks) is dead under
+        # window-only — dropped. `+ 64` keeps a slide-boundary safety margin.
+        return max_num_seqs * per_decode + 64
 
     def slots_per_req(self) -> int:
         # State cache is one slot per req regardless of MTP. The MTP draft

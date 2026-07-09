@@ -1839,6 +1839,18 @@ class DeepseekV4Attention(nn.Module):
         # (swa_kv[slot, pos%cache]); paged content-addressing needs the
         # block_tables-based swa_write below instead. Pass swa_kv=None so neither
         # the flydsl nor the Triton-fallback fused write fires.
+        # Decode FUSES the paged (content-addressed) SWA cache-write into the
+        # qk_norm_rope launch via swa_block_tables — this drops a separate
+        # _swa_write_kernel launch per layer (profiling showed the standalone
+        # write + its 11k launches were the paged-SWA decode overhead vs the
+        # old ring-fused path). The flydsl kernel writes
+        #   swa_kv[block_tables[bid, pos//bs]*bs + pos%bs] = kv_out[t]
+        # for every token (gated on batch_id>=0), matching the standalone
+        # swa_write exactly. Decode has no ordering hazard (unlike prefill,
+        # which writes its in-chunk SWA tail AFTER sparse_attn so chunked
+        # prefix reads see prior-chunk contents), so writing here (before the
+        # decode attention reads the window) is safe. Prefill → swa_kv=None,
+        # separate post-attn swa_write below.
         q_sa, kv, q_scale, kv_scale = qk_norm_rope_maybe_quant(
             q,
             kv_pre,
@@ -1852,22 +1864,13 @@ class DeepseekV4Attention(nn.Module):
             self.eps,
             quant_q=False,
             quant_k=False,
-            swa_kv=None,
+            swa_kv=self.swa_kv if is_decode else None,
+            batch_id_per_token=attn_md.batch_id_per_token if is_decode else None,
+            swa_block_tables=swa_block_tables_gpu if is_decode else None,
+            swa_block_size=swa_block_size if is_decode else None,
+            swa_cu_seqlens_q=attn_md.cu_seqlens_q if is_decode else None,
+            swa_write_per_batch=attn_md.max_seqlen_q if is_decode else None,
         )
-        # Decode SWA write (paged, content-addressed). Prefill writes its SWA
-        # AFTER sparse_attn (see below) so chunked prefix reads see prior-chunk
-        # contents; decode has no such ordering hazard, so write here before the
-        # decode attention reads the window.
-        if is_decode:
-            swa_write(
-                kv,
-                positions,
-                attn_md.cu_seqlens_q,
-                swa_block_tables_gpu,
-                self.swa_kv,
-                swa_block_size,
-                attn_md.max_seqlen_q,
-            )
         if _V4_USE_REF_QUANT:
             act_quant_inplace(kv[..., :-rd], 64, self.scale_fmt)
 
@@ -1978,9 +1981,16 @@ class DeepseekV4Attention(nn.Module):
             )  # [S, H, head_dim]
             # swa_write AFTER attn so chunked-prefill prefix SWA reads see the
             # prior chunk's contents (not this chunk's just-computed tail).
-            # paged-SWA: content-addressed via block_tables; write EVERY token
-            # of the chunk (write_per_batch = max_seqlen_q) so each token's SWA
-            # is stored at its own block slot for cross-request prefix reuse.
+            # OPT (window-only prefill write): only write each seq's trailing
+            # `window_size` tokens (not the whole chunk). SWA decode only ever
+            # reads the last `window` tokens, so this is correct for the seq's
+            # own decode; it drops cross-request prefix reuse of the middle SWA
+            # blocks. Cuts prefill scatter-writes ~ chunk_len/window (e.g. 64x
+            # at in8192) — kills the uncoalesced block_tables scatter that made
+            # concurrent prefill slow. Correct for single- AND multi-chunk:
+            # window(128) <= chunk size, so any token's window reaches back at
+            # most 127 tokens = within the prior chunk's written last-128;
+            # free_after_prefill_chunk keeps that trailing block until read.
             swa_write(
                 kv_full,
                 positions_full,
@@ -1988,7 +1998,7 @@ class DeepseekV4Attention(nn.Module):
                 swa_block_tables_gpu,
                 self.swa_kv,
                 swa_block_size,
-                attn_md.max_seqlen_q,
+                min(self.window_size, attn_md.max_seqlen_q),
             )
 
         # Inverse RoPE on output's rope dims to remove absolute-position

@@ -91,16 +91,16 @@ class SlidingWindowPool:
         return len(self.free_block_ids_set) >= n
 
     def admission_blocks(self, seq: Sequence) -> int:
-        """Peak concurrent SWA blocks one request holds during (chunked) prefill:
-        its trailing window plus the largest single chunk (bounded by the batch
-        token budget), capped by the prompt's block count. Admission gate instead
-        of the full `seq.num_blocks`, since SWA is filled incrementally and
-        window-freed per chunk. Mirrors vLLM max_admission_blocks_per_request."""
+        """Peak concurrent SWA blocks one request holds during (chunked) prefill.
+        Window-only prefill (ensure_for_tokens materializes only the trailing
+        `window` blocks, not the whole chunk) → peak footprint == the trailing
+        window = `tail_blocks` (+1 for the slide boundary), same as a decoding
+        seq — NOT the old `window-1 + max_num_batched_tokens` full-chunk span.
+        Capped by the prompt's block count. Admission gate instead of full
+        `seq.num_blocks` since SWA is filled incrementally + window-freed."""
         if not self.enabled:
             return 0
-        bs = self.block_size
-        span = max(0, self.window - 1) + max(self.max_num_batched_tokens, bs)
-        cap = (span + bs - 1) // bs + 1
+        cap = self.tail_blocks + 1
         return min(cap, seq.num_blocks)
 
     def bounded_hit(self, seq: Sequence, P: int, block_hashes: list[int]) -> int:
@@ -185,8 +185,17 @@ class SlidingWindowPool:
         if not self.enabled or num_new_tokens <= 0:
             return
         bs = self.block_size
+        seq_len = num_cached_tokens + num_new_tokens
         start_blk = num_cached_tokens // bs
-        end_blk = (num_cached_tokens + num_new_tokens - 1) // bs
+        end_blk = (seq_len - 1) // bs
+        # OPT (window-only alloc): only materialize the trailing-window blocks
+        # (blocks the SWA window will actually read + be written by the
+        # window-only swa_write). Earlier blocks stay -1 (never written/read),
+        # matching free_out_of_window's sentinel. Cuts prefill SWA allocation
+        # from O(chunk_len/bs) to O(window/bs) — pairs with the window-only
+        # swa_write in deepseek_v4.py. free_before mirrors free_out_of_window.
+        free_before = max(0, (seq_len - self.window) // bs)
+        start_blk = max(start_blk, free_before)
         table = seq.swa_block_table
         for i in range(start_blk, end_blk + 1):
             if i >= len(table):
