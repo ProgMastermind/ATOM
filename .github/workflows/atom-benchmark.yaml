@@ -383,15 +383,15 @@ jobs:
       # atom-dev image predating aiter #4159. See that step for rationale.
       - name: Patch aiter flydsl for paged-SWA (aiter#4159)
         run: |
-          F=/app/aiter-test/aiter/ops/flydsl/kernels/qk_norm_rope_quant.py
-          URL=https://raw.githubusercontent.com/ROCm/aiter/5dc443dad76567a970a77b7b5d098e46835603ec/aiter/ops/flydsl/kernels/qk_norm_rope_quant.py
-          docker exec atom-regression bash -lc "
+          URL="https://raw.githubusercontent.com/ROCm/aiter/5dc443dad76567a970a77b7b5d098e46835603ec/aiter/ops/flydsl/kernels/qk_norm_rope_quant.py"
+          docker exec -e AITER_FLYDSL_URL="$URL" atom-regression bash -lc '
             set -euo pipefail
-            curl -fsSL '$URL' -o \"\$F.new\"
-            grep -q swa_block_tables \"\$F.new\"
-            mv \"\$F.new\" \"\$F\"
-            echo 'patched flydsl qk_norm_rope_quant:'; md5sum \"\$F\"
-          "
+            F=/app/aiter-test/aiter/ops/flydsl/kernels/qk_norm_rope_quant.py
+            curl -fsSL "$AITER_FLYDSL_URL" -o "$F.new"
+            grep -q swa_block_tables "$F.new"
+            mv "$F.new" "$F"
+            echo "patched flydsl qk_norm_rope_quant:"; md5sum "$F"
+          '
 
       - name: Launch server
         env:
