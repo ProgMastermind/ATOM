@@ -89,10 +89,11 @@ _Answer:_
 
 ## Step 3 — PR Type Classification
 
-- [ ] **Performance optimization** → P1 (benchmark numbers), P2 (production shapes), P3 (reproducible)
-- [ ] **New aiter op usage / aiter API change** → E1 (aiter dep), E3 (dead param)
+- [ ] **Performance optimization** → P1 (benchmark numbers), P5 (setup cost excluded?), P2 (production shapes), P3 (reproducible)
+- [ ] **New aiter op usage / aiter API change** → E1 (aiter dep), B6 (new kwarg unhandled by all ATOM dispatch branches?), E3 (dead param)
+- [ ] **New constexpr / routing flag / new attribute key added** → B6 (do ALL dispatch branches handle the new value, or assert on it?), C3 (new arch string literal?)
 - [ ] **Model integration** (`atom/models/*.py`) → A2 (shared backbone coverage), Step 4 risk
-- [ ] **Dispatch logic change** → B1 (silent bypass), B2 (phase proxy), A3 (scope too broad)
+- [ ] **Dispatch logic change** → B1 (silent bypass), B2 (phase proxy), B6 (new value unhandled?), A3 (scope too broad)
 - [ ] **cudagraph / capture path** → B3 (cudagraph compatibility)
 - [ ] **Plugin / vLLM / SGLang interface** → E2 (bridge sync)
 - [ ] **Config / tuning** → A2 (other GPU archs), A3 (scope too broad)
@@ -245,6 +246,21 @@ Trigger: new `tl.constexpr` bool in a Triton kernel that disables a bounds/senti
 Real example (ATOM#1498): `CHECK_NEG_ONE_SENTINEL=False` disables -1 slot filter in paged prefill kernel; illegal access if any -1 slot appears without the check.
 → `⚠️ B4: [constexpr] disables [check] — document which caller invariant guarantees no [invalid value] on that path`
 
+**B5 — Accepted parameter silently discarded** ⚠️ (🔴 if controls output correctness)
+Function accepts a parameter in its signature but the value is never used: discarded with `del param`, commented out, unreachable due to `or True` short-circuit, or passed to a callee that immediately discards it.
+Severity: 🔴 if the discarded parameter controls output correctness (e.g., `expert_mask`, `guidance_scale`, `q_scale`) — callers passing non-default values silently get wrong output. ⚠️ if it controls a performance knob or optional feature with a working default.
+Exception: method overrides where the base class signature requires the parameter but this subclass legitimately doesn't use it — flag as 📝 with a note that the discard is structural.
+Real examples: `expert_mask` accepted but `# return None` commented out → TP expert-parallel callers silently routed wrong; `needs_independent_noise` from `prepare_model()` return tuple dropped in `prefill_forward`, sampler called without it — first token uses wrong sampling mode (ATOM#860); `needs_independent_noise` structurally `del`-ed inside ATOM_USE_TORCH_SAMPLER override → 📝 not 🔴.
+→ `🔴/⚠️ B5: [param] accepted in [fn] signature but never used — callers passing non-default values silently have no effect`
+
+**B6 — New dispatch value not handled by all paths, no warning** ⚠️/🔴
+When a PR introduces a new routing value to a multi-way dispatch — a new dtype, a new arch string, a new layout flag, a new `getattr` attribute key — every reachable dispatch branch must either (a) handle it explicitly, (b) fall through to a documented safe default, or (c) assert/warn before the wrong branch is reached. Silent fallback to an incorrect behavior is a bug.
+Severity: 🔴 if the wrong path produces incorrect output (wrong expert mapping, wrong kernel, wrong scale). ⚠️ if the wrong path is a safe-but-suboptimal default.
+Exception: an upstream assert/raise/isinstance check that prevents the bad value from reaching the branch → not B6. A runtime assert that fires for the dangerous combo → not B6.
+FP self-check: Is the uncovered branch actually reachable with the new value? Is there a caller contract preventing the bad combo?
+Real examples: `getattr(self.args,'n_shared_experts',0)` silent zero fallback — shared expert slots silently dropped from mapping with no warning if attribute absent (ATOM#1548); `x_pad_to_multiple=256` kwarg added to fused AR+RMSNorm call before aiter PR merged — TypeError at dispatch for all callers (ATOM#841).
+→ `🔴/⚠️ B6: [new value/attribute] reaches [branch] which assumes [old behavior] — [what wrong thing happens] — add assert or explicit handling`
+
 ---
 
 ### C — Hardcoded Arch / Dtype Assumptions
@@ -261,6 +277,13 @@ Use `tensor.dtype == fp8_fnuz` to check IS fnuz. Gating CONVERSION by arch is OK
 Real example (aiter#4073): valarLip: "check _is_fnuz by tensor's DType instead of arch."
 → `⚠️ C2: fnuz check uses arch name — use tensor.dtype comparison`
 
+**C3 — New GPU arch string or arch-specific constant hardcoded in dispatch** ⚠️
+**FP self-check first (do this before deciding to fire):** Search the unchanged lines of this file for the same arch string or constant value (e.g., `'gfx942'`, `576`). If it already appears on an unchanged line → **do not fire** (pre-existing style). Only proceed if it is genuinely new to this file.
+Trigger (only after self-check passes): a new `+` line introduces an arch string literal in a dispatch condition (`if arch == 'gfx942':`, `'gfx950' in arch_str`), or a magic constant tied to a specific arch/model config (`576` for MLA kv_lora_rank+qk_rope_head_dim), rather than deriving from config or a named constant.
+Also exempt: strings in comments, docstrings, or directory names; values imported from a central registry.
+Real examples: hardcoded `576` in `_bind_kv_cache_to_modules()` instead of `kv_lora_rank + qk_rope_head_dim` — breaks any MLA variant where the sum ≠ 576 (ATOM#860 → fire C3); `'gfx942'` already in `attention_mla.py` and new `+` line extends same pattern (→ skip, pre-existing style).
+→ `⚠️ C3: new arch-specific [string/constant] hardcoded in dispatch — derive from config or named constant`
+
 ---
 
 ### D — Uninitialized / Boundary State
@@ -271,6 +294,7 @@ _Rule numbers are aligned with aiter's D-section. D3 (hipblaslt tuning config) i
 **D1 — Atomic reduction on uninitialized buffer** 🔴
 `atomic_fmax(*ptr, val)` = `*ptr = max(*ptr, val)`. If `*ptr` is uninitialized (from `::empty()` / `torch.empty()`), garbage dominates the max → corrupted amax → corrupted FP8 descale → silent wrong quantization.
 Trigger: ATOM code passes a freshly-allocated `torch.empty()` tensor to an aiter kernel that uses atomic reductions internally (e.g., `fused_qk_norm_rope_cache_pts_quant_shuffle` v_amax buffers); or any new allocation on the `torch.empty` path near a kernel that calls `atomic_fmax`.
+Severity: 🔴 for atomic accumulation (atomic_fmax, atomicAdd) — garbage propagates into every output element. ⚠️ for partial-sum buffers where a zero-weight coefficient mathematically cancels the contribution (e.g., online softmax with empty batch: `exp(-inf) × garbage = 0`); still flag because `0.0 × NaN = NaN` on IEEE hardware if the allocator returns dirty pages.
 Real example (aiter#4015): yzhou103: "AiterTensor::empty does not zero-initialize... garbage in v_amax silently corrupts descale."
 → `🔴 D1: [buffer] passed to atomic kernel not zero-initialized — use torch.zeros not torch.empty`
 
@@ -306,6 +330,12 @@ Trigger: diff adds a new function decorated with `@compile_ops` or `torch.librar
 Python code calls a C++ / aiter kernel but doesn't assert `.is_contiguous()` or call `.contiguous()` on inputs that may arrive strided (slice of larger tensor, `.T`, output of non-contiguous `view()`). Kernel reads from wrong addresses — completely silent wrong result.
 Trigger: new call to an aiter kernel or C-extension; check that non-trivially-shaped inputs are either asserted contiguous or made contiguous before the call.
 → `⚠️ D8: [tensor] passed to [kernel] without contiguous check — add .contiguous() or assert .is_contiguous()`
+
+**D9 — INT32 overflow in GPU pointer arithmetic** 🔴
+Python wrapper or model code computes a buffer offset or index in `int32` (or `torch.int32`) when the product of dimensions can exceed 2^31 (~2 billion) at production scale.
+Common patterns: `token_id * (num_heads * head_dim)` overflows at token_id > 16M with H=32, D=128; `total_tokens * head_dim` overflows for long-context batches.
+Trigger: arithmetic involving `token_id`, `total_tokens`, `seq_start`, or `batch_offset` that produces a buffer address or index in int32 without an explicit widening cast to int64 before the multiply.
+→ `🔴 D9: [expr] in int32 — widen [token_id / total_tokens / seq_start] to int64 before multiplying by [stride]`
 
 ---
 
@@ -373,6 +403,12 @@ New attention / norm op tested only at full head count (TP=1 equivalent). At TP=
 Trigger: new kernel or dispatch path that takes per-device head count; PR shows only one head count without TP=4/8 variant.
 → `⚠️ P4: test covers only TP=1 head count — verify at num_heads÷TP=4 (e.g., [128→32])`
 
+**P5 — Benchmark timing excludes one-time setup cost** ⚠️
+Perf numbers exist but the timing window starts AFTER a one-time setup step whose cost is borne by real users on every cold start: weight shuffle/preshuffle, first-call JIT compile, model weight loading, or precompile of variant kernels. Omitting this makes a net-regression look like a speedup.
+Trigger: PR description shows a speedup but benchmark timing begins after `shuffle_weight()`, after `warmup_iters`, or inside an already-warm JIT cache. Check: would a user deploying this op from scratch see the same number?
+Real example: aiter#4166 — `shuffle_weight` excluded from timing; claimed 1.14x win is ~0.83x regression when included.
+→ `⚠️ P5: timing window excludes [setup step] — re-run benchmark including [shuffle_weight / first-call compile / precompile] to confirm net improvement`
+
 ---
 
 ### Housekeeping (quick scan)
@@ -385,7 +421,7 @@ Trigger: new kernel or dispatch path that takes per-device head count; PR shows 
 | TODO/stub in new path | `# TODO`, `# FIXME`, `raise NotImplementedError`, lone `pass` on a `+` line inside a new branch | `⚠️ HK4: [location] — incomplete implementation in new code path, will silently not execute on default path` |
 | Undocumented new env var | `os.environ.get("ATOM_...` or `os.environ.get("AITER_...` on a `+` line | `📝 HK5: new env var [NAME] not documented — add to README or known knobs list` |
 | Test reference dtype promotion | New test reference impl uses Python float literal (`1.0 + weight`, `0.5 * x.float()`) or explicit upcast (`.to(torch.float32)`, `.double()`) promoting to fp32 while kernel runs in bf16/fp8 — comparison calibrated against wrong-precision baseline | `⚠️ HK6: reference [fn] promotes to fp32 — cast back to [kernel dtype] before comparison` |
-| New third-party dependency | New package in `requirements*.txt`, `setup.py`, `pyproject.toml`; or new top-level `import [pkg]` not already a project dep | `📝 HK7: new dependency [pkg] — justify why it's needed and add to requirements` |
+| New third-party dependency | New package in `requirements*.txt`, `setup.py`, `pyproject.toml`; or new top-level `import [pkg]` not already a project dep. Exception: ROCm system packages (`amdsmi`, `hip`, `rccl`) are intentionally not on PyPI — flag only if there is no `try/except ImportError` guard AND no comment explaining the ROCm-only dependency | `📝 HK7: new dependency [pkg] — add to requirements, or add try/except ImportError with a comment for ROCm system packages` |
 
 ---
 
@@ -453,22 +489,23 @@ If the answer is yes, add it to the findings. If the answer is no, proceed.
 📝 [note]
 ```
 
-Each finding must have two parts:
+Each finding must have **three parts**:
 1. **Problem** — what exactly is wrong, with file/line if relevant
-2. **Decision needed** — what the human reviewer needs to verify or ask for
+2. **Impact** — what goes wrong at runtime if this is not fixed (wrong output / crash / OOM / perf regression)
+3. **Action** — end with a verb phrase: "**Author must** [do X]" or "**Reviewer should ask** [Y]" — no verb = incomplete finding, do not include
 
 Do NOT use rule codes (P1, D2, A1…) in output — they are internal labels only.
 
 Examples of good findings:
-- `🔴 deepseek_v2.py:1245 changes torch.zeros → torch.empty, but the old comment explicitly says "trailing pad must be zero for asm reader" and the new comment claims "never read" — direct contradiction. Author must cite the asm spec or a test proving padding is not read.`
-- `⚠️ PR claims 1.3–1.5x speedup but description has only profiling screenshots, no token/s numbers. Author must provide concrete benchmark data with units.`
-- `⚠️ Chunked indexer logic is copy-pasted verbatim into deepseek_v2.py and deepseek_v4.py. Author must confirm correctness was verified independently under v4's variable semantics.`
-- `📝 No corresponding ATOM consumer PR mentioned — who will call emit_bf16=True?`
+- `🔴 deepseek_v2.py:1245 changes torch.zeros → torch.empty, but the old comment explicitly says "trailing pad must be zero for asm reader" and the new comment claims "never read" — if padding IS read, every quantized token in the batch gets corrupted output silently. **Author must** cite the asm spec or a test proving padding is not read.`
+- `⚠️ PR claims 1.3–1.5x speedup but the benchmark starts after shuffle_weight() completes — users pay that cost on every cold start. **Author must** re-run with shuffle_weight included in the timing window and confirm the speedup holds.`
+- `⚠️ Chunked indexer logic is copy-pasted verbatim into deepseek_v2.py and deepseek_v4.py with only variable names changed — if v4's variable semantics differ, the formula silently produces wrong KV offsets for all v4 callers. **Author must** confirm correctness was verified independently under v4's variable layout.`
+- `📝 No corresponding ATOM consumer PR mentioned. **Reviewer should ask** who will pass emit_bf16=True to activate this path.`
 
-Examples of bad findings (too vague, no action):
-- `⚠️ Missing perf numbers` — no decision, no action
+Examples of bad findings (too vague, missing action verb):
+- `⚠️ Missing perf numbers` — no impact, no action
 - `🔴 D2 violation` — rule code means nothing to a reviewer
-- `📝 Check backbone files` — reviewer does not know what to do
+- `⚠️ The benchmark may not include setup cost` — no "Author must" conclusion
 
 ---
 
