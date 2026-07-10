@@ -1810,13 +1810,27 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
                 )
         return shared_buffer
 
-    def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
+    def build(
+        self,
+        common_prefix_len,
+        common_attn_metadata,
+        fast_build=False,
+        *,
+        _req_id_per_token=None,
+        _drafting=False,
+    ):
         num_tokens = common_attn_metadata.num_actual_tokens
-        starts = common_attn_metadata.query_start_loc_cpu.to(torch.int32)
-        seg_lengths = torch.diff(starts)
-        req_id_per_token = torch.repeat_interleave(
-            torch.arange(seg_lengths.shape[0], dtype=torch.int32), seg_lengths
-        )
+        if _req_id_per_token is not None:
+            # Draft path (see build_for_drafting): req_id_per_token was already
+            # produced on-GPU, so the copy_ below is device-to-device and the
+            # per-step pageable H2D sync is avoided.
+            req_id_per_token = _req_id_per_token
+        else:
+            starts = common_attn_metadata.query_start_loc_cpu.to(torch.int32)
+            seg_lengths = torch.diff(starts)
+            req_id_per_token = torch.repeat_interleave(
+                torch.arange(seg_lengths.shape[0], dtype=torch.int32), seg_lengths
+            )
         # Shrink-tail-only zeroing instead of three full-buffer fill_(0) every
         # step (the buffers are persistent across decode steps and zeros-init):
         #   - req_id_per_token_buffer / paged_kv_indices: the kernel only reads
@@ -1899,7 +1913,9 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         # adds no extra CPU work.
         num_reqs = common_attn_metadata.num_reqs
         decode_only = (
-            int(common_attn_metadata.max_query_len) == 1 and num_tokens == num_reqs
+            not _drafting
+            and int(common_attn_metadata.max_query_len) == 1
+            and num_tokens == num_reqs
         )
         metadata_key = None
         if decode_only:
@@ -1969,6 +1985,45 @@ class AiterMlaSparseMetadataBuilder(AttentionMetadataBuilder):
         )
 
         return attn_metadata
+
+    def build_for_drafting(self, common_attn_metadata, draft_index):
+        """Sync-free per-draft-step build for sparse MLA main attention.
+
+        vLLM's EagleProposer rebuilds attention metadata for every MTP draft
+        step. The inherited build_for_drafting just calls build(), which
+        constructs ``req_id_per_token`` on the host and copies it into a GPU
+        buffer -- a pageable, synchronous H2D copy that stalls the draft
+        model's kernel dispatch right at the target->draft boundary (this is
+        the H2D sync visible between the main and draft models in the trace).
+
+        During MTP/EAGLE drafting every request contributes exactly one decode
+        token, so ``req_id_per_token`` is simply ``arange(num_reqs)`` and can be
+        built on-GPU (device-to-device copy, no sync). We also pass
+        ``_drafting=True`` so build() skips the decode-only work-split
+        fingerprint (whose ``seq_lens.cpu()`` fallback would be another sync and
+        which MTP/spec batches invalidate anyway). Non-uniform batches (any
+        prefill or padding) fall back to the regular build().
+        """
+        num_reqs = common_attn_metadata.num_reqs
+        num_tokens = common_attn_metadata.num_actual_tokens
+        if not (
+            num_tokens == num_reqs and int(common_attn_metadata.max_query_len) == 1
+        ):
+            return self.build(
+                common_prefix_len=0,
+                common_attn_metadata=common_attn_metadata,
+                fast_build=True,
+            )
+        req_id_per_token = torch.arange(
+            num_tokens, dtype=torch.int32, device=self.device
+        )
+        return self.build(
+            common_prefix_len=0,
+            common_attn_metadata=common_attn_metadata,
+            fast_build=True,
+            _req_id_per_token=req_id_per_token,
+            _drafting=True,
+        )
 
 
 class AiterMlaSparseIndexerMetadataBuilder(AttentionMetadataBuilder):
