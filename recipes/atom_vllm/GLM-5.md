@@ -168,3 +168,122 @@ lm_eval --model local-completions \
         --tasks gsm8k \
         --num_fewshot 20
 ```
+
+## Good known
+
+Docker image:
+
+```text
+docker.io/rocm/atom-dev:vllm-v0.22.0-nightly_20260709
+```
+
+change atom to hexwang/vllm_glm_mtp and commit 65906a43765b10f05cd2648dda4b9bc774e8bbfb
+
+Command:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+ 
+rm -rf /root/.cache/vllm/torch_compile_cache
+rm -rf /root/.cache/atom/torch_compile_cache
+
+export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_USE_FLYDSL_MOE_SORTING=1
+
+export CUDA_VISIBLE_DEVICES=4,5,6,7
+
+model_path="${MODEL_PATH:-/shared/data/amd_int/models/GLM-5.2-MXFP4}"
+server_host="${SERVER_HOST:-localhost}"
+server_port="${PORT:-8013}"
+tensor_parallel_size="${TP_SIZE:-4}"
+gpu_memory_utilization="${GPU_MEMORY_UTILIZATION:-0.9}"
+max_num_batched_tokens="${MAX_NUM_BATCHED_TOKENS:-16384}"
+enable_prefix_caching="${ENABLE_PREFIX_CACHING:-1}"
+enable_mtp="${ENABLE_MTP:-1}"
+enable_profile="${ENABLE_PROFILE:-0}"
+profile_dir="${PROFILE_DIR:-$(pwd)/profile}"
+server_log="${SERVER_LOG:-$(pwd)/server.log}"
+server_pid_file="${SERVER_PID_FILE:-${server_log}.pid}"
+ 
+mkdir -p "$(dirname "${server_log}")"
+: > "${server_log}"
+
+# --kv-cache-dtype fp8 
+
+vllm_args=(
+    vllm serve "${model_path}"
+    --host "${server_host}"
+    --port "${server_port}"
+    --tensor-parallel-size "${tensor_parallel_size}"
+    --gpu_memory_utilization "${gpu_memory_utilization}"
+    --max-num-batched-tokens "${max_num_batched_tokens}"
+    --trust-remote-code
+    --async-scheduling
+    --additional-config '{"online_quant_config": {"global_quant_config": "ptpc_fp8", "exclude_layer": ["lm_head", "model.embed_tokens", "*.mlp.gate", "model.layers.[0-9].mlp.*expert*", "model.layers.[1-6][0-9].mlp.*expert*", "model.layers.7[0-7].mlp.*expert*"]}}'
+    --load-format fastsafetensors
+    --compilation-config '{"cudagraph_mode": "FULL_AND_PIECEWISE"}'
+    --seed 42
+)
+
+if [[ "${enable_prefix_caching}" != "1" ]]; then
+    vllm_args+=(--no-enable-prefix-caching)
+fi
+
+if [[ "${enable_mtp}" == "1" ]]; then
+    vllm_args+=(--speculative-config '{"method": "mtp", "num_speculative_tokens": 3}')
+    echo "MTP: ENABLED (mtp, num_speculative_tokens=3)"
+else
+    echo "MTP: DISABLED (ENABLE_MTP=${enable_mtp})"
+fi
+
+if [[ "${enable_profile}" == "1" ]]; then
+    mkdir -p "${profile_dir}"
+    profile_dir="$(cd "${profile_dir}" && pwd)"
+    vllm_args+=(
+        --profiler-config.profiler torch
+        --profiler-config.torch_profiler_dir "${profile_dir}"
+        --profiler-config.ignore_frontend true
+    )
+    echo "PROFILE: ENABLED (torch, dir=${profile_dir})"
+else
+    echo "PROFILE: DISABLED (ENABLE_PROFILE=${enable_profile})"
+fi
+ 
+(
+{
+    echo "Starting GLM vLLM server at ${server_host}:${server_port}"
+    echo "Log file: ${server_log}"
+    echo "PID file: ${server_pid_file}"
+    echo "Profile dir: ${profile_dir}"
+    printf 'Command:'
+    printf ' %q' "${vllm_args[@]}"
+    printf '\n'
+    "${vllm_args[@]}"
+} 2>&1 | tee -a "${server_log}"
+) &
+
+server_pid=$!
+echo "${server_pid}" > "${server_pid_file}"
+disown "${server_pid}" 2>/dev/null || true
+
+echo "GLM vLLM server started in background."
+echo "PID: ${server_pid}"
+echo "Log file: ${server_log}"
+echo "PID file: ${server_pid_file}"
+```
+
+Accuracy test command:
+
+```bash
+evalscope eval \
+  --model /shared/data/amd_int/models/GLM-5.2-MXFP4 \
+  --api-url http://localhost:8013/v1/chat/completions \
+  --api-key EMPTY \
+  --eval-type openai_api \
+  --datasets gpqa_diamond \
+  --eval-batch-size 32 \
+  --generation-config '{"max_tokens": 100000, "temperature": 1.0, "top_p": 0.95}' \
+  --seed 42 \
+  --timeout 7200 2>&1 | tee log.eval.log
+```
