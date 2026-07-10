@@ -95,7 +95,7 @@ from atom.utils.custom_register import direct_register_custom_op
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
-from atom.plugin import is_plugin_mode
+from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.vllm.attention.layer_sparse_mla import (
     IndexerDecoratorForPluginMode,
     DeepseekV32IndexerCacheDecoratorForPluginMode,
@@ -2439,8 +2439,16 @@ def use_replicated_vocab_embed(config: PretrainedConfig) -> bool:
     (``glm_moe_dsa``) — both the main model and its MTP draft — whose embedding is
     independent of the still TP-sharded ``lm_head`` (``tie_word_embeddings=False``),
     so the lookup is bit-identical to the sharded masked-embedding + all-reduce
-    path. Skipped in plugin mode (vLLM/SGLang/RTP own the embedding lifecycle) and
-    whenever the embedding is tied to the sharded head.
+    path.
+
+    Enabled under the **vLLM** plugin as well: its MTP proposer unconditionally
+    shares the *target* model's ``embed_tokens`` into the draft
+    (``llm_base_proposer._maybe_share_embeddings``), so replicating the main
+    model's table also removes the per-step all-reduce from the draft rollout —
+    and the plugin loader honours each param's ``weight_loader`` so every rank
+    loads the full (un-sharded) table. Left on the sharded path for the SGLang/RTP
+    plugins (their embedding lifecycle is not verified here) and whenever the
+    embedding is tied to the sharded head.
 
     The GLM-5.2 main model keeps ``model_type == "glm_moe_dsa"``; its MTP draft
     config has ``model_type`` rewritten to ``"deepseek_mtp"`` (see
@@ -2449,7 +2457,7 @@ def use_replicated_vocab_embed(config: PretrainedConfig) -> bool:
     """
     if not envs.ATOM_REPLICATE_VOCAB_EMBED:
         return False
-    if is_plugin_mode():
+    if is_plugin_mode() and not is_vllm():
         return False
     if getattr(config, "tie_word_embeddings", False):
         return False
@@ -2483,6 +2491,11 @@ class DeepseekV2Model(nn.Module):
                 self.embed_tokens = ReplicatedEmbedding(
                     config.vocab_size,
                     config.hidden_size,
+                )
+                logger.info(
+                    "vocab embedding: REPLICATED (full %d-row table per rank, "
+                    "no post-embed all-reduce)",
+                    config.vocab_size,
                 )
             else:
                 self.embed_tokens = VocabParallelEmbedding(
