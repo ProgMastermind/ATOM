@@ -467,13 +467,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
         quant_config: FusedMoEQuantConfig | None,
     ) -> FusedMoEPrepareAndFinalize | None:
         from aiter.dist.parallel_state import get_ep_group
-
-        all2all_manager = get_ep_group().device_communicator.all2all_manager
-        assert all2all_manager is not None
+        from atom.utils import envs
 
         prepare_finalize: FusedMoEPrepareAndFinalize | None = None
-
-        from atom.utils import envs
 
         if envs.ATOM_ALL2ALL_BACKEND == "rccl":
             from atom.model_ops.fused_moe.rccl_prepare_finalize import (
@@ -509,13 +505,14 @@ class FusedMoEMethodBase(QuantizeMethodBase):
                 "triton_batched_gemm",
             )
             use_fp8_dispatch = is_fp8 and quant_type is not None and not use_batched_impl
+            ep_group = get_ep_group()
             return RcclPrepareAndFinalize(
-                rank=all2all_manager.rank,
-                world_size=all2all_manager.world_size,
+                rank=ep_group.rank_in_group,
+                world_size=ep_group.world_size,
                 hidden_dim=moe.hidden_dim,
                 scale_dim=scale_dim,
                 max_tokens_per_rank=moe.max_num_tokens,
-                num_local_experts=moe.num_experts // all2all_manager.world_size,
+                num_local_experts=moe.num_experts // ep_group.world_size,
                 num_experts_per_token=moe.experts_per_token,
                 in_dtype=moe.in_dtype,
                 use_fp8_dispatch=use_fp8_dispatch,
@@ -558,6 +555,9 @@ class FusedMoEMethodBase(QuantizeMethodBase):
             #     else torch.bfloat16
             # )
             # mori_dtype = torch.bfloat16
+
+            all2all_manager = get_ep_group().device_communicator.all2all_manager
+            assert all2all_manager is not None
 
             all_to_all_args = dict(
                 rank=all2all_manager.rank,
@@ -946,6 +946,12 @@ class Mxfp4MoEMethod(FusedMoEMethodBase):
         if envs.is_set("ATOM_USE_TRITON_MOE_DECODE"):
             self.use_triton_decode = envs.ATOM_USE_TRITON_MOE_DECODE
         else:
+            self.use_triton_decode = False
+        if (
+            envs.ATOM_ALL2ALL_BACKEND == "rccl"
+            and envs.ATOM_RCCL_MOE_IMPL
+            in ("batched", "flydsl_batched_gemm", "triton_batched_gemm")
+        ):
             self.use_triton_decode = False
 
     def create_weights(

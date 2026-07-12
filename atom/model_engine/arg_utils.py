@@ -37,6 +37,7 @@ class EngineArgs:
     data_parallel_rank_local: Optional[int] = None
     data_parallel_master_ip: str = "127.0.0.1"
     data_parallel_master_port: int = 29500
+    data_parallel_base_port: Optional[int] = None
     distributed_dp: bool = False
     distributed_dp_serving: bool = False
     enforce_eager: bool = False
@@ -137,6 +138,15 @@ class EngineArgs:
             type=int,
             default=29500,
             help="Rendezvous port for data-parallel process groups.",
+        )
+        parser.add_argument(
+            "--data-parallel-base-port",
+            type=int,
+            default=None,
+            help=(
+                "Rendezvous port for model-runner distributed initialization. "
+                "Set this explicitly for multi-node launches."
+            ),
         )
         parser.add_argument(
             "--distributed-dp",
@@ -427,21 +437,25 @@ class EngineArgs:
         data_parallel_rank_local = kwargs.pop("data_parallel_rank_local")
         data_parallel_master_ip = kwargs.pop("data_parallel_master_ip")
         data_parallel_master_port = kwargs.pop("data_parallel_master_port")
+        data_parallel_base_port = kwargs.pop("data_parallel_base_port")
         distributed_dp = kwargs.pop("distributed_dp")
         distributed_dp_serving = kwargs.pop("distributed_dp_serving")
-        kwargs["parallel_config"] = ParallelConfig(
-            data_parallel_size=data_parallel_size,
-            data_parallel_size_local=(
+        parallel_config_kwargs = {
+            "data_parallel_size": data_parallel_size,
+            "data_parallel_size_local": (
                 data_parallel_size_local
                 if data_parallel_size_local is not None
                 else data_parallel_size
             ),
-            data_parallel_rank=data_parallel_rank,
-            data_parallel_rank_local=data_parallel_rank_local,
-            data_parallel_master_ip=data_parallel_master_ip,
-            data_parallel_master_port=data_parallel_master_port,
-            distributed_dp=distributed_dp,
-        )
+            "data_parallel_rank": data_parallel_rank,
+            "data_parallel_rank_local": data_parallel_rank_local,
+            "data_parallel_master_ip": data_parallel_master_ip,
+            "data_parallel_master_port": data_parallel_master_port,
+            "distributed_dp": distributed_dp,
+        }
+        if data_parallel_base_port is not None:
+            parallel_config_kwargs["data_parallel_base_port"] = data_parallel_base_port
+        kwargs["parallel_config"] = ParallelConfig(**parallel_config_kwargs)
         kwargs["distributed_dp_serving"] = distributed_dp_serving
 
         # --enable-tbo [prefill|all] → enable_tbo + enable_tbo_decode
