@@ -34,6 +34,7 @@ All commands below run **inside the container**.
 export NODE_IP=$(ip route get 1.1.1.1 | awk '/src/ {print $7; exit}')
 export PYTHONUNBUFFERED=1
 export AITER_QUICK_REDUCE_QUANTIZATION=INT4
+export AITER_MXFP4_INTERMEDIATE=1
 export ATOM_HOST_IP=${NODE_IP}
 export LD_LIBRARY_PATH=$(python3 -c "import sysconfig; print(sysconfig.get_path('purelib'))")/mooncake:/opt/rocm/lib:${LD_LIBRARY_PATH:-}
 rm -rf /root/.cache/atom/* 2>/dev/null || true
