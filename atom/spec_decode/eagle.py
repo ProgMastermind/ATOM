@@ -290,12 +290,33 @@ class EagleProposer:
 
     def load_model(self, target_model: nn.Module) -> None:
         if self.speculative_config.method == "eagle3":
-            load_model(
+            loaded = load_model(
                 self.model,
                 self.speculative_config.model,
                 self.speculative_config.draft_model_hf_config,
                 self.config.load_dummy,
                 False,
+            )
+            # Eagle3 checkpoints may omit the embedding matrix (e.g. NVIDIA's
+            # LlamaForCausalLMEagle3 speculators share the target tokenizer).
+            # Share embed_tokens/lm_head from the target when the draft didn't
+            # load them, so the draft can run without needing extra weights.
+            target_base = getattr(target_model, "language_model", target_model)
+            self._share_if_not_loaded(
+                self.model,
+                "embed_tokens",
+                target_base.model.embed_tokens,
+                loaded,
+                "embed_tokens.weight",
+                "Eagle3 embed_tokens",
+            )
+            self._share_if_not_loaded(
+                self.model,
+                "lm_head",
+                target_base.lm_head,
+                loaded,
+                "lm_head.weight",
+                "Eagle3 lm_head",
             )
             logger.info(
                 "Eagle3 draft model loaded from %s (independent embed/lm_head)",
