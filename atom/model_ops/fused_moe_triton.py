@@ -62,8 +62,20 @@ def _swizzle_mxfp4(
 ):
     """Weight swizzle for mxfp4 moe, used for aiter triton mxfp4 moe kernels.
 
-    The arch -> SWIZZLE_MX_SCALE label decision lives in aiter
-    (``shuffle_scale_moe(..., return_layout=True)``), so this stays arch-agnostic.
+    Arch-aware: the a16w4/a4w4 triton MoE kernels only decode the CDNA4 scale
+    swizzle (``SWIZZLE_MX_SCALE == "CDNA4_SCALE"``); every other label falls into
+    their plain ``else`` branch, which expects *unswizzled* scales. aiter's
+    ``shuffle_scale_moe`` now emits the gfx1250-specific ``"GFX1250_SCALE"`` tile
+    layout on gfx1250, which these kernels cannot unpack -- feeding it in makes
+    them misread the physically-shuffled scales (garbage/NaN, and OOB -> GPU
+    coredump at serving strides). So only apply the CDNA4 swizzle on CDNA4 archs
+    (gfx942/gfx950); on gfx1250 pass plain scales with label ``None`` (the
+    kernel's supported unswizzled path). The gfx1250 a8w4 *decode* path has its
+    own GFX1250-aware kernel and does not use this helper.
+
+    (The arch guard here mirrors ``origin/main``; #1547 dropped it while
+    "conforming to the new shuffle API", which reintroduced the GFX1250_SCALE
+    mismatch on gfx1250.)
     """
     assert envs.ATOM_USE_TRITON_GEMM or envs.ATOM_USE_TRITON_MOE
 
@@ -73,16 +85,20 @@ def _swizzle_mxfp4(
     w2_triton_layout = w2.transpose(-2, -1)
     w2_scale_triton_layout = w2_scale.transpose(-2, -1)
 
-    if N_1 % 32 == 0 and K_1 % (32 * 8) == 0:
+    # CDNA4 archs (gfx942/gfx950) get the "CDNA4_SCALE" preshuffle the kernel
+    # decodes; anything else (gfx1250) keeps plain scales + label None.
+    kernel_supports_scale_swizzle = get_arch() in ("gfx942", "gfx950")
+
+    if kernel_supports_scale_swizzle and N_1 % 32 == 0 and K_1 % (32 * 8) == 0:
         w1_scale_triton_layout, w1_swizzle_layout = shuffle_scale_moe(
-            w1_scale_triton_layout, return_layout=True
+            w1_scale_triton_layout, arch="gfx950", return_layout=True
         )
     else:
         w1_swizzle_layout = None
 
-    if N_2 % 32 == 0 and K_2 % (32 * 8) == 0:
+    if kernel_supports_scale_swizzle and N_2 % 32 == 0 and K_2 % (32 * 8) == 0:
         w2_scale_triton_layout, w2_swizzle_layout = shuffle_scale_moe(
-            w2_scale_triton_layout, return_layout=True
+            w2_scale_triton_layout, arch="gfx950", return_layout=True
         )
     else:
         w2_swizzle_layout = None
