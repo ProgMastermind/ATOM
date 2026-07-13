@@ -239,12 +239,3 @@ python -m atom.entrypoints.openai_server \
 
 Pure context parallel (`TP1 × PCP4`) is also valid on 4 GPUs — swap `-tp 2 -pcp 2`
 for `-tp 1 -pcp 4`.
-
-### Validating PCP
-
-Compare a PCP run against a same-GPU-count `-tp 4 -pcp 1` baseline. Accuracy
-should match the baseline (PCP does not change decode), and TTFT should improve
-as ISL grows. Use a long-input workload, e.g. `ISL=60000`, `OSL=1024`,
-concurrency 8, with the benchmark command from
-[Performance baseline](#performance-baseline), and the gsm8k
-[Accuracy test](#accuracy-test) for parity.
