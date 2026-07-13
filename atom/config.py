@@ -1127,6 +1127,17 @@ class Config:
             self.compilation_config = CompilationConfig(**self.compilation_config)
         # assert os.path.isdir(self.model)
 
+        # RapidServe (intra-GPU prefill/decode disagg) needs a specialized
+        # runner in both the prefill and decode processes. Select it unless the
+        # user explicitly overrode runner_qualname.
+        if (
+            self.enable_rapidserve
+            and self.runner_qualname == "atom.model_engine.model_runner.ModelRunner"
+        ):
+            self.runner_qualname = (
+                "atom.model_engine.model_runner.RapidServeModelRunner"
+            )
+
         assert 1 <= self.tensor_parallel_size <= 8
         self.hf_config = get_hf_config(
             self.model, trust_remote_code=self.trust_remote_code
