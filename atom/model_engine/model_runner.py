@@ -1777,93 +1777,6 @@ class ModelRunner:
             torch.distributed.barrier()
         return True
 
-    # ------------------------------------------------------------------
-    # Disaggregation: KV cache IPC sharing (Phase 1)
-    # ------------------------------------------------------------------
-
-    def _bind_kv_cache_to_modules(self):
-        """Bind self.kv_cache (and self.kv_scale if present) to all attention
-        modules.  Extracted from allocate_kv_cache() so it can be called
-        again after replacing self.kv_cache with an IPC-imported tensor."""
-        config = self.config
-        hf_config = config.hf_config
-        if hf_config.num_key_value_heads >= self.world_size:
-            num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        else:
-            num_kv_heads = 1
-        x = 16 // self.kv_cache.element_size()
-
-        models_to_bind = [("target", self.model)]
-        if self.config.speculative_config and hasattr(self, "drafter"):
-            models_to_bind.append(("draft", self.drafter.model))
-
-        kv_cache_tensors = []
-        layer_id = 0
-        for _model_name, model in models_to_bind:
-            for module in model.modules():
-                if hasattr(module, "base_attention"):
-                    if hasattr(module, "use_mla") and not module.use_mla:
-                        if self.is_qwen_next():
-                            attn_idx = layer_id // self.full_attention_interval
-                        else:
-                            attn_idx = layer_id
-                        k_cache = self.kv_cache[0, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim // x,
-                            self.physical_block_size,
-                            x,
-                        )
-                        v_cache = self.kv_cache[1, attn_idx].view(
-                            self.num_physical_kvcache_blocks,
-                            num_kv_heads,
-                            hf_config.head_dim,
-                            self.physical_block_size,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        if config.kv_cache_dtype == "fp8":
-                            module.k_scale = self.kv_scale[0, attn_idx]
-                            module.v_scale = self.kv_scale[1, attn_idx]
-                        from atom.config import KVCacheTensor
-
-                        kv_cache_tensors.append(
-                            KVCacheTensor(
-                                layer_num=layer_id,
-                                k_cache=k_cache,
-                                v_cache=v_cache,
-                                k_scale=module.k_scale,
-                                v_scale=module.v_scale,
-                            )
-                        )
-                        module.k_cache = k_cache
-                        module.v_cache = v_cache
-                        layer_id += 1
-                    elif hasattr(module, "use_mla") and module.use_mla:
-                        kv_cache = self.kv_cache[layer_id].view(
-                            self.num_physical_kvcache_blocks * self.physical_block_size,
-                            1,
-                            576,
-                        )
-                        module.max_model_len = self.config.max_model_len
-                        from atom.config import KVCacheTensor
-
-                        kv_cache_tensors.append(
-                            KVCacheTensor(
-                                layer_num=layer_id,
-                                k_cache=kv_cache,
-                                v_cache=None,
-                                k_scale=None,
-                                v_scale=None,
-                            )
-                        )
-                        module.kv_cache = kv_cache
-                        layer_id += 1
-
-        from atom.utils.forward_context import set_kv_cache_data
-
-        kv_cache_data = {f"layer_{i}": t for i, t in enumerate(kv_cache_tensors)}
-        set_kv_cache_data(kv_cache_data)
-
     def get_dp_padding(self, num_tokens: int) -> tuple[int, Optional[torch.Tensor]]:
         dp_size = self.config.parallel_config.data_parallel_size
         dp_rank = self.config.parallel_config.data_parallel_rank
@@ -2444,7 +2357,6 @@ class ModelRunner:
         ) = self.prepare_model(batch)
         logits, hidden_states = self.run_model(input_ids, batch)
 
-        # postprocess (sampling + async CPU copy) always runs on default stream.
         fwd_output = self.postprocess(
             batch,
             logits,
@@ -3111,6 +3023,90 @@ class RapidServeModelRunner(ModelRunner):
         self._bind_kv_cache_to_modules()
         logger.info(f"ModelRunner rank {self.rank}: import_kv_cache_ipc_handle done")
         return True
+
+    def _bind_kv_cache_to_modules(self):
+        """Bind self.kv_cache (and self.kv_scale if present) to all attention
+        modules.  Called after replacing self.kv_cache with an IPC-imported
+        tensor (decode process), where the builder-based binding path in
+        allocate_kv_cache() is skipped."""
+        config = self.config
+        hf_config = config.hf_config
+        if hf_config.num_key_value_heads >= self.world_size:
+            num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        else:
+            num_kv_heads = 1
+        x = 16 // self.kv_cache.element_size()
+
+        models_to_bind = [("target", self.model)]
+        if self.config.speculative_config and hasattr(self, "drafter"):
+            models_to_bind.append(("draft", self.drafter.model))
+
+        kv_cache_tensors = []
+        layer_id = 0
+        for _model_name, model in models_to_bind:
+            for module in model.modules():
+                if hasattr(module, "base_attention"):
+                    if hasattr(module, "use_mla") and not module.use_mla:
+                        if self.is_qwen_next():
+                            attn_idx = layer_id // self.full_attention_interval
+                        else:
+                            attn_idx = layer_id
+                        k_cache = self.kv_cache[0, attn_idx].view(
+                            self.num_physical_kvcache_blocks,
+                            num_kv_heads,
+                            hf_config.head_dim // x,
+                            self.physical_block_size,
+                            x,
+                        )
+                        v_cache = self.kv_cache[1, attn_idx].view(
+                            self.num_physical_kvcache_blocks,
+                            num_kv_heads,
+                            hf_config.head_dim,
+                            self.physical_block_size,
+                        )
+                        module.max_model_len = self.config.max_model_len
+                        if config.kv_cache_dtype == "fp8":
+                            module.k_scale = self.kv_scale[0, attn_idx]
+                            module.v_scale = self.kv_scale[1, attn_idx]
+                        from atom.config import KVCacheTensor
+
+                        kv_cache_tensors.append(
+                            KVCacheTensor(
+                                layer_num=layer_id,
+                                k_cache=k_cache,
+                                v_cache=v_cache,
+                                k_scale=module.k_scale,
+                                v_scale=module.v_scale,
+                            )
+                        )
+                        module.k_cache = k_cache
+                        module.v_cache = v_cache
+                        layer_id += 1
+                    elif hasattr(module, "use_mla") and module.use_mla:
+                        kv_cache = self.kv_cache[layer_id].view(
+                            self.num_physical_kvcache_blocks * self.physical_block_size,
+                            1,
+                            576,
+                        )
+                        module.max_model_len = self.config.max_model_len
+                        from atom.config import KVCacheTensor
+
+                        kv_cache_tensors.append(
+                            KVCacheTensor(
+                                layer_num=layer_id,
+                                k_cache=kv_cache,
+                                v_cache=None,
+                                k_scale=None,
+                                v_scale=None,
+                            )
+                        )
+                        module.kv_cache = kv_cache
+                        layer_id += 1
+
+        from atom.utils.forward_context import set_kv_cache_data
+
+        kv_cache_data = {f"layer_{i}": t for i, t in enumerate(kv_cache_tensors)}
+        set_kv_cache_data(kv_cache_data)
 
     # ------------------------------------------------------------------
     # CU-masked stream pools + prefill forward
