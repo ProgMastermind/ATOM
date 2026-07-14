@@ -29,10 +29,12 @@ def _ext():
     here = os.path.dirname(__file__)
     # _vmm_ext.cpp is host code (g++); _vmm_kernels.cu is device code (hipcc).
     srcs = [os.path.join(here, "_vmm_ext.cpp"), os.path.join(here, "_vmm_kernels.cu")]
+    # Don't add -I{rocm}/include: torch already adds it as -isystem, and a plain
+    # -I breaks ROCm 7.2's texture_types_hip.h (quote-include resolves to
+    # hip/hip/channel_descriptor.h). Only the link dir is needed.
     return load(
         name="atom_vmm_ext",
         sources=srcs,
-        extra_include_paths=[os.path.join(rocm, "include")],
         extra_ldflags=[f"-L{os.path.join(rocm, 'lib')}", "-lamdhip64"],
         verbose=False,
     )

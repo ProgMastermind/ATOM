@@ -7,11 +7,17 @@
 // not require the source GPU to be in the consumer's visible set.
 #include <torch/extension.h>
 #include <hip/hip_runtime.h>
+#include <hip/hip_version.h>
 
 #include <cstring>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
+
+// Fabric shareable handles (scale-out / IFOE) landed in ROCm ~7.14; older
+// runtimes (e.g. gfx950 / MI355X on ROCm 7.2) lack the symbols. Guard the
+// fabric code so the connector still builds + runs there (fd/XGMI path only).
+#define ATOM_HAS_FABRIC (HIP_VERSION >= 71000000)
 
 #define HIPCK(expr)                                                          \
   do {                                                                       \
@@ -39,8 +45,14 @@ hipMemAllocationProp make_prop(int device, bool fabric = false) {
   prop.type = hipMemAllocationTypePinned;
   prop.location.type = hipMemLocationTypeDevice;
   prop.location.id = device;
+#if ATOM_HAS_FABRIC
   prop.requestedHandleType = fabric ? hipMemHandleTypeFabric
                                     : hipMemHandleTypePosixFileDescriptor;
+#else
+  if (fabric)
+    throw std::runtime_error("fabric handles require ROCm >= 7.14");
+  prop.requestedHandleType = hipMemHandleTypePosixFileDescriptor;
+#endif
   return prop;
 }
 
@@ -80,10 +92,15 @@ bool vmm_supported(int device) {
 // Whether the device supports exporting VMM handles as fabric handles
 // (cross-node / IFOE). False on gfx950 (scale-up only), true on gfx1250.
 bool vmm_supported_fabric(int device) {
+#if ATOM_HAS_FABRIC
   int value = 0;
   hipDeviceGetAttribute(&value, hipDeviceAttributeHandleTypeFabricSupported,
                         device);
   return value != 0;
+#else
+  (void)device;
+  return false;
+#endif
 }
 
 // Allocate an exportable VMM buffer on `device`, map it and grant `device`
@@ -108,15 +125,21 @@ int64_t vmm_alloc(int64_t nbytes, int device, bool fabric = false) {
 // Export the region's handle as a 64-byte fabric handle (to send over TCP to a
 // remote node); node-independent, unlike the POSIX fd.
 pybind11::bytes vmm_export_fabric(int64_t id) {
+#if ATOM_HAS_FABRIC
   hipMemFabricHandle_t h{};
   HIPCK(hipMemExportToShareableHandle(&h, region(id).handle,
                                       hipMemHandleTypeFabric, 0));
   return pybind11::bytes(reinterpret_cast<const char *>(&h), sizeof(h));
+#else
+  (void)id;
+  throw std::runtime_error("fabric handles require ROCm >= 7.14");
+#endif
 }
 
 // Import a peer's fabric handle (64 raw bytes), map it on `device` and grant
 // `device` peer access. `nbytes` must match the producer's requested size.
 int64_t vmm_import_fabric(pybind11::bytes handle, int64_t nbytes, int device) {
+#if ATOM_HAS_FABRIC
   HIPCK(hipSetDevice(device));
   size_t size =
       round_up_to_granularity(static_cast<size_t>(nbytes), device, true);
@@ -134,6 +157,12 @@ int64_t vmm_import_fabric(pybind11::bytes handle, int64_t nbytes, int device) {
   int64_t id = g_next_id++;
   g_regions[id] = r;
   return id;
+#else
+  (void)handle;
+  (void)nbytes;
+  (void)device;
+  throw std::runtime_error("fabric handles require ROCm >= 7.14");
+#endif
 }
 
 // Export the region's handle as a POSIX file descriptor (to send over a UNIX
