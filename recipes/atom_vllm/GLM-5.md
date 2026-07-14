@@ -6,7 +6,7 @@ GLM-5 features sparse MLA, and is architecturally similar to DeepSeek-V3.2. Its 
 
 Refer to the [GLM-5.2-FP8 Recipe](#glm-52-fp8-recipe) and [GLM-5.2-MXFP4 Recipe](#glm-52-mxfp4-recipe) for deployment details of the latest GLM-5.2 model.
 
-## Pull the OOT Docker
+## Pull the Docker Image
 Use the latest image for all the recipes below.
 ```bash
 docker pull rocm/atom-dev:vllm-latest
