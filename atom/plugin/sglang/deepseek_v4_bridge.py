@@ -327,7 +327,7 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
             view.index_copy_(0, tgt_idx, view.index_select(0, src_idx).clone())
 
     def set_swa_loc(self, loc: torch.Tensor) -> None:
-        # SGLang 0.5.12 requires BaseSWAKVPool subclasses to expose this hook.
+        # SGLang requires BaseSWAKVPool subclasses to expose this hook.
         # DSV4 pools do not use the generic precomputed SWA location path, and
         # ATOM writes the proxy arena through its own bridge metadata.
         pass
