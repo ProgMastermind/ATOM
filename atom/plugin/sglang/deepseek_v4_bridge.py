@@ -69,20 +69,27 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         page_size: int,
         swa_page_size: int,
         dtype: torch.dtype,
-        state_dtype: torch.dtype,
-        qk_nope_head_dim: int,
-        qk_rope_head_dim: int,
-        indexer_head_dim: int,
-        layer_num: int,
-        device: str,
-        enable_memory_saver: bool,
-        compression_ratios: list[int],
+        state_dtype: Optional[torch.dtype] = None,
+        qk_nope_head_dim: int = 0,
+        qk_rope_head_dim: int = 0,
+        indexer_head_dim: int = 0,
+        layer_num: int = 0,
+        device: str = "cuda",
+        enable_memory_saver: bool = False,
+        compression_ratios: Optional[list[int]] = None,
         start_layer: Optional[int] = None,
         end_layer: Optional[int] = None,
         enable_hisparse: bool = False,
+        num_req_slots: Optional[int] = None,
+        sliding_window: Optional[int] = None,
+        c4_state_dtype: Optional[torch.dtype] = None,
+        c128_state_dtype: Optional[torch.dtype] = None,
+        online_mtp_max_draft_tokens: int = 0,
+        **_unused_kwargs: Any,
     ) -> None:
         del c4_state_pool_size, c128_state_pool_size, dtype, state_dtype
-        del enable_memory_saver, enable_hisparse
+        del c4_state_dtype, c128_state_dtype, sliding_window
+        del enable_memory_saver, enable_hisparse, online_mtp_max_draft_tokens
 
         self.max_num_reqs = int(max_num_reqs)
         self.swa_size = int(swa_size)
@@ -113,7 +120,9 @@ class ATOMDeepSeekV4ProxyKVPool(BaseSWAKVPool):
         self.full_kv_pool = None
         self.swa_kv_pool = None
 
-        self.num_slots = max(1, self.max_num_reqs)
+        self.num_slots = max(
+            1, int(num_req_slots) if num_req_slots is not None else self.max_num_reqs
+        )
         # SGLang's DSV4 allocator is initialized with page_size/swa_page_size=256
         # for paged-SWA bookkeeping, but ATOM V4-Pro attention uses a 128-token
         # attention window.  Native ATOM sizes the SWA ring as

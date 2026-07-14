@@ -53,8 +53,56 @@ class SGLangGDNForwardContext:
         return getattr(attn_backend, "linear_attn_backend", attn_backend)
 
     @staticmethod
-    def _build_kv_cache_tensors(forward_batch: Any) -> Dict[str, KVCacheTensor]:
-        pool = forward_batch.req_to_token_pool
+    def _resolve_attn_backend(forward_batch: Any) -> Any:
+        backend = getattr(forward_batch, "attn_backend", None)
+        if backend is not None:
+            return backend
+
+        try:
+            from sglang.srt.model_executor.forward_context import (
+                get_attn_backend,
+                has_forward_context,
+            )
+
+            if has_forward_context():
+                return get_attn_backend()
+        except Exception:
+            pass
+
+        return None
+
+    @staticmethod
+    def _patch_forward_batch_pools(forward_batch: Any, attn_backend: Any) -> None:
+        for attr in ("token_to_kv_pool", "req_to_token_pool"):
+            if getattr(forward_batch, attr, None) is None:
+                pool = getattr(attn_backend, attr, None)
+                if pool is not None:
+                    try:
+                        setattr(forward_batch, attr, pool)
+                    except Exception:
+                        pass
+
+    @staticmethod
+    def _build_kv_cache_tensors(
+        forward_batch: Any, attn_backend: Any
+    ) -> Dict[str, KVCacheTensor]:
+        pool = getattr(forward_batch, "req_to_token_pool", None)
+        if pool is None:
+            pool = getattr(attn_backend, "req_to_token_pool", None)
+        if pool is None:
+            try:
+                from sglang.srt.model_executor.forward_context import (
+                    get_req_to_token_pool,
+                    has_forward_context,
+                )
+
+                if has_forward_context():
+                    pool = get_req_to_token_pool()
+            except Exception:
+                pool = None
+        if pool is None:
+            return {}
+
         mamba_map = getattr(pool, "mamba_map", None)
         if mamba_map is None:
             return {}
@@ -173,12 +221,21 @@ class SGLangGDNForwardContext:
             return None
 
         forward_batch = metadata.forward_batch
-        linear_backend = cls._linear_attn_backend(forward_batch.attn_backend)
+        attn_backend = cls._resolve_attn_backend(forward_batch)
+        if attn_backend is None:
+            logger.warning(
+                "SGLang GDN forward context: no active SGLang attention backend; "
+                "GDN metadata skipped."
+            )
+            return None
+
+        cls._patch_forward_batch_pools(forward_batch, attn_backend)
+        linear_backend = cls._linear_attn_backend(attn_backend)
         gdn_metadata = cls._build_gdn_metadata(forward_batch, linear_backend)
         if gdn_metadata is None:
             return None
 
-        kv_cache_data = cls._build_kv_cache_tensors(forward_batch)
+        kv_cache_data = cls._build_kv_cache_tensors(forward_batch, attn_backend)
         if not kv_cache_data:
             return None
 

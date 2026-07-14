@@ -763,6 +763,7 @@ def init_aiter_dist(config: Config) -> None:
             return
 
     # Fallback: create aiter's own groups (vLLM reuse failed or non-vLLM plugin)
+    import aiter.ops.communication as aiter_comm
     from aiter import init_dist_env
     from aiter.dist.utils import get_distributed_init_method
 
@@ -778,8 +779,6 @@ def init_aiter_dist(config: Config) -> None:
             dp_master_ip = "127.0.0.1"
             dp_master_port = config.plugin_config.sglang_port_args.nccl_port
     elif config.plugin_config.is_rtpllm:
-        import os
-
         dp_master_ip = os.getenv("MASTER_ADDR", "127.0.0.1")
         dp_master_port = int(os.getenv("MASTER_PORT", "29500"))
 
@@ -788,11 +787,32 @@ def init_aiter_dist(config: Config) -> None:
     logger.info(
         f"Initialize aiter dist for using aiter custom collective op for plugin mode, rank:{rank}"
     )
-    init_dist_env(
-        tensor_model_parallel_size=tensor_parallel_size,
-        rankID=rank,
-        backend="nccl",
-        distributed_init_method=distributed_init_method,
-        data_parallel_size=config.parallel_config.data_parallel_size,
-        data_parallel_rank=config.parallel_config.data_parallel_rank,
-    )
+    if config.plugin_config.is_sglang and os.environ.get(
+        "SGLANG_DISABLE_AITER_CUSTOM_ALL_REDUCE", "0"
+    ) == "1":
+        original_set_custom_all_reduce = aiter_comm.set_custom_all_reduce
+
+        def _force_disable_custom_all_reduce(_enable: bool) -> None:
+            original_set_custom_all_reduce(False)
+
+        aiter_comm.set_custom_all_reduce = _force_disable_custom_all_reduce
+        try:
+            init_dist_env(
+                tensor_model_parallel_size=tensor_parallel_size,
+                rankID=rank,
+                backend="nccl",
+                distributed_init_method=distributed_init_method,
+                data_parallel_size=config.parallel_config.data_parallel_size,
+                data_parallel_rank=config.parallel_config.data_parallel_rank,
+            )
+        finally:
+            aiter_comm.set_custom_all_reduce = original_set_custom_all_reduce
+    else:
+        init_dist_env(
+            tensor_model_parallel_size=tensor_parallel_size,
+            rankID=rank,
+            backend="nccl",
+            distributed_init_method=distributed_init_method,
+            data_parallel_size=config.parallel_config.data_parallel_size,
+            data_parallel_rank=config.parallel_config.data_parallel_rank,
+        )

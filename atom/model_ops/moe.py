@@ -1874,32 +1874,27 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self.num_experts = num_experts
         intermediate_size_for_weight = intermediate_size_per_partition
 
-        if self.block_quant:
+        if self.channel_quant:
+            channel_align = 128
+            intermediate_size_for_weight = (
+                (intermediate_size_per_partition + channel_align - 1)
+                // channel_align
+                * channel_align
+            )
+        elif self.block_quant:
             if self.quant_type == QuantType.per_1x128:
                 block_n = 128
                 block_k = 128
             elif self.quant_type == QuantType.per_1x32:
                 block_n = 1
                 block_k = 32
-            tp_size = get_tp_group().world_size
-            # NOTE: To ensure proper alignment of the block-wise quantization
-            # scales, the output_size of the weights for both the gate and up
-            # layers must be divisible by block_n.
-            # Required by column parallel or enabling merged weights
-            if intermediate_size_per_partition % block_n != 0:
-                raise ValueError(
-                    f"The output_size of gate's and up's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_n = {block_n}."
+            if self.quant_type == QuantType.per_1x128:
+                intermediate_size_for_weight = (
+                    (intermediate_size_per_partition + block_n - 1)
+                    // block_n
+                    * block_n
                 )
-            if tp_size > 1 and intermediate_size_per_partition % block_k != 0:
-                # Required by row parallel
-                raise ValueError(
-                    f"The input_size of down's weight = "
-                    f"{intermediate_size_per_partition} is not divisible by "
-                    f"weight quantization block_k = {block_k}."
-                )
-            if self.quant_type == QuantType.per_1x32:
+            elif self.quant_type == QuantType.per_1x32:
                 # aiter's GU-interleaved MXFP8 scale shuffle packs 8 scale
                 # columns, i.e. 256 weight columns for 1x32 scales. TP8 on
                 # MiniMax-M3 has local intermediate=384, so pad to 512.
@@ -1920,7 +1915,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         )
         layer.register_parameter("w13_weight", w13_weight)
-        if self.quant_type == QuantType.per_1x32:
+        if intermediate_size_for_weight != intermediate_size_per_partition:
             w13_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w13_weight, extra_weight_attrs)
 
@@ -1933,7 +1928,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             )
         )
         layer.register_parameter("w2_weight", w2_weight)
-        if self.quant_type == QuantType.per_1x32:
+        if intermediate_size_for_weight != intermediate_size_per_partition:
             w2_weight.data.view(torch.uint8).zero_()
         set_weight_attrs(w2_weight, extra_weight_attrs)
 
@@ -2201,6 +2196,18 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         fused_shared_experts_scoring_func: Optional[str] = None,
         activation: ActivationType = ActivationType.Silu,
     ) -> torch.Tensor:
+        original_num_tokens = x.shape[0]
+        if self.channel_quant and original_num_tokens < 32:
+            pad_tokens = 32 - original_num_tokens
+            x = torch.cat([x, x.new_zeros((pad_tokens, x.shape[1]))], dim=0)
+            router_logits = torch.cat(
+                [
+                    router_logits,
+                    router_logits.new_zeros((pad_tokens, router_logits.shape[1])),
+                ],
+                dim=0,
+            )
+
         topk_weights, topk_ids = FusedMoE.select_experts(
             hidden_states=x,
             router_logits=router_logits,
@@ -2229,7 +2236,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             "swiglu_limit": getattr(layer, "swiglu_limit", 0.0),
         }
         if self.quant_type == QuantType.per_Tensor or self.fused_experts is None:
-            return torch.ops.aiter.rocm_aiter_fused_moe(
+            out = torch.ops.aiter.rocm_aiter_fused_moe(
                 x,
                 layer.w13_weight,
                 layer.w2_weight,
@@ -2245,7 +2252,9 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 doweight_stage1=apply_router_weight_on_input,
                 **moe_extra_args,
             )
-        return self.fused_experts(
+            return out[:original_num_tokens]
+
+        out = self.fused_experts(
             hidden_states=x,
             w1=layer.w13_weight,
             w2=layer.w2_weight,
@@ -2264,6 +2273,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             apply_router_weight_on_input=apply_router_weight_on_input,
             moe_extra_args=moe_extra_args,
         )
+        return out[:original_num_tokens]
 
 
 def determine_expert_map(
@@ -2892,6 +2902,39 @@ class FusedMoE(torch.nn.Module):
                 load_full=load_full,
             )
 
+    def _load_per_1x128_weight_scale(
+        self,
+        expert_data: torch.Tensor,
+        shard_dim: int,
+        shard_id: str,
+        loaded_weight: torch.Tensor,
+        tp_rank: int,
+    ):
+        block = 128
+        scale_start = (tp_rank * self.intermediate_size_per_partition) // block
+        scale_end = (
+            (tp_rank + 1) * self.intermediate_size_per_partition + block - 1
+        ) // block
+        scale_size = max(1, scale_end - scale_start)
+        loaded_weight = loaded_weight.narrow(shard_dim, scale_start, scale_size)
+
+        if shard_id in ("w1", "w3"):
+            expert_shard_size = expert_data.shape[shard_dim] // 2
+            if shard_id == "w1":
+                expert_data = expert_data.narrow(shard_dim, 0, expert_shard_size)
+            else:
+                expert_data = expert_data.narrow(
+                    shard_dim, expert_shard_size, expert_shard_size
+                )
+        elif shard_id != "w2":
+            raise ValueError(f"Unknown MoE shard_id for FP8 block scale: {shard_id}")
+
+        if loaded_weight.shape[shard_dim] != expert_data.shape[shard_dim]:
+            expert_data = expert_data.narrow(
+                shard_dim, 0, loaded_weight.shape[shard_dim]
+            )
+        self._copy_quant_storage(expert_data, loaded_weight)
+
     def _load_per_channel_weight_scale(
         self,
         expert_data: torch.Tensor,
@@ -3284,14 +3327,26 @@ class FusedMoE(torch.nn.Module):
                 QuantType.per_1x128,
                 QuantType.per_1x32,
             ]:
-                self._load_model_weight_or_group_weight_scale(
-                    shard_id=shard_id,
-                    shard_dim=shard_dim,
-                    loaded_weight=loaded_weight,
-                    expert_data=expert_data,
-                    tp_rank=self.tp_rank,
-                    load_full=getattr(param, "load_full_w2", False),
-                )
+                if (
+                    quant_method == QuantType.per_1x128
+                    and not getattr(param, "load_full_w2", False)
+                ):
+                    self._load_per_1x128_weight_scale(
+                        shard_id=shard_id,
+                        shard_dim=shard_dim,
+                        loaded_weight=loaded_weight,
+                        expert_data=expert_data,
+                        tp_rank=self.tp_rank,
+                    )
+                else:
+                    self._load_model_weight_or_group_weight_scale(
+                        shard_id=shard_id,
+                        shard_dim=shard_dim,
+                        loaded_weight=loaded_weight,
+                        expert_data=expert_data,
+                        tp_rank=self.tp_rank,
+                        load_full=getattr(param, "load_full_w2", False),
+                    )
             elif quant_method == QuantType.per_Tensor:
                 self._load_per_tensor_weight_scale(
                     shard_id=shard_id,

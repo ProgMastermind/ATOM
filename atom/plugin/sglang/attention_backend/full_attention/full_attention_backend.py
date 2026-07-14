@@ -104,6 +104,8 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         topk: int = 1,
     ):
         super().__init__(model_runner, skip_prefill, kv_indptr_buf, topk)
+        self._atom_token_to_kv_pool = model_runner.token_to_kv_pool
+        self._atom_req_to_token_pool = model_runner.req_to_token_pool
         mapping = getattr(
             model_runner.token_to_kv_pool, "full_attention_layer_id_mapping", None
         )
@@ -174,6 +176,36 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         else:
             self.prefill_ps_num_kv_splits = None
 
+    def _patch_forward_batch_pools(self, forward_batch: ForwardBatch):
+        attr_to_pool = {
+            "token_to_kv_pool": self._atom_token_to_kv_pool,
+            "req_to_token_pool": self._atom_req_to_token_pool,
+        }
+        for attr, saved_pool in attr_to_pool.items():
+            if getattr(forward_batch, attr, None) is not None:
+                continue
+            pool = saved_pool or getattr(self, attr, None)
+            if pool is None:
+                try:
+                    from sglang.srt.model_executor.forward_context import (
+                        get_attn_backend,
+                        has_forward_context,
+                    )
+
+                    if has_forward_context():
+                        backend = get_attn_backend()
+                        pool = getattr(backend, attr, None)
+                        if pool is None:
+                            full_backend = getattr(backend, "full_attn_backend", None)
+                            pool = getattr(full_backend, attr, None)
+                except Exception:
+                    pool = None
+            if pool is not None:
+                try:
+                    setattr(forward_batch, attr, pool)
+                except Exception:
+                    pass
+
     def _cuda_graph_mla_max_seqlen_qo(self) -> int:
         """Largest q length used by MLA CUDA graph speculative paths."""
         max_seqlen_qo = 1
@@ -185,6 +217,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init auxiliary variables for triton attention backend."""
+        self._patch_forward_batch_pools(forward_batch)
         if forward_batch.forward_mode.is_decode_or_idle():
             self._init_forward_metadata_decode(forward_batch)
         elif self.use_mla and forward_batch.forward_mode.is_draft_extend_v2():
@@ -2348,6 +2381,7 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
         save_kv_cache=True,
         **kwargs,
     ):
+        self._patch_forward_batch_pools(forward_batch)
         topk_indices = kwargs.get("topk_indices")
         if self.use_mla and topk_indices is not None:
             return self._forward_sparse_mla(
@@ -2454,10 +2488,17 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
             )
         else:
             q_3d = q.contiguous().view(-1, layer.tp_q_head_num, layer.head_dim)
-            if self.forward_metadata.page_table.dtype != torch.int32:
+            page_table = getattr(self.forward_metadata, "page_table", None)
+            if page_table is None:
+                page_table = getattr(self.forward_metadata, "swa_page_table", None)
+            if page_table is None:
+                raise AttributeError(
+                    "ForwardMetadata has neither page_table nor swa_page_table"
+                )
+            if page_table.dtype != torch.int32:
                 raise TypeError(
                     "pa_fwd_asm block_tables must be torch.int32, got "
-                    f"{self.forward_metadata.page_table.dtype}"
+                    f"{page_table.dtype}"
                 )
             if self.forward_metadata.kv_lens.dtype != torch.int32:
                 raise TypeError(
@@ -2474,9 +2515,9 @@ class ATOMAttnBackendForSgl(AiterAttnBackend):
                 Q=q_3d,
                 K=new_key_cache,
                 V=new_value_cache,
-                block_tables=self.forward_metadata.page_table,
+                block_tables=page_table,
                 context_lens=self.forward_metadata.kv_lens,
-                block_tables_stride0=self.forward_metadata.page_table.stride(0),
+                block_tables_stride0=page_table.stride(0),
                 K_QScale=k_qscale,
                 V_QScale=v_qscale,
                 out_=o,

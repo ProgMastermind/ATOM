@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 # Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -216,7 +218,9 @@ class ParallelLMHead(VocabParallelEmbedding):
                 x = x[last_indices].contiguous()
         logits = tgemm.mm(x, self.weight, self.bias)
         if self.tp_size > 1:
-            use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER
+            use_custom = envs.ATOM_USE_CUSTOM_ALL_GATHER and (
+                os.environ.get("SGLANG_DISABLE_AITER_CUSTOM_ALL_REDUCE", "0") != "1"
+            )
             logits = tensor_model_parallel_all_gather(logits, use_custom=use_custom)
             # all_logits = (
             #     [torch.empty_like(logits) for _ in range(self.tp_size)]
