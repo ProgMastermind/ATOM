@@ -29,6 +29,8 @@ set -euo pipefail
 #   LM_EVAL_NUM_CONCURRENT
 #   LM_EVAL_EXTRA_MODEL_ARGS
 #   LM_EVAL_USE_CHAT_COMPLETIONS
+#   ATOM_SGLANG_USE_WORKSPACE_ATOM: Prefer the checked-out ATOM source mounted
+#     at /workspace over the ATOM revision baked into the SGLang image (default: 0).
 
 TYPE=${1:-launch}
 if [[ "${TYPE}" != "start" && "${TYPE}" != "launch" && "${TYPE}" != "accuracy" ]]; then
@@ -66,12 +68,30 @@ if [[ -z "${MODEL_NAME}" || -z "${MODEL_PATH}" ]]; then
 fi
 
 prepare_runtime_paths() {
-  if [[ -d /app/sglang/python && -d /app/ATOM ]]; then
-    local path_prefix="/app/sglang/python:/app/ATOM"
+  local atom_source_dir="/app/ATOM"
+  if [[ "${ATOM_SGLANG_USE_WORKSPACE_ATOM:-0}" == "1" && -d /workspace/atom ]]; then
+    atom_source_dir="/workspace"
+  fi
+
+  if [[ -d /app/sglang/python && -d "${atom_source_dir}/atom" ]]; then
+    # The validation image intentionally supplies SGLang and its compiled
+    # dependencies, but accuracy CI must exercise the ATOM revision checked
+    # out by this workflow.  Put that checkout before /app/ATOM, which may be
+    # an older revision baked into a floating validation image.
+    local path_prefix="/app/sglang/python:${atom_source_dir}"
     if [[ -d /app/aiter-test ]]; then
       path_prefix="/app/aiter-test:${path_prefix}"
     fi
     export PYTHONPATH="${path_prefix}${PYTHONPATH:+:${PYTHONPATH}}"
+    echo "ATOM source root: ${atom_source_dir}"
+    python3 - <<'PY'
+import atom
+
+print(f"ATOM import path: {atom.__file__}")
+PY
+    if [[ -d "${atom_source_dir}/.git" ]]; then
+      echo "ATOM source commit: $(git -C "${atom_source_dir}" rev-parse HEAD)"
+    fi
     cd /app
   elif [[ -d /workspace ]]; then
     cd /workspace

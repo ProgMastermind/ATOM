@@ -417,6 +417,7 @@ jobs:
             -e SGLANG_MODEL_PATH="${SGLANG_RESOLVED_MODEL_PATH:-$SGLANG_MODEL_PATH}" \
             -e SGLANG_EXTRA_ARGS="${SGLANG_EXTRA_ARGS}" \
             -e SGLANG_ENV_VARS="${SGLANG_ENV_VARS}" \
+            -e ATOM_SGLANG_USE_WORKSPACE_ATOM="1" \
             -e SGLANG_DOCKER_IMAGE="${SGLANG_IMAGE_TAG}" \
             -e GPU_NAME="${{ steps.gpu-info.outputs.gpu_name }}" \
             -e GPU_VRAM_GB="${{ steps.gpu-info.outputs.gpu_vram_gb }}" \
@@ -546,4 +547,3 @@ jobs:
           $CONTAINER_ENGINE stop "$CONTAINER_NAME" || true
           $CONTAINER_ENGINE rm "$CONTAINER_NAME" || true
           $CONTAINER_ENGINE rmi "${SGLANG_IMAGE_REF:-${SGLANG_IMAGE_TAG}}" || true
-
