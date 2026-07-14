@@ -95,7 +95,6 @@ from atom.utils.custom_register import direct_register_custom_op
 from atom.model_ops import module_dispatch_ops as _module_dispatch_ops  # noqa: F401
 from atom.utils.decorators import mark_trace, support_torch_compile
 from atom.utils.forward_context import get_forward_context
-from atom.plugin import is_plugin_mode, is_vllm
 from atom.plugin.vllm.attention.layer_sparse_mla import (
     IndexerDecoratorForPluginMode,
     DeepseekV32IndexerCacheDecoratorForPluginMode,
@@ -2456,8 +2455,6 @@ def use_replicated_vocab_embed(config: PretrainedConfig) -> bool:
     ``index_share_for_mtp_iteration`` flag, so we detect either.
     """
     if not envs.ATOM_REPLICATE_VOCAB_EMBED:
-        return False
-    if is_plugin_mode() and not is_vllm():
         return False
     if getattr(config, "tie_word_embeddings", False):
         return False
