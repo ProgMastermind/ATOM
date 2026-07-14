@@ -787,9 +787,10 @@ def init_aiter_dist(config: Config) -> None:
     logger.info(
         f"Initialize aiter dist for using aiter custom collective op for plugin mode, rank:{rank}"
     )
-    if config.plugin_config.is_sglang and os.environ.get(
-        "SGLANG_DISABLE_AITER_CUSTOM_ALL_REDUCE", "0"
-    ) == "1":
+    if (
+        config.plugin_config.is_sglang
+        and os.environ.get("SGLANG_DISABLE_AITER_CUSTOM_ALL_REDUCE", "0") == "1"
+    ):
         original_set_custom_all_reduce = aiter_comm.set_custom_all_reduce
 
         def _force_disable_custom_all_reduce(_enable: bool) -> None:

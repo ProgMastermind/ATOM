@@ -1890,9 +1890,7 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 block_k = 32
             if self.quant_type == QuantType.per_1x128:
                 intermediate_size_for_weight = (
-                    (intermediate_size_per_partition + block_n - 1)
-                    // block_n
-                    * block_n
+                    (intermediate_size_per_partition + block_n - 1) // block_n * block_n
                 )
             elif self.quant_type == QuantType.per_1x32:
                 # aiter's GU-interleaved MXFP8 scale shuffle packs 8 scale
@@ -3327,9 +3325,8 @@ class FusedMoE(torch.nn.Module):
                 QuantType.per_1x128,
                 QuantType.per_1x32,
             ]:
-                if (
-                    quant_method == QuantType.per_1x128
-                    and not getattr(param, "load_full_w2", False)
+                if quant_method == QuantType.per_1x128 and not getattr(
+                    param, "load_full_w2", False
                 ):
                     self._load_per_1x128_weight_scale(
                         shard_id=shard_id,
