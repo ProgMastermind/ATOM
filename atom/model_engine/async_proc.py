@@ -94,9 +94,7 @@ class AsyncIOProc:
             dp_local_rank = cfg.parallel_config.data_parallel_rank_local
             if dp_local_rank is None:
                 dp_local_rank = cfg.parallel_config.data_parallel_rank
-            gpu = (
-                dp_local_rank * cfg.tensor_parallel_size + rank
-            )
+            gpu = dp_local_rank * cfg.tensor_parallel_size + rank
             numa_bind_to_node(gpu, label)
         except Exception as e:
             logger.warning(f"AsyncIOProc({label}): NUMA bind skipped: {e}")
